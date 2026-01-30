@@ -1,0 +1,97 @@
+// SPDX-License-Identifier: MPL-2.0
+
+using Gtk 4.0;
+using Adw 1;
+
+template $HangarWindow: Adw.ApplicationWindow {
+  default-width: 1000;
+  default-height: 700;
+  title: "Hangar";
+
+  Adw.NavigationSplitView split_view {
+    min-sidebar-width: 200;
+    max-sidebar-width: 280;
+
+    sidebar: Adw.NavigationPage {
+      title: "Hangar";
+
+      Adw.ToolbarView {
+        [top]
+        Adw.HeaderBar {
+          [start]
+          Gtk.Button {
+            icon-name: "open-menu-symbolic";
+            tooltip-text: "Menu";
+          }
+        }
+
+        content: Gtk.Box {
+          orientation: vertical;
+          spacing: 6;
+          margin-start: 12;
+          margin-end: 12;
+          margin-top: 6;
+          margin-bottom: 6;
+
+          Gtk.ListBox {
+            selection-mode: single;
+
+            styles [
+              "navigation-sidebar",
+            ]
+
+            Adw.ActionRow {
+              icon-name: "go-home-symbolic";
+              title: "Home";
+            }
+
+            Adw.ActionRow {
+              icon-name: "bell-outline-symbolic";
+              title: "Notifications";
+            }
+
+            Adw.ActionRow {
+              icon-name: "system-search-symbolic";
+              title: "Search";
+            }
+
+            Adw.ActionRow {
+              icon-name: "avatar-default-symbolic";
+              title: "Profile";
+            }
+          }
+        };
+      }
+    };
+
+    content: Adw.NavigationPage {
+      title: "Timeline";
+
+      Adw.ToolbarView {
+        [top]
+        Adw.HeaderBar {
+          [title]
+          Adw.WindowTitle {
+            title: "Following";
+          }
+
+          [end]
+          Gtk.Button {
+            icon-name: "document-edit-symbolic";
+            tooltip-text: "New Post";
+          }
+        }
+
+        content: Gtk.ScrolledWindow {
+          vexpand: true;
+
+          Gtk.ListView timeline_list {
+            styles [
+              "background",
+            ]
+          }
+        };
+      }
+    };
+  }
+}

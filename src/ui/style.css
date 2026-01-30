@@ -1,0 +1,77 @@
+/* SPDX-License-Identifier: MPL-2.0 */
+/* Hangar Stylesheet */
+
+/* Sidebar rail styling */
+.sidebar-rail {
+    background-color: @window_bg_color;
+    border-right: 1px solid @borders;
+}
+
+.sidebar-rail listbox {
+    background: transparent;
+}
+
+.sidebar-rail listbox row {
+    padding: 4px;
+    margin: 2px 4px;
+    border-radius: 8px;
+}
+
+.sidebar-rail listbox row:selected {
+    background-color: alpha(@accent_bg_color, 0.15);
+}
+
+.sidebar-rail listbox row:hover:not(:selected) {
+    background-color: alpha(@window_fg_color, 0.05);
+}
+
+/* Navigation item labels */
+.sidebar-rail .caption {
+    font-size: 10px;
+    font-weight: 500;
+}
+
+/* Compose button in sidebar */
+.sidebar-rail .suggested-action.circular {
+    min-width: 48px;
+    min-height: 48px;
+}
+
+/* Post card styling */
+.card {
+    background-color: @card_bg_color;
+    border-radius: 12px;
+    padding: 16px;
+    margin: 8px 0;
+}
+
+.card .heading {
+    font-weight: 600;
+}
+
+/* Action buttons in post cards */
+.card .flat.circular {
+    min-width: 32px;
+    min-height: 32px;
+    padding: 4px;
+}
+
+/* Error label styling */
+.error {
+    color: @error_color;
+}
+
+/* Timeline background */
+.background {
+    background-color: @window_bg_color;
+}
+
+/* Feed selector button */
+.title {
+    font-weight: 600;
+}
+
+/* Login dialog styling */
+window.background entry {
+    min-height: 36px;
+}

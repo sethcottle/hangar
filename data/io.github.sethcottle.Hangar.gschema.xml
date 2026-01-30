@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-License-Identifier: MPL-2.0 -->
+<schemalist gettext-domain="hangar">
+  <schema id="io.github.sethcottle.Hangar" path="/io/github/sethcottle/Hangar/">
+    <key name="window-width" type="i">
+      <default>1000</default>
+      <summary>Window width</summary>
+    </key>
+    <key name="window-height" type="i">
+      <default>700</default>
+      <summary>Window height</summary>
+    </key>
+    <key name="window-maximized" type="b">
+      <default>false</default>
+      <summary>Window maximized state</summary>
+    </key>
+  </schema>
+</schemalist>
