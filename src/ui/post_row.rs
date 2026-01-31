@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use crate::atproto::Post;
-use gtk4::gdk;
+use crate::ui::avatar_cache;
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
@@ -22,6 +22,11 @@ mod imp {
         pub reply_count_label: RefCell<Option<gtk4::Label>>,
         pub repost_count_label: RefCell<Option<gtk4::Label>>,
         pub like_count_label: RefCell<Option<gtk4::Label>>,
+        pub like_btn: RefCell<Option<gtk4::Button>>,
+        pub repost_btn: RefCell<Option<gtk4::Button>>,
+        pub like_handler_id: RefCell<Option<glib::SignalHandlerId>>,
+        pub repost_handler_id: RefCell<Option<glib::SignalHandlerId>>,
+        pub images_box: RefCell<Option<gtk4::FlowBox>>,
     }
 
     #[glib::object_subclass]
@@ -102,18 +107,30 @@ impl PostRow {
         content.set_xalign(0.0);
         self.append(&content);
 
+        // Images (embed thumbnails)
+        let images_box = gtk4::FlowBox::new();
+        images_box.set_selection_mode(gtk4::SelectionMode::None);
+        images_box.set_max_children_per_line(3);
+        images_box.set_min_children_per_line(1);
+        images_box.set_homogeneous(false);
+        images_box.set_row_spacing(8);
+        images_box.set_column_spacing(8);
+        images_box.add_css_class("post-images");
+        self.append(&images_box);
+
         // Action bar
         let actions = gtk4::Box::new(gtk4::Orientation::Horizontal, 24);
         actions.set_margin_top(8);
 
-        let (reply_btn, reply_count) = Self::create_action_button("comment-symbolic");
+        let (reply_btn, reply_count, _) = Self::create_action_button("comment-symbolic");
         actions.append(&reply_btn);
 
-        let (repost_btn, repost_count) =
+        let (repost_btn, repost_count, repost_btn_ref) =
             Self::create_action_button("media-playlist-repeat-symbolic");
         actions.append(&repost_btn);
 
-        let (like_btn, like_count) = Self::create_action_button("emblem-favorite-symbolic");
+        let (like_btn, like_count, like_btn_ref) =
+            Self::create_action_button("emblem-favorite-symbolic");
         actions.append(&like_btn);
 
         let spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
@@ -137,9 +154,12 @@ impl PostRow {
         imp.reply_count_label.replace(Some(reply_count));
         imp.repost_count_label.replace(Some(repost_count));
         imp.like_count_label.replace(Some(like_count));
+        imp.like_btn.replace(Some(like_btn_ref));
+        imp.repost_btn.replace(Some(repost_btn_ref));
+        imp.images_box.replace(Some(images_box));
     }
 
-    fn create_action_button(icon_name: &str) -> (gtk4::Box, gtk4::Label) {
+    fn create_action_button(icon_name: &str) -> (gtk4::Box, gtk4::Label, gtk4::Button) {
         let btn_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
 
         let btn = gtk4::Button::from_icon_name(icon_name);
@@ -151,7 +171,33 @@ impl PostRow {
         count_label.add_css_class("dim-label");
         btn_box.append(&count_label);
 
-        (btn_box, count_label)
+        (btn_box, count_label, btn)
+    }
+
+    pub fn connect_like_clicked<F: Fn() + 'static>(&self, f: F) {
+        let imp = self.imp();
+        if let Some(id) = imp.like_handler_id.take() {
+            if let Some(btn) = imp.like_btn.borrow().as_ref() {
+                btn.disconnect(id);
+            }
+        }
+        if let Some(btn) = imp.like_btn.borrow().as_ref() {
+            let id = btn.connect_clicked(move |_| f());
+            imp.like_handler_id.replace(Some(id));
+        }
+    }
+
+    pub fn connect_repost_clicked<F: Fn() + 'static>(&self, f: F) {
+        let imp = self.imp();
+        if let Some(id) = imp.repost_handler_id.take() {
+            if let Some(btn) = imp.repost_btn.borrow().as_ref() {
+                btn.disconnect(id);
+            }
+        }
+        if let Some(btn) = imp.repost_btn.borrow().as_ref() {
+            let id = btn.connect_clicked(move |_| f());
+            imp.repost_handler_id.replace(Some(id));
+        }
     }
 
     pub fn bind(&self, post: &Post) {
@@ -168,7 +214,7 @@ impl PostRow {
             avatar.set_text(Some(display_name));
 
             if let Some(avatar_url) = &post.author.avatar {
-                Self::load_avatar(avatar.clone(), avatar_url.clone());
+                avatar_cache::load_avatar(avatar.clone(), avatar_url.clone());
             }
         }
 
@@ -188,6 +234,23 @@ impl PostRow {
             label.set_text(&post.text);
         }
 
+        // Clear and repopulate images
+        if let Some(images_box) = imp.images_box.borrow().as_ref() {
+            while let Some(child) = images_box.first_child() {
+                images_box.remove(&child);
+            }
+            for url in &post.images {
+                let picture = gtk4::Picture::new();
+                picture.set_keep_aspect_ratio(true);
+                picture.set_can_shrink(true);
+                picture.set_size_request(200, 200);
+                picture.add_css_class("post-embed-image");
+                images_box.insert(&picture, -1);
+                avatar_cache::load_image_into_picture(picture, url.clone());
+            }
+            images_box.set_visible(!post.images.is_empty());
+        }
+
         if let Some(label) = imp.reply_count_label.borrow().as_ref() {
             label.set_text(&Self::format_count(post.reply_count));
         }
@@ -199,40 +262,6 @@ impl PostRow {
         if let Some(label) = imp.like_count_label.borrow().as_ref() {
             label.set_text(&Self::format_count(post.like_count));
         }
-    }
-
-    fn load_avatar(avatar: adw::Avatar, url: String) {
-        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
-
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async {
-                if let Ok(response) = reqwest::get(&url).await {
-                    if let Ok(bytes) = response.bytes().await {
-                        let _ = tx.send(bytes.to_vec());
-                    }
-                }
-            });
-        });
-
-        glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
-            match rx.try_recv() {
-                Ok(bytes) => {
-                    let glib_bytes = glib::Bytes::from(&bytes);
-                    let stream = gtk4::gio::MemoryInputStream::from_bytes(&glib_bytes);
-
-                    if let Ok(pixbuf) =
-                        gdk::gdk_pixbuf::Pixbuf::from_stream(&stream, gtk4::gio::Cancellable::NONE)
-                    {
-                        let texture = gdk::Texture::for_pixbuf(&pixbuf);
-                        avatar.set_custom_image(Some(&texture));
-                    }
-                    glib::ControlFlow::Break
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
-            }
-        });
     }
 
     fn format_count(count: Option<u32>) -> String {

@@ -9,7 +9,8 @@ use std::sync::Arc;
 use std::thread;
 
 use crate::atproto::{HangarClient, Post, Profile, Session};
-use crate::ui::{HangarWindow, LoginDialog};
+use crate::state::SessionManager;
+use crate::ui::{ComposeDialog, HangarWindow, LoginDialog};
 
 mod imp {
     use super::*;
@@ -19,6 +20,8 @@ mod imp {
     pub struct HangarApplication {
         pub client: RefCell<Option<Arc<HangarClient>>>,
         pub window: RefCell<Option<HangarWindow>>,
+        pub timeline_cursor: RefCell<Option<String>>,
+        pub loading_more: RefCell<bool>,
     }
 
     #[glib::object_subclass]
@@ -60,10 +63,29 @@ mod imp {
             let window = HangarWindow::new(app.upcast_ref::<adw::Application>());
             self.window.replace(Some(window.clone()));
 
+            let app_clone = app.clone();
+            window.set_load_more_callback(move || {
+                app_clone.fetch_timeline_more();
+            });
+
+            let app_clone = app.clone();
+            window.set_like_callback(move |uri, cid| {
+                app_clone.do_like(&uri, &cid);
+            });
+
+            let app_clone = app.clone();
+            window.set_repost_callback(move |uri, cid| {
+                app_clone.do_repost(&uri, &cid);
+            });
+
+            let app_clone = app.clone();
+            window.set_compose_callback(move || {
+                app_clone.open_compose_dialog();
+            });
+
             window.present();
 
-            // Show login dialog
-            app.show_login_dialog(&window);
+            app.try_restore_session();
         }
     }
 
@@ -93,6 +115,41 @@ impl HangarApplication {
             .expect("client not initialized")
     }
 
+    fn try_restore_session(&self) {
+        let (tx, rx) = std::sync::mpsc::channel::<Result<Session, String>>();
+        let client = self.client();
+
+        thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async {
+                let session = SessionManager::load().await.map_err(|e| e.to_string())?;
+                client.resume_session(&session).await.map_err(|e| e.to_string())?;
+                Ok(session)
+            });
+            let _ = tx.send(result);
+        });
+
+        let app = self.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            match rx.try_recv() {
+                Ok(Ok(session)) => {
+                    if app.imp().window.borrow().as_ref().is_some() {
+                        app.fetch_user_profile(&session.did);
+                        app.fetch_timeline();
+                    }
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        app.show_login_dialog(window);
+                    }
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+            }
+        });
+    }
+
     fn show_login_dialog(&self, window: &HangarWindow) {
         let dialog = LoginDialog::new(window);
 
@@ -113,12 +170,17 @@ impl HangarApplication {
             // Get a channel for sending results back
             let (tx, rx) = std::sync::mpsc::channel::<Result<Session, String>>();
 
-            // Spawn the async work on a separate thread with its own Tokio runtime
             let client = app.client();
             thread::spawn(move || {
                 let rt = tokio::runtime::Runtime::new().unwrap();
-                let result = rt.block_on(async { client.login(&handle, &password).await });
-                let _ = tx.send(result.map_err(|e| e.to_string()));
+                let result = rt.block_on(async {
+                    let session = client.login(&handle, &password).await.map_err(|e| e.to_string())?;
+                    if let Err(e) = SessionManager::store(&session).await {
+                        eprintln!("Failed to persist session: {}", e);
+                    }
+                    Ok(session)
+                });
+                let _ = tx.send(result);
             });
 
             // Poll for results on GTK main thread
@@ -203,20 +265,20 @@ impl HangarApplication {
     }
 
     fn fetch_timeline(&self) {
-        let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<Post>, String>>();
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(Vec<Post>, Option<String>), String>>();
 
         let client = self.client();
         thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             let result = rt.block_on(async { client.get_timeline(None).await });
-            let _ = tx.send(result.map(|(posts, _)| posts).map_err(|e| e.to_string()));
+            let _ = tx.send(result.map_err(|e| e.to_string()));
         });
 
         let app = self.clone();
         glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
             match rx.try_recv() {
-                Ok(Ok(posts)) => {
-                    println!("Fetched {} posts", posts.len());
+                Ok(Ok((posts, next_cursor))) => {
+                    app.imp().timeline_cursor.replace(next_cursor);
                     if let Some(window) = app.imp().window.borrow().as_ref() {
                         window.set_posts(posts);
                     }
@@ -229,6 +291,157 @@ impl HangarApplication {
                 Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     eprintln!("Failed to fetch timeline: connection lost");
+                    glib::ControlFlow::Break
+                }
+            }
+        });
+    }
+
+    fn do_like(&self, uri: &str, cid: &str) {
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let client = self.client();
+        let uri = uri.to_string();
+        let cid = cid.to_string();
+        thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async { client.like(&uri, &cid).await });
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            match rx.try_recv() {
+                Ok(Ok(())) => glib::ControlFlow::Break,
+                Ok(Err(e)) => {
+                    eprintln!("Like failed: {}", e);
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+            }
+        });
+    }
+
+    fn open_compose_dialog(&self) {
+        let window = match self.imp().window.borrow().as_ref() {
+            Some(w) => w.clone(),
+            None => return,
+        };
+        let dialog = ComposeDialog::new(&window);
+
+        let app = self.clone();
+        let dialog_weak = dialog.downgrade();
+
+        dialog.connect_post(move |text| {
+            if let Some(dialog) = dialog_weak.upgrade() {
+                dialog.set_loading(true);
+                dialog.hide_error();
+            }
+
+            let app = app.clone();
+            let dialog_weak = dialog_weak.clone();
+
+            let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+            let client = app.client();
+            let text = text.to_string();
+
+            thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                let result = rt.block_on(async { client.create_post(&text).await });
+                let _ = tx.send(result.map_err(|e| e.to_string()));
+            });
+
+            glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+                match rx.try_recv() {
+                    Ok(Ok(())) => {
+                        if let Some(dialog) = dialog_weak.upgrade() {
+                            dialog.set_loading(false);
+                            dialog.close();
+                        }
+                        app.fetch_timeline();
+                        glib::ControlFlow::Break
+                    }
+                    Ok(Err(e)) => {
+                        if let Some(dialog) = dialog_weak.upgrade() {
+                            dialog.set_loading(false);
+                            dialog.show_error(&e);
+                        }
+                        glib::ControlFlow::Break
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        if let Some(dialog) = dialog_weak.upgrade() {
+                            dialog.set_loading(false);
+                        }
+                        glib::ControlFlow::Break
+                    }
+                }
+            });
+        });
+
+        dialog.present();
+    }
+
+    fn do_repost(&self, uri: &str, cid: &str) {
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let client = self.client();
+        let uri = uri.to_string();
+        let cid = cid.to_string();
+        thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async { client.repost(&uri, &cid).await });
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            match rx.try_recv() {
+                Ok(Ok(())) => glib::ControlFlow::Break,
+                Ok(Err(e)) => {
+                    eprintln!("Repost failed: {}", e);
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+            }
+        });
+    }
+
+    pub fn fetch_timeline_more(&self) {
+        if *self.imp().loading_more.borrow() {
+            return;
+        }
+        let cursor = match self.imp().timeline_cursor.borrow().as_ref() {
+            Some(c) => c.clone(),
+            None => return,
+        };
+        self.imp().loading_more.replace(true);
+
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(Vec<Post>, Option<String>), String>>();
+        let client = self.client();
+        thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async { client.get_timeline(Some(&cursor)).await });
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+
+        let app = self.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            match rx.try_recv() {
+                Ok(Ok((posts, next_cursor))) => {
+                    app.imp().loading_more.replace(false);
+                    app.imp().timeline_cursor.replace(next_cursor);
+                    if !posts.is_empty() {
+                        if let Some(window) = app.imp().window.borrow().as_ref() {
+                            window.append_posts(posts);
+                        }
+                    }
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(e)) => {
+                    app.imp().loading_more.replace(false);
+                    eprintln!("Failed to fetch more timeline: {}", e);
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    app.imp().loading_more.replace(false);
                     glib::ControlFlow::Break
                 }
             }

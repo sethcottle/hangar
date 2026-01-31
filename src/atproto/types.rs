@@ -22,6 +22,7 @@ pub struct Post {
     pub like_count: Option<u32>,
     pub repost_count: Option<u32>,
     pub reply_count: Option<u32>,
+    pub images: Vec<String>,
 }
 
 #[derive(Debug, Clone)]

@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: MPL-2.0
 
-#![allow(dead_code)]
-
 use crate::atproto::Session;
 use crate::config::APP_ID;
 use secret_service::{EncryptionType, SecretService};
@@ -95,6 +93,7 @@ impl SessionManager {
         Ok(session)
     }
 
+    #[allow(dead_code)]
     pub async fn clear() -> Result<(), SessionError> {
         let ss = SecretService::connect(EncryptionType::Dh)
             .await

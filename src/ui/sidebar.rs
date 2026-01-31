@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use gtk4::gdk;
+use crate::ui::avatar_cache;
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
@@ -69,6 +69,7 @@ mod imp {
         pub avatar: RefCell<Option<adw::Avatar>>,
         pub nav_list: RefCell<Option<gtk4::ListBox>>,
         pub selected_item: Cell<Option<NavItem>>,
+        pub compose_btn: RefCell<Option<gtk4::Button>>,
     }
 
     #[glib::object_subclass]
@@ -165,6 +166,7 @@ impl Sidebar {
         compose_btn.set_width_request(48);
         compose_btn.set_height_request(48);
 
+        self.imp().compose_btn.replace(Some(compose_btn.clone()));
         compose_box.append(&compose_btn);
         self.append(&compose_box);
     }
@@ -207,48 +209,20 @@ impl Sidebar {
         self.imp().selected_item.get()
     }
 
+    pub fn connect_compose_clicked<F: Fn() + 'static>(&self, callback: F) {
+        if let Some(btn) = self.imp().compose_btn.borrow().as_ref() {
+            btn.connect_clicked(move |_| callback());
+        }
+    }
+
     pub fn set_user_avatar(&self, display_name: &str, avatar_url: Option<&str>) {
         if let Some(avatar) = self.imp().avatar.borrow().as_ref() {
             avatar.set_text(Some(display_name));
 
             if let Some(url) = avatar_url {
-                Self::load_avatar(avatar.clone(), url.to_string());
+                avatar_cache::load_avatar(avatar.clone(), url.to_string());
             }
         }
-    }
-
-    fn load_avatar(avatar: adw::Avatar, url: String) {
-        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
-
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async {
-                if let Ok(response) = reqwest::get(&url).await {
-                    if let Ok(bytes) = response.bytes().await {
-                        let _ = tx.send(bytes.to_vec());
-                    }
-                }
-            });
-        });
-
-        glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
-            match rx.try_recv() {
-                Ok(bytes) => {
-                    let glib_bytes = glib::Bytes::from(&bytes);
-                    let stream = gtk4::gio::MemoryInputStream::from_bytes(&glib_bytes);
-
-                    if let Ok(pixbuf) =
-                        gdk::gdk_pixbuf::Pixbuf::from_stream(&stream, gtk4::gio::Cancellable::NONE)
-                    {
-                        let texture = gdk::Texture::for_pixbuf(&pixbuf);
-                        avatar.set_custom_image(Some(&texture));
-                    }
-                    glib::ControlFlow::Break
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
-            }
-        });
     }
 }
 

@@ -4,6 +4,8 @@ use crate::atproto::types::{Post, Profile, Session};
 use crate::config::DEFAULT_PDS;
 use atrium_api::agent::AtpAgent;
 use atrium_api::agent::store::MemorySessionStore;
+use atrium_api::com::atproto::repo::create_record;
+use atrium_api::types::Unknown;
 use atrium_xrpc_client::reqwest::ReqwestClient;
 use std::sync::RwLock;
 use thiserror::Error;
@@ -175,6 +177,8 @@ impl HangarClient {
 
         let (text, created_at) = self.extract_post_record(&post_view.data.record);
 
+        let images = self.extract_post_images(&post_view.data.embed);
+
         Post {
             uri: post_view.data.uri,
             cid: post_view.data.cid.as_ref().to_string(),
@@ -190,7 +194,29 @@ impl HangarClient {
             repost_count: post_view.data.repost_count.map(|c| c as u32),
             like_count: post_view.data.like_count.map(|c| c as u32),
             indexed_at: post_view.data.indexed_at.as_str().to_string(),
+            images,
         }
+    }
+
+    fn extract_post_images(
+        &self,
+        embed: &Option<atrium_api::types::Union<atrium_api::app::bsky::feed::defs::PostViewEmbedRefs>>,
+    ) -> Vec<String> {
+        use atrium_api::app::bsky::feed::defs::PostViewEmbedRefs;
+        use atrium_api::types::Union;
+
+        let Some(Union::Refs(embed_ref)) = embed else {
+            return Vec::new();
+        };
+        let PostViewEmbedRefs::AppBskyEmbedImagesView(images_view) = embed_ref else {
+            return Vec::new();
+        };
+        images_view
+            .data
+            .images
+            .iter()
+            .map(|img| img.fullsize.as_str().to_string())
+            .collect()
     }
 
     #[allow(clippy::await_holding_lock)]
@@ -219,6 +245,117 @@ impl HangarClient {
             display_name: output.data.display_name.clone(),
             avatar: output.data.avatar.clone(),
         })
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    pub async fn like(&self, uri: &str, cid: &str) -> Result<(), ClientError> {
+        let agent_guard = self.agent.read().unwrap();
+        let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
+        let session = agent.get_session().await.ok_or(ClientError::NotAuthenticated)?;
+
+        let record_json = serde_json::json!({
+            "$type": "app.bsky.feed.like",
+            "subject": { "uri": uri, "cid": cid },
+            "createdAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        });
+        let record: Unknown = serde_json::from_value(record_json)
+            .map_err(|e| ClientError::InvalidResponse(e.to_string()))?;
+
+        let collection = atrium_api::types::string::Nsid::new("app.bsky.feed.like".to_string())
+            .map_err(|_| ClientError::InvalidResponse("invalid collection".into()))?;
+
+        let input = create_record::InputData {
+            collection,
+            record,
+            repo: session.data.did.clone().into(),
+            rkey: None,
+            swap_commit: None,
+            validate: None,
+        };
+
+        agent
+            .api
+            .com
+            .atproto
+            .repo
+            .create_record(input.into())
+            .await
+            .map_err(|e| ClientError::Network(e.to_string()))?;
+        Ok(())
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    pub async fn repost(&self, uri: &str, cid: &str) -> Result<(), ClientError> {
+        let agent_guard = self.agent.read().unwrap();
+        let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
+        let session = agent.get_session().await.ok_or(ClientError::NotAuthenticated)?;
+
+        let record_json = serde_json::json!({
+            "$type": "app.bsky.feed.repost",
+            "subject": { "uri": uri, "cid": cid },
+            "createdAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        });
+        let record: Unknown = serde_json::from_value(record_json)
+            .map_err(|e| ClientError::InvalidResponse(e.to_string()))?;
+
+        let collection = atrium_api::types::string::Nsid::new("app.bsky.feed.repost".to_string())
+            .map_err(|_| ClientError::InvalidResponse("invalid collection".into()))?;
+
+        let input = create_record::InputData {
+            collection,
+            record,
+            repo: session.data.did.clone().into(),
+            rkey: None,
+            swap_commit: None,
+            validate: None,
+        };
+
+        agent
+            .api
+            .com
+            .atproto
+            .repo
+            .create_record(input.into())
+            .await
+            .map_err(|e| ClientError::Network(e.to_string()))?;
+        Ok(())
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    pub async fn create_post(&self, text: &str) -> Result<(), ClientError> {
+        let agent_guard = self.agent.read().unwrap();
+        let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
+        let session = agent.get_session().await.ok_or(ClientError::NotAuthenticated)?;
+
+        let record_json = serde_json::json!({
+            "$type": "app.bsky.feed.post",
+            "text": text,
+            "createdAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        });
+        let record: Unknown = serde_json::from_value(record_json)
+            .map_err(|e| ClientError::InvalidResponse(e.to_string()))?;
+
+        let collection = atrium_api::types::string::Nsid::new("app.bsky.feed.post".to_string())
+            .map_err(|_| ClientError::InvalidResponse("invalid collection".into()))?;
+
+        let input = create_record::InputData {
+            collection,
+            record,
+            repo: session.data.did.clone().into(),
+            rkey: None,
+            swap_commit: None,
+            validate: None,
+        };
+
+        agent
+            .api
+            .com
+            .atproto
+            .repo
+            .create_record(input.into())
+            .await
+            .map_err(|e| ClientError::Network(e.to_string()))?;
+        Ok(())
     }
 
     fn extract_post_record(&self, record: &atrium_api::types::Unknown) -> (String, String) {

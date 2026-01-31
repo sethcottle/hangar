@@ -58,6 +58,10 @@ mod imp {
     pub struct HangarWindow {
         pub sidebar: RefCell<Option<Sidebar>>,
         pub timeline_model: RefCell<Option<gio::ListStore>>,
+        pub load_more_callback: RefCell<Option<Box<dyn Fn() + 'static>>>,
+        pub like_callback: RefCell<Option<Box<dyn Fn(String, String) + 'static>>>,
+        pub repost_callback: RefCell<Option<Box<dyn Fn(String, String) + 'static>>>,
+        pub compose_callback: RefCell<Option<Box<dyn Fn() + 'static>>>,
     }
 
     #[glib::object_subclass]
@@ -161,15 +165,29 @@ impl HangarWindow {
             }
         });
 
-        factory.connect_bind(|_, item| {
-            if let Some(list_item) = item.downcast_ref::<gtk4::ListItem>()
-                && let Some(post_object) = list_item.item().and_downcast::<PostObject>()
-                && let Some(post) = post_object.post()
-                && let Some(post_row) = list_item.child().and_downcast::<PostRow>()
-            {
-                post_row.bind(&post);
+        factory.connect_bind(glib::clone!(
+            @strong self as win => move |_, item| {
+                if let Some(list_item) = item.downcast_ref::<gtk4::ListItem>()
+                    && let Some(post_object) = list_item.item().and_downcast::<PostObject>()
+                    && let Some(post) = post_object.post()
+                    && let Some(post_row) = list_item.child().and_downcast::<PostRow>()
+                {
+                    post_row.bind(&post);
+                    let uri = post.uri.clone();
+                    let cid = post.cid.clone();
+                    let w = win.clone();
+                    post_row.connect_like_clicked(move || {
+                        w.imp().like_callback.borrow().as_ref().map(|cb| cb(uri.clone(), cid.clone()));
+                    });
+                    let uri = post.uri.clone();
+                    let cid = post.cid.clone();
+                    let w = win.clone();
+                    post_row.connect_repost_clicked(move || {
+                        w.imp().repost_callback.borrow().as_ref().map(|cb| cb(uri.clone(), cid.clone()));
+                    });
+                }
             }
-        });
+        ));
 
         let selection = gtk4::NoSelection::new(Some(model.clone()));
         let list_view = gtk4::ListView::new(Some(selection), Some(factory));
@@ -182,7 +200,55 @@ impl HangarWindow {
         let imp = self.imp();
         imp.timeline_model.replace(Some(model));
 
+        let adj = scrolled.vadjustment();
+        adj.connect_value_changed(glib::clone!(
+            @weak self as win => move |adj| {
+                let value = adj.value();
+                let upper = adj.upper();
+                let page_size = adj.page_size();
+                if value >= upper - page_size - 200.0 {
+                    if let Some(cb) = win.imp().load_more_callback.borrow().as_ref() {
+                        cb();
+                    }
+                }
+            }
+        ));
+
         scrolled
+    }
+
+    pub fn set_load_more_callback<F: Fn() + 'static>(&self, callback: F) {
+        self.imp()
+            .load_more_callback
+            .replace(Some(Box::new(callback)));
+    }
+
+    pub fn set_like_callback<F: Fn(String, String) + 'static>(&self, callback: F) {
+        self.imp()
+            .like_callback
+            .replace(Some(Box::new(callback)));
+    }
+
+    pub fn set_repost_callback<F: Fn(String, String) + 'static>(&self, callback: F) {
+        self.imp()
+            .repost_callback
+            .replace(Some(Box::new(callback)));
+    }
+
+    pub fn set_compose_callback<F: Fn() + 'static>(&self, callback: F) {
+        self.imp()
+            .compose_callback
+            .replace(Some(Box::new(callback)));
+        if let Some(sidebar) = self.imp().sidebar.borrow().as_ref() {
+            let win = self.clone();
+            sidebar.connect_compose_clicked(move || {
+                win.imp()
+                    .compose_callback
+                    .borrow()
+                    .as_ref()
+                    .map(|cb| cb());
+            });
+        }
     }
 
     pub fn set_posts(&self, posts: Vec<Post>) {
@@ -196,7 +262,6 @@ impl HangarWindow {
         }
     }
 
-    #[allow(dead_code)]
     pub fn append_posts(&self, posts: Vec<Post>) {
         if let Some(model) = self.imp().timeline_model.borrow().as_ref() {
             for post in posts {

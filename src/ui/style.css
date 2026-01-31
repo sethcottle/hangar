@@ -49,6 +49,15 @@
     font-weight: 600;
 }
 
+/* Post embed images */
+.card .post-images {
+    margin-top: 8px;
+}
+
+.card .post-embed-image {
+    border-radius: 8px;
+}
+
 /* Action buttons in post cards */
 .card .flat.circular {
     min-width: 32px;
