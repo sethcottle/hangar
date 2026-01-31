@@ -967,6 +967,198 @@ impl HangarClient {
 
         Ok((posts, output.data.cursor))
     }
+
+    /// Get a post thread (the main post and its replies)
+    #[allow(clippy::await_holding_lock)]
+    pub async fn get_thread(
+        &self,
+        post_uri: &str,
+    ) -> Result<Vec<Post>, ClientError> {
+        let agent_guard = self.agent.read().unwrap();
+        let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
+
+        let params = atrium_api::app::bsky::feed::get_post_thread::ParametersData {
+            uri: post_uri
+                .parse()
+                .map_err(|e| ClientError::InvalidResponse(format!("invalid URI: {e}")))?,
+            depth: Some(atrium_api::types::LimitedU16::try_from(6_u16).unwrap()),
+            parent_height: Some(atrium_api::types::LimitedU16::try_from(80_u16).unwrap()),
+        };
+
+        let output = agent
+            .api
+            .app
+            .bsky
+            .feed
+            .get_post_thread(params.into())
+            .await
+            .map_err(|e| ClientError::Network(e.to_string()))?;
+
+        // Extract posts from thread view
+        let mut posts = Vec::new();
+        self.extract_thread_posts(&output.data.thread, &mut posts);
+        Ok(posts)
+    }
+
+    /// Recursively extract posts from a thread view
+    fn extract_thread_posts(
+        &self,
+        thread: &atrium_api::types::Union<atrium_api::app::bsky::feed::get_post_thread::OutputThreadRefs>,
+        posts: &mut Vec<Post>,
+    ) {
+        use atrium_api::app::bsky::feed::get_post_thread::OutputThreadRefs;
+        use atrium_api::types::Union;
+
+        match thread {
+            Union::Refs(OutputThreadRefs::AppBskyFeedDefsThreadViewPost(thread_view)) => {
+                // Add parent posts first (recursively)
+                if let Some(parent) = &thread_view.data.parent {
+                    self.extract_parent_posts(parent, posts);
+                }
+
+                // Add the main post
+                let post = self.convert_post_view(&thread_view.data.post);
+                posts.push(post);
+
+                // Add replies
+                if let Some(replies) = &thread_view.data.replies {
+                    for reply in replies {
+                        self.extract_reply_posts(reply, posts);
+                    }
+                }
+            }
+            Union::Refs(OutputThreadRefs::AppBskyFeedDefsNotFoundPost(_)) => {}
+            Union::Refs(OutputThreadRefs::AppBskyFeedDefsBlockedPost(_)) => {}
+            _ => {}
+        }
+    }
+
+    /// Extract parent posts from thread (going up the chain)
+    fn extract_parent_posts(
+        &self,
+        parent: &atrium_api::types::Union<atrium_api::app::bsky::feed::defs::ThreadViewPostParentRefs>,
+        posts: &mut Vec<Post>,
+    ) {
+        use atrium_api::app::bsky::feed::defs::ThreadViewPostParentRefs;
+        use atrium_api::types::Union;
+
+        match parent {
+            Union::Refs(ThreadViewPostParentRefs::ThreadViewPost(thread_view)) => {
+                // Recurse to get older parents first
+                if let Some(grandparent) = &thread_view.data.parent {
+                    self.extract_parent_posts(grandparent, posts);
+                }
+                // Then add this parent
+                let post = self.convert_post_view(&thread_view.data.post);
+                posts.push(post);
+            }
+            Union::Refs(ThreadViewPostParentRefs::NotFoundPost(_)) => {}
+            Union::Refs(ThreadViewPostParentRefs::BlockedPost(_)) => {}
+            _ => {}
+        }
+    }
+
+    /// Extract reply posts from thread
+    fn extract_reply_posts(
+        &self,
+        reply: &atrium_api::types::Union<atrium_api::app::bsky::feed::defs::ThreadViewPostRepliesItem>,
+        posts: &mut Vec<Post>,
+    ) {
+        use atrium_api::app::bsky::feed::defs::ThreadViewPostRepliesItem;
+        use atrium_api::types::Union;
+
+        match reply {
+            Union::Refs(ThreadViewPostRepliesItem::ThreadViewPost(thread_view)) => {
+                let post = self.convert_post_view(&thread_view.data.post);
+                posts.push(post);
+
+                // Recursively add nested replies
+                if let Some(replies) = &thread_view.data.replies {
+                    for nested_reply in replies {
+                        self.extract_reply_posts(nested_reply, posts);
+                    }
+                }
+            }
+            Union::Refs(ThreadViewPostRepliesItem::NotFoundPost(_)) => {}
+            Union::Refs(ThreadViewPostRepliesItem::BlockedPost(_)) => {}
+            _ => {}
+        }
+    }
+
+    /// Convert a PostView to our Post type (used for thread extraction)
+    fn convert_post_view(&self, post_view: &atrium_api::app::bsky::feed::defs::PostView) -> Post {
+        let author = &post_view.data.author;
+        let (text, created_at) = self.extract_post_record(&post_view.data.record);
+        let embed = self.extract_embed(&post_view.data.embed);
+
+        let (viewer_like, viewer_repost) = post_view
+            .data
+            .viewer
+            .as_ref()
+            .map(|v| (v.data.like.clone(), v.data.repost.clone()))
+            .unwrap_or((None, None));
+
+        Post {
+            uri: post_view.data.uri.clone(),
+            cid: post_view.data.cid.as_ref().to_string(),
+            author: Profile {
+                did: author.data.did.to_string(),
+                handle: author.data.handle.to_string(),
+                display_name: author.data.display_name.clone(),
+                avatar: author.data.avatar.clone(),
+            },
+            text,
+            created_at,
+            reply_count: post_view.data.reply_count.map(|c| c as u32),
+            repost_count: post_view.data.repost_count.map(|c| c as u32),
+            like_count: post_view.data.like_count.map(|c| c as u32),
+            indexed_at: post_view.data.indexed_at.as_str().to_string(),
+            embed,
+            viewer_like,
+            viewer_repost,
+            repost_reason: None,
+            reply_context: None,
+        }
+    }
+
+    /// Get an author's feed (posts by a specific user)
+    #[allow(clippy::await_holding_lock)]
+    pub async fn get_author_feed(
+        &self,
+        actor: &str,
+        cursor: Option<&str>,
+    ) -> Result<(Vec<Post>, Option<String>), ClientError> {
+        let agent_guard = self.agent.read().unwrap();
+        let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
+
+        let params = atrium_api::app::bsky::feed::get_author_feed::ParametersData {
+            actor: actor
+                .parse()
+                .map_err(|e| ClientError::InvalidResponse(format!("invalid actor: {e}")))?,
+            cursor: cursor.map(String::from),
+            filter: None,
+            include_pins: None,
+            limit: None,
+        };
+
+        let output = agent
+            .api
+            .app
+            .bsky
+            .feed
+            .get_author_feed(params.into())
+            .await
+            .map_err(|e| ClientError::Network(e.to_string()))?;
+
+        let posts: Vec<Post> = output
+            .data
+            .feed
+            .into_iter()
+            .map(|feed_view| self.convert_feed_view_post(feed_view))
+            .collect();
+
+        Ok((posts, output.data.cursor))
+    }
 }
 
 impl Default for HangarClient {

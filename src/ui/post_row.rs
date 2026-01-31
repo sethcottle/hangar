@@ -7,6 +7,8 @@ use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
 use libadwaita as adw;
 
+use crate::atproto::Profile;
+
 mod imp {
     use super::*;
     use std::cell::RefCell;
@@ -41,6 +43,9 @@ mod imp {
         pub is_reposted: RefCell<bool>,
         pub viewer_like_uri: RefCell<Option<String>>,
         pub viewer_repost_uri: RefCell<Option<String>>,
+        // Navigation callbacks
+        pub post_clicked_callback: RefCell<Option<Box<dyn Fn(Post) + 'static>>>,
+        pub profile_clicked_callback: RefCell<Option<Box<dyn Fn(Profile) + 'static>>>,
     }
 
     #[glib::object_subclass]
@@ -101,8 +106,25 @@ impl PostRow {
         // Header row: avatar + name + handle + time
         let header = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
 
+        // Wrap avatar in a button-like container for clickability
+        let avatar_btn = gtk4::Button::new();
+        avatar_btn.add_css_class("flat");
+        avatar_btn.add_css_class("circular");
+        avatar_btn.set_cursor_from_name(Some("pointer"));
         let avatar = adw::Avatar::new(40, None, true);
-        header.append(&avatar);
+        avatar_btn.set_child(Some(&avatar));
+        header.append(&avatar_btn);
+
+        // Connect avatar click to profile navigation
+        let post_row = self.clone();
+        avatar_btn.connect_clicked(move |_| {
+            let imp = post_row.imp();
+            if let Some(post) = imp.post.borrow().as_ref() {
+                if let Some(cb) = imp.profile_clicked_callback.borrow().as_ref() {
+                    cb(post.author.clone());
+                }
+            }
+        });
 
         let name_box = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
         name_box.set_hexpand(true);
@@ -138,21 +160,40 @@ impl PostRow {
 
         self.append(&header);
 
+        // Content area (clickable to open thread)
+        let content_area = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        content_area.set_cursor_from_name(Some("pointer"));
+
         // Post content
         let content = gtk4::Label::new(None);
         content.set_halign(gtk4::Align::Start);
         content.set_wrap(true);
         content.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
-        content.set_selectable(true);
+        content.set_selectable(false); // Disable selection to allow click-through
         content.set_xalign(0.0);
-        self.append(&content);
+        content_area.append(&content);
 
         // Unified embed container (images, videos, external cards, quotes)
         let embed_container = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
         embed_container.set_margin_top(8);
         embed_container.add_css_class("post-embed");
         embed_container.set_visible(false);
-        self.append(&embed_container);
+        content_area.append(&embed_container);
+
+        // Add click gesture to content area
+        let gesture = gtk4::GestureClick::new();
+        let post_row = self.clone();
+        gesture.connect_released(move |_, _, _, _| {
+            let imp = post_row.imp();
+            if let Some(post) = imp.post.borrow().as_ref() {
+                if let Some(cb) = imp.post_clicked_callback.borrow().as_ref() {
+                    cb(post.clone());
+                }
+            }
+        });
+        content_area.add_controller(gesture);
+
+        self.append(&content_area);
 
         // Action bar
         let actions = gtk4::Box::new(gtk4::Orientation::Horizontal, 24);
@@ -421,6 +462,20 @@ impl PostRow {
             let id = btn.connect_clicked(move |_| f());
             imp.reply_handler_id.replace(Some(id));
         }
+    }
+
+    /// Set callback for when the post content area is clicked (to open thread)
+    pub fn set_post_clicked_callback<F: Fn(Post) + 'static>(&self, f: F) {
+        self.imp()
+            .post_clicked_callback
+            .replace(Some(Box::new(f)));
+    }
+
+    /// Set callback for when the avatar/profile is clicked (to open profile)
+    pub fn set_profile_clicked_callback<F: Fn(Profile) + 'static>(&self, f: F) {
+        self.imp()
+            .profile_clicked_callback
+            .replace(Some(Box::new(f)));
     }
 
     pub fn bind(&self, post: &Post) {

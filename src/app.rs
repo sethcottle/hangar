@@ -137,6 +137,16 @@ mod imp {
                 app_clone.switch_feed(feed);
             });
 
+            let app_clone = app.clone();
+            window.set_post_clicked_callback(move |post| {
+                app_clone.open_thread_view(post);
+            });
+
+            let app_clone = app.clone();
+            window.set_profile_clicked_callback(move |profile| {
+                app_clone.open_profile_view(profile);
+            });
+
             window.present();
 
             app.try_restore_session();
@@ -972,6 +982,76 @@ impl HangarApplication {
                 Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     eprintln!("Failed to fetch feed: connection lost");
+                    glib::ControlFlow::Break
+                }
+            }
+        });
+    }
+
+    /// Open the thread view for a post
+    fn open_thread_view(&self, post: Post) {
+        let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<Post>, String>>();
+        let client = self.client();
+        let post_uri = post.uri.clone();
+        let main_post = post.clone();
+
+        thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async { client.get_thread(&post_uri).await });
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+
+        let app = self.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            match rx.try_recv() {
+                Ok(Ok(posts)) => {
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.push_thread_page(&main_post, posts);
+                    }
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(e)) => {
+                    eprintln!("Failed to fetch thread: {}", e);
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    eprintln!("Failed to fetch thread: connection lost");
+                    glib::ControlFlow::Break
+                }
+            }
+        });
+    }
+
+    /// Open the profile view for a user
+    fn open_profile_view(&self, profile: Profile) {
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(Vec<Post>, Option<String>), String>>();
+        let client = self.client();
+        let actor = profile.did.clone();
+        let profile_clone = profile.clone();
+
+        thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async { client.get_author_feed(&actor, None).await });
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+
+        let app = self.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            match rx.try_recv() {
+                Ok(Ok((posts, _cursor))) => {
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.push_profile_page(&profile_clone, posts);
+                    }
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(e)) => {
+                    eprintln!("Failed to fetch profile feed: {}", e);
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    eprintln!("Failed to fetch profile feed: connection lost");
                     glib::ControlFlow::Break
                 }
             }

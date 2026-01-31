@@ -51,12 +51,15 @@ mod post_object {
 
 use post_object::PostObject;
 
+use crate::atproto::Profile;
+
 mod imp {
     use super::*;
 
     #[derive(Default)]
     pub struct HangarWindow {
         pub sidebar: RefCell<Option<Sidebar>>,
+        pub navigation_view: RefCell<Option<adw::NavigationView>>,
         pub timeline_model: RefCell<Option<gio::ListStore>>,
         pub load_more_callback: RefCell<Option<Box<dyn Fn() + 'static>>>,
         pub refresh_callback: RefCell<Option<Box<dyn Fn() + 'static>>>,
@@ -75,6 +78,9 @@ mod imp {
         pub feed_changed_callback: RefCell<Option<Box<dyn Fn(SavedFeed) + 'static>>>,
         pub saved_feeds: RefCell<Vec<SavedFeed>>,
         pub current_feed_uri: RefCell<String>,
+        // Navigation callbacks
+        pub post_clicked_callback: RefCell<Option<Box<dyn Fn(Post) + 'static>>>,
+        pub profile_clicked_callback: RefCell<Option<Box<dyn Fn(Profile) + 'static>>>,
     }
 
     #[glib::object_subclass]
@@ -123,13 +129,22 @@ impl HangarWindow {
         let separator = gtk4::Separator::new(gtk4::Orientation::Vertical);
         main_box.append(&separator);
 
-        let content = self.build_content();
-        main_box.append(&content);
+        // Use NavigationView for push/pop navigation between screens
+        let nav_view = adw::NavigationView::new();
+        nav_view.set_hexpand(true);
+        nav_view.set_vexpand(true);
+
+        // Create the timeline page as the root
+        let timeline_page = self.build_timeline_page();
+        nav_view.add(&timeline_page);
+
+        main_box.append(&nav_view);
 
         self.set_content(Some(&main_box));
 
         let imp = self.imp();
         imp.sidebar.replace(Some(sidebar));
+        imp.navigation_view.replace(Some(nav_view));
 
         // Add keyboard shortcuts
         self.setup_shortcuts();
@@ -168,12 +183,13 @@ impl HangarWindow {
         self.add_controller(controller);
     }
 
-    fn build_content(&self) -> gtk4::Box {
+    fn build_timeline_page(&self) -> adw::NavigationPage {
         let content_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         content_box.set_hexpand(true);
 
         let header = adw::HeaderBar::new();
         header.set_show_start_title_buttons(false);
+        header.set_show_end_title_buttons(false);
 
         // Feed selector button with popover
         let feed_menu_btn = gtk4::MenuButton::new();
@@ -268,7 +284,9 @@ impl HangarWindow {
         content_box.append(&header);
         content_box.append(&self.build_timeline());
 
-        content_box
+        let page = adw::NavigationPage::new(&content_box, "Home");
+        page.set_tag(Some("timeline"));
+        page
     }
 
     fn build_timeline(&self) -> gtk4::Box {
@@ -326,6 +344,15 @@ impl HangarWindow {
                     let w = win.clone();
                     post_row.connect_reply_clicked(move || {
                         w.imp().reply_callback.borrow().as_ref().map(|cb| cb(post_clone.clone()));
+                    });
+                    // Navigation callbacks
+                    let w = win.clone();
+                    post_row.set_post_clicked_callback(move |p| {
+                        w.imp().post_clicked_callback.borrow().as_ref().map(|cb| cb(p));
+                    });
+                    let w = win.clone();
+                    post_row.set_profile_clicked_callback(move |profile| {
+                        w.imp().profile_clicked_callback.borrow().as_ref().map(|cb| cb(profile));
                     });
                 }
             }
@@ -592,5 +619,332 @@ impl HangarWindow {
         }
         self.imp().current_feed_uri.replace(uri.to_string());
         self.rebuild_feed_list();
+    }
+
+    /// Set callback for when a post is clicked (to open thread view)
+    pub fn set_post_clicked_callback<F: Fn(Post) + 'static>(&self, callback: F) {
+        self.imp()
+            .post_clicked_callback
+            .replace(Some(Box::new(callback)));
+    }
+
+    /// Set callback for when a profile is clicked (to open profile view)
+    pub fn set_profile_clicked_callback<F: Fn(Profile) + 'static>(&self, callback: F) {
+        self.imp()
+            .profile_clicked_callback
+            .replace(Some(Box::new(callback)));
+    }
+
+    /// Push a thread view page onto the navigation stack
+    pub fn push_thread_page(&self, post: &Post, thread_posts: Vec<Post>) {
+        let Some(nav_view) = self.imp().navigation_view.borrow().as_ref().cloned() else {
+            return;
+        };
+
+        let page = self.build_thread_page(post, thread_posts);
+        nav_view.push(&page);
+    }
+
+    /// Push a profile view page onto the navigation stack
+    pub fn push_profile_page(&self, profile: &Profile, posts: Vec<Post>) {
+        let Some(nav_view) = self.imp().navigation_view.borrow().as_ref().cloned() else {
+            return;
+        };
+
+        let page = self.build_profile_page(profile, posts);
+        nav_view.push(&page);
+    }
+
+    /// Pop to the timeline (root) page
+    pub fn pop_to_timeline(&self) {
+        if let Some(nav_view) = self.imp().navigation_view.borrow().as_ref() {
+            nav_view.pop_to_tag("timeline");
+        }
+    }
+
+    /// Build a thread view page
+    fn build_thread_page(&self, main_post: &Post, posts: Vec<Post>) -> adw::NavigationPage {
+        let content_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        content_box.set_hexpand(true);
+
+        let header = adw::HeaderBar::new();
+        header.set_show_start_title_buttons(false);
+        header.set_show_end_title_buttons(false);
+
+        let title = gtk4::Label::new(Some("Thread"));
+        title.add_css_class("title");
+        header.set_title_widget(Some(&title));
+
+        content_box.append(&header);
+
+        // Split posts into: parents (before main), main post, replies (after main)
+        let main_uri = &main_post.uri;
+        let main_post_idx = posts.iter().position(|p| &p.uri == main_uri);
+
+        let (parent_posts, main_and_replies): (Vec<_>, Vec<_>) = match main_post_idx {
+            Some(idx) => (posts[..idx].to_vec(), posts[idx..].to_vec()),
+            None => (vec![], posts),
+        };
+
+        let (main_post_vec, reply_posts): (Vec<_>, Vec<_>) = if main_and_replies.is_empty() {
+            (vec![main_post.clone()], vec![])
+        } else {
+            (vec![main_and_replies[0].clone()], main_and_replies.into_iter().skip(1).collect())
+        };
+
+        let the_main_post = main_post_vec.first().cloned().unwrap_or_else(|| main_post.clone());
+
+        // Create scrollable content
+        let scroll_content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+
+        // Helper to create a post list section
+        let create_post_list = |win: &Self, posts_to_show: Vec<Post>| -> gtk4::ListView {
+            let model = gio::ListStore::new::<PostObject>();
+            let factory = gtk4::SignalListItemFactory::new();
+
+            factory.connect_setup(|_, item| {
+                let post_row = PostRow::new();
+                if let Some(list_item) = item.downcast_ref::<gtk4::ListItem>() {
+                    list_item.set_child(Some(&post_row));
+                }
+            });
+
+            let w = win.clone();
+            factory.connect_bind(move |_, item| {
+                if let Some(list_item) = item.downcast_ref::<gtk4::ListItem>()
+                    && let Some(post_object) = list_item.item().and_downcast::<PostObject>()
+                    && let Some(post) = post_object.post()
+                    && let Some(post_row) = list_item.child().and_downcast::<PostRow>()
+                {
+                    post_row.bind(&post);
+                    let post_for_like = post.clone();
+                    let win = w.clone();
+                    post_row.connect_like_clicked(move |row, was_liked, like_uri| {
+                        let mut post_with_state = post_for_like.clone();
+                        post_with_state.viewer_like = if was_liked { like_uri } else { None };
+                        let row_weak = row.downgrade();
+                        win.imp().like_callback.borrow().as_ref().map(|cb| cb(post_with_state, row_weak));
+                    });
+                    let post_for_repost = post.clone();
+                    let win = w.clone();
+                    post_row.connect_repost_clicked(move |row, was_reposted, repost_uri| {
+                        let mut post_with_state = post_for_repost.clone();
+                        post_with_state.viewer_repost = if was_reposted { repost_uri } else { None };
+                        let row_weak = row.downgrade();
+                        win.imp().repost_callback.borrow().as_ref().map(|cb| cb(post_with_state, row_weak));
+                    });
+                    let post_for_quote = post.clone();
+                    let win = w.clone();
+                    post_row.connect_quote_clicked(move || {
+                        win.imp().quote_callback.borrow().as_ref().map(|cb| cb(post_for_quote.clone()));
+                    });
+                    let post_clone = post.clone();
+                    let win = w.clone();
+                    post_row.connect_reply_clicked(move || {
+                        win.imp().reply_callback.borrow().as_ref().map(|cb| cb(post_clone.clone()));
+                    });
+                }
+            });
+
+            for post in posts_to_show {
+                model.append(&PostObject::new(post));
+            }
+
+            let selection = gtk4::NoSelection::new(Some(model));
+            let list_view = gtk4::ListView::new(Some(selection), Some(factory));
+            list_view.add_css_class("background");
+            list_view
+        };
+
+        // Add parent posts (if any)
+        if !parent_posts.is_empty() {
+            let parent_list = create_post_list(self, parent_posts);
+            scroll_content.append(&parent_list);
+        }
+
+        // Add the main post
+        let main_list = create_post_list(self, vec![the_main_post.clone()]);
+        scroll_content.append(&main_list);
+
+        // Add "Posted {date}" separator
+        let posted_separator = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+        posted_separator.add_css_class("thread-separator");
+        posted_separator.set_margin_top(8);
+        posted_separator.set_margin_bottom(8);
+
+        // Format the date: "Posted Sat, Jan 31, 2026 at 12:50 PM"
+        let posted_text = Self::format_full_timestamp(&the_main_post.indexed_at);
+        let posted_label = gtk4::Label::new(Some(&posted_text));
+        posted_label.add_css_class("dim-label");
+        posted_label.set_halign(gtk4::Align::Center);
+        posted_separator.append(&posted_label);
+
+        scroll_content.append(&posted_separator);
+
+        // Add "Replies" section if there are replies
+        if !reply_posts.is_empty() {
+            let replies_label = gtk4::Label::new(Some("Replies"));
+            replies_label.add_css_class("title-4");
+            replies_label.set_halign(gtk4::Align::Start);
+            replies_label.set_margin_start(16);
+            replies_label.set_margin_top(8);
+            replies_label.set_margin_bottom(8);
+            scroll_content.append(&replies_label);
+
+            let replies_list = create_post_list(self, reply_posts);
+            scroll_content.append(&replies_list);
+        }
+
+        let scrolled = gtk4::ScrolledWindow::new();
+        scrolled.set_vexpand(true);
+        scrolled.set_child(Some(&scroll_content));
+        content_box.append(&scrolled);
+
+        let page = adw::NavigationPage::new(&content_box, "Thread");
+        page.set_tag(Some("thread"));
+        page
+    }
+
+    /// Format a timestamp as "Posted Sat, Jan 31, 2026 at 12:50 PM"
+    fn format_full_timestamp(indexed_at: &str) -> String {
+        if indexed_at.is_empty() {
+            return "Posted".to_string();
+        }
+
+        let Ok(post_time) = chrono::DateTime::parse_from_rfc3339(indexed_at) else {
+            return "Posted".to_string();
+        };
+
+        // Format: "Posted Sat, Jan 31, 2026 at 12:50 PM"
+        format!(
+            "Posted {}",
+            post_time.format("%a, %b %d, %Y at %l:%M %p").to_string().trim()
+        )
+    }
+
+    /// Build a profile view page
+    fn build_profile_page(&self, profile: &Profile, posts: Vec<Post>) -> adw::NavigationPage {
+        let content_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        content_box.set_hexpand(true);
+
+        let header = adw::HeaderBar::new();
+        header.set_show_start_title_buttons(false);
+        header.set_show_end_title_buttons(false);
+
+        let display_name = profile
+            .display_name
+            .as_deref()
+            .unwrap_or(&profile.handle);
+        let title = gtk4::Label::new(Some(display_name));
+        title.add_css_class("title");
+        header.set_title_widget(Some(&title));
+
+        content_box.append(&header);
+
+        // Profile header section
+        let profile_header = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+        profile_header.set_margin_start(16);
+        profile_header.set_margin_end(16);
+        profile_header.set_margin_top(16);
+        profile_header.set_margin_bottom(16);
+
+        let avatar = adw::Avatar::new(80, Some(display_name), true);
+        if let Some(avatar_url) = &profile.avatar {
+            crate::ui::avatar_cache::load_avatar(avatar.clone(), avatar_url.clone());
+        }
+        avatar.set_halign(gtk4::Align::Center);
+        profile_header.append(&avatar);
+
+        let name_label = gtk4::Label::new(Some(display_name));
+        name_label.add_css_class("title-1");
+        name_label.set_halign(gtk4::Align::Center);
+        profile_header.append(&name_label);
+
+        let handle_label = gtk4::Label::new(Some(&format!("@{}", profile.handle)));
+        handle_label.add_css_class("dim-label");
+        handle_label.set_halign(gtk4::Align::Center);
+        profile_header.append(&handle_label);
+
+        content_box.append(&profile_header);
+
+        // Separator
+        let separator = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+        content_box.append(&separator);
+
+        // Posts section label
+        let posts_label = gtk4::Label::new(Some("Posts"));
+        posts_label.add_css_class("title-4");
+        posts_label.set_halign(gtk4::Align::Start);
+        posts_label.set_margin_start(16);
+        posts_label.set_margin_top(12);
+        posts_label.set_margin_bottom(8);
+        content_box.append(&posts_label);
+
+        // Build posts list
+        let model = gio::ListStore::new::<PostObject>();
+        let factory = gtk4::SignalListItemFactory::new();
+
+        factory.connect_setup(|_, item| {
+            let post_row = PostRow::new();
+            if let Some(list_item) = item.downcast_ref::<gtk4::ListItem>() {
+                list_item.set_child(Some(&post_row));
+            }
+        });
+
+        let win = self.clone();
+        factory.connect_bind(move |_, item| {
+            if let Some(list_item) = item.downcast_ref::<gtk4::ListItem>()
+                && let Some(post_object) = list_item.item().and_downcast::<PostObject>()
+                && let Some(post) = post_object.post()
+                && let Some(post_row) = list_item.child().and_downcast::<PostRow>()
+            {
+                post_row.bind(&post);
+                // Wire up like/repost/reply/quote callbacks
+                let post_for_like = post.clone();
+                let w = win.clone();
+                post_row.connect_like_clicked(move |row, was_liked, like_uri| {
+                    let mut post_with_state = post_for_like.clone();
+                    post_with_state.viewer_like = if was_liked { like_uri } else { None };
+                    let row_weak = row.downgrade();
+                    w.imp().like_callback.borrow().as_ref().map(|cb| cb(post_with_state, row_weak));
+                });
+                let post_for_repost = post.clone();
+                let w = win.clone();
+                post_row.connect_repost_clicked(move |row, was_reposted, repost_uri| {
+                    let mut post_with_state = post_for_repost.clone();
+                    post_with_state.viewer_repost = if was_reposted { repost_uri } else { None };
+                    let row_weak = row.downgrade();
+                    w.imp().repost_callback.borrow().as_ref().map(|cb| cb(post_with_state, row_weak));
+                });
+                let post_for_quote = post.clone();
+                let w = win.clone();
+                post_row.connect_quote_clicked(move || {
+                    w.imp().quote_callback.borrow().as_ref().map(|cb| cb(post_for_quote.clone()));
+                });
+                let post_clone = post.clone();
+                let w = win.clone();
+                post_row.connect_reply_clicked(move || {
+                    w.imp().reply_callback.borrow().as_ref().map(|cb| cb(post_clone.clone()));
+                });
+            }
+        });
+
+        // Add posts to model
+        for post in posts {
+            model.append(&PostObject::new(post));
+        }
+
+        let selection = gtk4::NoSelection::new(Some(model));
+        let list_view = gtk4::ListView::new(Some(selection), Some(factory));
+        list_view.add_css_class("background");
+
+        let scrolled = gtk4::ScrolledWindow::new();
+        scrolled.set_vexpand(true);
+        scrolled.set_child(Some(&list_view));
+        content_box.append(&scrolled);
+
+        let page = adw::NavigationPage::new(&content_box, display_name);
+        page.set_tag(Some("profile"));
+        page
     }
 }
