@@ -12,7 +12,7 @@ keywords = ["bluesky", "atproto", "gtk", "gnome", "social"]
 categories = ["gui"]
 
 [dependencies]
-gtk4 = "0.9"
+gtk4 = { version = "0.9", features = ["v4_6"] }
 libadwaita = "0.7"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 atrium-api = { version = "0.24", features = ["agent"] }

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use crate::atproto::types::{Post, Profile, Session};
+use crate::atproto::types::{Post, Profile, SavedFeed, Session};
 use crate::config::DEFAULT_PDS;
 use atrium_api::agent::AtpAgent;
 use atrium_api::agent::store::MemorySessionStore;
@@ -434,6 +434,148 @@ impl HangarClient {
             }
             _ => (String::new(), String::new()),
         }
+    }
+
+    /// Get the user's saved/pinned feeds from preferences
+    #[allow(clippy::await_holding_lock)]
+    pub async fn get_saved_feeds(&self) -> Result<Vec<SavedFeed>, ClientError> {
+        let agent_guard = self.agent.read().unwrap();
+        let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
+
+        let output = agent
+            .api
+            .app
+            .bsky
+            .actor
+            .get_preferences(
+                atrium_api::app::bsky::actor::get_preferences::ParametersData {}.into(),
+            )
+            .await
+            .map_err(|e| ClientError::Network(e.to_string()))?;
+
+        let mut feeds = vec![SavedFeed::home()];
+
+        // Parse preferences to find saved feeds
+        for pref in output.data.preferences.iter() {
+            use atrium_api::app::bsky::actor::defs::PreferencesItem;
+            use atrium_api::types::Union;
+
+            if let Union::Refs(PreferencesItem::SavedFeedsPrefV2(saved_feeds_pref)) = pref {
+                for item in &saved_feeds_pref.data.items {
+                    // Only include pinned feeds (shown in feed selector)
+                    if item.data.pinned {
+                        let feed_type = item.data.r#type.clone();
+                        let uri = item.data.value.clone();
+
+                        // Skip timeline type as we already have "Following"
+                        if feed_type == "timeline" {
+                            continue;
+                        }
+
+                        // We'll need to fetch the display name separately
+                        // For now, use the rkey from URI as a fallback name
+                        let display_name = uri
+                            .split('/')
+                            .last()
+                            .unwrap_or("Feed")
+                            .to_string();
+
+                        feeds.push(SavedFeed {
+                            feed_type,
+                            uri,
+                            display_name,
+                            description: None,
+                            pinned: true,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Now fetch display names for the feed generators
+        let feed_uris: Vec<String> = feeds
+            .iter()
+            .filter(|f| !f.is_home())
+            .map(|f| f.uri.clone())
+            .collect();
+
+        if !feed_uris.is_empty() {
+            if let Ok(generators) = self.get_feed_generators_internal(&agent, &feed_uris).await {
+                for (uri, name, description) in generators {
+                    if let Some(feed) = feeds.iter_mut().find(|f| f.uri == uri) {
+                        feed.display_name = name;
+                        feed.description = description;
+                    }
+                }
+            }
+        }
+
+        Ok(feeds)
+    }
+
+    /// Internal helper to get feed generator metadata (uri, display_name, description)
+    #[allow(clippy::await_holding_lock)]
+    async fn get_feed_generators_internal(
+        &self,
+        agent: &Agent,
+        uris: &[String],
+    ) -> Result<Vec<(String, String, Option<String>)>, ClientError> {
+        let params = atrium_api::app::bsky::feed::get_feed_generators::ParametersData {
+            feeds: uris.iter().map(|s| s.parse().unwrap()).collect(),
+        };
+
+        let output = agent
+            .api
+            .app
+            .bsky
+            .feed
+            .get_feed_generators(params.into())
+            .await
+            .map_err(|e| ClientError::Network(e.to_string()))?;
+
+        Ok(output
+            .data
+            .feeds
+            .into_iter()
+            .map(|f| (f.data.uri, f.data.display_name, f.data.description))
+            .collect())
+    }
+
+    /// Fetch a custom feed by its AT-URI
+    #[allow(clippy::await_holding_lock)]
+    pub async fn get_feed(
+        &self,
+        feed_uri: &str,
+        cursor: Option<&str>,
+    ) -> Result<(Vec<Post>, Option<String>), ClientError> {
+        let agent_guard = self.agent.read().unwrap();
+        let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
+
+        let params = atrium_api::app::bsky::feed::get_feed::ParametersData {
+            feed: feed_uri
+                .parse()
+                .map_err(|e| ClientError::InvalidResponse(format!("invalid feed URI: {e}")))?,
+            cursor: cursor.map(String::from),
+            limit: None,
+        };
+
+        let output = agent
+            .api
+            .app
+            .bsky
+            .feed
+            .get_feed(params.into())
+            .await
+            .map_err(|e| ClientError::Network(e.to_string()))?;
+
+        let posts: Vec<Post> = output
+            .data
+            .feed
+            .into_iter()
+            .map(|feed_view| self.convert_feed_view_post(feed_view))
+            .collect();
+
+        Ok((posts, output.data.cursor))
     }
 }
 

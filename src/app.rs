@@ -8,7 +8,7 @@ use std::cell::RefCell;
 use std::sync::Arc;
 use std::thread;
 
-use crate::atproto::{HangarClient, Post, Profile, Session};
+use crate::atproto::{HangarClient, Post, Profile, SavedFeed, Session};
 use crate::state::SessionManager;
 use crate::ui::{ComposeDialog, HangarWindow, LoginDialog, ReplyContext};
 
@@ -28,6 +28,8 @@ mod imp {
         pub pending_new_posts: RefCell<Vec<Post>>,
         /// Whether we're currently checking for new posts
         pub checking_new_posts: RefCell<bool>,
+        /// The currently selected feed
+        pub current_feed: RefCell<Option<SavedFeed>>,
     }
 
     #[glib::object_subclass]
@@ -124,6 +126,11 @@ mod imp {
                 app_clone.show_new_posts();
             });
 
+            let app_clone = app.clone();
+            window.set_feed_changed_callback(move |feed| {
+                app_clone.switch_feed(feed);
+            });
+
             window.present();
 
             app.try_restore_session();
@@ -176,6 +183,7 @@ impl HangarApplication {
                 Ok(Ok(session)) => {
                     if app.imp().window.borrow().as_ref().is_some() {
                         app.fetch_user_profile(&session.did);
+                        app.fetch_saved_feeds();
                         app.fetch_timeline();
                     }
                     glib::ControlFlow::Break
@@ -238,6 +246,9 @@ impl HangarApplication {
 
                         // Fetch user profile for sidebar avatar
                         app.fetch_user_profile(&session.did);
+
+                        // Fetch saved feeds for feed selector
+                        app.fetch_saved_feeds();
 
                         // Fetch timeline
                         app.fetch_timeline();
@@ -536,11 +547,26 @@ impl HangarApplication {
             window.set_loading_more(true);
         }
 
+        // Get current feed URI if not home
+        let current_feed = self.imp().current_feed.borrow().clone();
+        let feed_uri = current_feed.as_ref().and_then(|f| {
+            if f.is_home() {
+                None
+            } else {
+                Some(f.uri.clone())
+            }
+        });
+
         let (tx, rx) = std::sync::mpsc::channel::<Result<(Vec<Post>, Option<String>), String>>();
         let client = self.client();
         thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
-            let result = rt.block_on(async { client.get_timeline(Some(&cursor)).await });
+            let result = rt.block_on(async {
+                match feed_uri {
+                    Some(uri) => client.get_feed(&uri, Some(&cursor)).await,
+                    None => client.get_timeline(Some(&cursor)).await,
+                }
+            });
             let _ = tx.send(result.map_err(|e| e.to_string()));
         });
 
@@ -601,12 +627,27 @@ impl HangarApplication {
 
         self.imp().checking_new_posts.replace(true);
 
+        // Get current feed URI if not home
+        let current_feed = self.imp().current_feed.borrow().clone();
+        let feed_uri = current_feed.as_ref().and_then(|f| {
+            if f.is_home() {
+                None
+            } else {
+                Some(f.uri.clone())
+            }
+        });
+
         let (tx, rx) = std::sync::mpsc::channel::<Result<(Vec<Post>, Option<String>), String>>();
         let client = self.client();
 
         thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
-            let result = rt.block_on(async { client.get_timeline(None).await });
+            let result = rt.block_on(async {
+                match feed_uri {
+                    Some(uri) => client.get_feed(&uri, None).await,
+                    None => client.get_timeline(None).await,
+                }
+            });
             let _ = tx.send(result.map_err(|e| e.to_string()));
         });
 
@@ -693,6 +734,131 @@ impl HangarApplication {
             window.prepend_posts(pending);
             window.scroll_to_top();
         }
+    }
+
+    /// Fetch the user's saved feeds and populate the feed selector
+    fn fetch_saved_feeds(&self) {
+        let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<SavedFeed>, String>>();
+        let client = self.client();
+
+        thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async { client.get_saved_feeds().await });
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+
+        let app = self.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            match rx.try_recv() {
+                Ok(Ok(feeds)) => {
+                    // Set default feed if not already set
+                    if app.imp().current_feed.borrow().is_none() {
+                        if let Some(first) = feeds.first() {
+                            app.imp().current_feed.replace(Some(first.clone()));
+                        }
+                    }
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        // Set the current feed name/uri first so checkmark shows correctly
+                        if let Some(current) = app.imp().current_feed.borrow().as_ref() {
+                            window.set_current_feed_name(&current.display_name, &current.uri);
+                        }
+                        window.set_saved_feeds(feeds);
+                    }
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(e)) => {
+                    eprintln!("Failed to fetch saved feeds: {}", e);
+                    // Still set up a default home feed
+                    let home_feed = vec![SavedFeed::home()];
+                    app.imp().current_feed.replace(Some(SavedFeed::home()));
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.set_saved_feeds(home_feed);
+                    }
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    eprintln!("Failed to fetch saved feeds: connection lost");
+                    glib::ControlFlow::Break
+                }
+            }
+        });
+    }
+
+    /// Switch to a different feed
+    fn switch_feed(&self, feed: SavedFeed) {
+        // Update current feed
+        let feed_name = feed.display_name.clone();
+        let feed_uri = feed.uri.clone();
+        self.imp().current_feed.replace(Some(feed.clone()));
+
+        // Update UI
+        if let Some(window) = self.imp().window.borrow().as_ref() {
+            window.set_current_feed_name(&feed_name, &feed_uri);
+            window.hide_new_posts_banner();
+        }
+
+        // Clear state
+        self.imp().timeline_cursor.replace(None);
+        self.imp().newest_post_uri.replace(None);
+        self.imp().pending_new_posts.replace(Vec::new());
+
+        // Fetch the new feed
+        self.fetch_current_feed();
+    }
+
+    /// Fetch posts for the current feed (home timeline or custom feed)
+    fn fetch_current_feed(&self) {
+        let current_feed = self.imp().current_feed.borrow().clone();
+        let feed_uri = current_feed.as_ref().and_then(|f| {
+            if f.is_home() {
+                None
+            } else {
+                Some(f.uri.clone())
+            }
+        });
+
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(Vec<Post>, Option<String>), String>>();
+        let client = self.client();
+
+        thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async {
+                match feed_uri {
+                    Some(uri) => client.get_feed(&uri, None).await,
+                    None => client.get_timeline(None).await,
+                }
+            });
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+
+        let app = self.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            match rx.try_recv() {
+                Ok(Ok((posts, next_cursor))) => {
+                    app.imp().timeline_cursor.replace(next_cursor);
+                    if let Some(first) = posts.first() {
+                        app.imp().newest_post_uri.replace(Some(first.uri.clone()));
+                    }
+                    app.imp().pending_new_posts.replace(Vec::new());
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.hide_new_posts_banner();
+                        window.set_posts(posts);
+                    }
+                    app.start_new_posts_polling();
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(e)) => {
+                    eprintln!("Failed to fetch feed: {}", e);
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    eprintln!("Failed to fetch feed: connection lost");
+                    glib::ControlFlow::Break
+                }
+            }
+        });
     }
 }
 

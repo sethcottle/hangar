@@ -4,4 +4,4 @@ mod client;
 mod types;
 
 pub use client::HangarClient;
-pub use types::{Post, Profile, Session};
+pub use types::{Post, Profile, SavedFeed, Session};

@@ -2,7 +2,7 @@
 
 use super::post_row::PostRow;
 use super::sidebar::Sidebar;
-use crate::atproto::Post;
+use crate::atproto::{Post, SavedFeed};
 use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
 use gtk4::{gio, glib};
@@ -68,6 +68,12 @@ mod imp {
         pub new_posts_banner: RefCell<Option<gtk4::Button>>,
         pub new_posts_callback: RefCell<Option<Box<dyn Fn() + 'static>>>,
         pub scrolled_window: RefCell<Option<gtk4::ScrolledWindow>>,
+        pub feed_btn_label: RefCell<Option<gtk4::Label>>,
+        pub feed_popover: RefCell<Option<gtk4::Popover>>,
+        pub feed_list_box: RefCell<Option<gtk4::ListBox>>,
+        pub feed_changed_callback: RefCell<Option<Box<dyn Fn(SavedFeed) + 'static>>>,
+        pub saved_feeds: RefCell<Vec<SavedFeed>>,
+        pub current_feed_uri: RefCell<String>,
     }
 
     #[glib::object_subclass]
@@ -168,16 +174,71 @@ impl HangarWindow {
         let header = adw::HeaderBar::new();
         header.set_show_start_title_buttons(false);
 
-        let feed_btn = gtk4::Button::new();
-        let feed_label = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+        // Feed selector button with popover
+        let feed_menu_btn = gtk4::MenuButton::new();
+        let feed_label_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
         let title_label = gtk4::Label::new(Some("Following"));
         title_label.add_css_class("title");
-        feed_label.append(&title_label);
+        feed_label_box.append(&title_label);
         let dropdown_icon = gtk4::Image::from_icon_name("pan-down-symbolic");
-        feed_label.append(&dropdown_icon);
-        feed_btn.set_child(Some(&feed_label));
-        feed_btn.add_css_class("flat");
-        header.set_title_widget(Some(&feed_btn));
+        feed_label_box.append(&dropdown_icon);
+        feed_menu_btn.set_child(Some(&feed_label_box));
+        feed_menu_btn.add_css_class("flat");
+
+        // Create popover with feed list
+        let popover = gtk4::Popover::new();
+        popover.set_has_arrow(false);
+        popover.set_autohide(true);
+        popover.add_css_class("menu");
+        popover.set_position(gtk4::PositionType::Bottom);
+        popover.set_offset(0, 8); // Push it down a bit to avoid overlapping header
+
+        let popover_content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+
+        // Header
+        let header_label = gtk4::Label::new(Some("Select a Feed"));
+        header_label.add_css_class("title-4");
+        header_label.set_margin_top(12);
+        header_label.set_margin_bottom(8);
+        popover_content.append(&header_label);
+
+        let feed_list = gtk4::ListBox::new();
+        feed_list.set_selection_mode(gtk4::SelectionMode::None);
+
+        // Connect row activation - close popover first, then fire callback
+        let popover_weak = popover.downgrade();
+        feed_list.connect_row_activated(glib::clone!(
+            #[weak(rename_to = window)]
+            self,
+            move |_, row| {
+                // Close popover first to avoid widget state issues
+                if let Some(pop) = popover_weak.upgrade() {
+                    pop.popdown();
+                }
+
+                let index = row.index() as usize;
+                let feed = {
+                    let feeds = window.imp().saved_feeds.borrow();
+                    feeds.get(index).cloned()
+                };
+                if let Some(feed) = feed {
+                    if let Some(cb) = window.imp().feed_changed_callback.borrow().as_ref() {
+                        cb(feed);
+                    }
+                }
+            }
+        ));
+
+        popover_content.append(&feed_list);
+        popover.set_child(Some(&popover_content));
+        feed_menu_btn.set_popover(Some(&popover));
+
+        header.set_title_widget(Some(&feed_menu_btn));
+
+        // Store references
+        self.imp().feed_btn_label.replace(Some(title_label));
+        self.imp().feed_popover.replace(Some(popover));
+        self.imp().feed_list_box.replace(Some(feed_list));
 
         let refresh_btn = gtk4::Button::from_icon_name("view-refresh-symbolic");
         refresh_btn.set_tooltip_text(Some("Refresh"));
@@ -447,5 +508,71 @@ impl HangarWindow {
                 model.insert(i as u32, &post_object);
             }
         }
+    }
+
+    /// Set the callback for when the user selects a different feed
+    pub fn set_feed_changed_callback<F: Fn(SavedFeed) + 'static>(&self, callback: F) {
+        self.imp()
+            .feed_changed_callback
+            .replace(Some(Box::new(callback)));
+    }
+
+    /// Update the list of available feeds in the popover
+    pub fn set_saved_feeds(&self, feeds: Vec<SavedFeed>) {
+        self.imp().saved_feeds.replace(feeds.clone());
+        self.rebuild_feed_list();
+    }
+
+    /// Rebuild the feed list UI (called when feeds change or selection changes)
+    fn rebuild_feed_list(&self) {
+        let Some(list_box) = self.imp().feed_list_box.borrow().as_ref().cloned() else {
+            return;
+        };
+
+        let feeds = self.imp().saved_feeds.borrow();
+        let current_uri = self.imp().current_feed_uri.borrow();
+
+        // Clear existing rows
+        while let Some(child) = list_box.first_child() {
+            list_box.remove(&child);
+        }
+
+        // Add rows for each feed
+        for feed in feeds.iter() {
+            let row = adw::ActionRow::new();
+            row.set_title(&feed.display_name);
+
+            // Show truncated description if available
+            if let Some(desc) = &feed.description {
+                // Truncate long descriptions
+                let truncated = if desc.len() > 60 {
+                    format!("{}...", &desc[..57])
+                } else {
+                    desc.clone()
+                };
+                row.set_subtitle(&truncated);
+                row.set_subtitle_lines(1);
+            }
+
+            // Add checkmark for selected feed
+            let is_selected = feed.uri == *current_uri;
+            if is_selected {
+                let check = gtk4::Image::from_icon_name("object-select-symbolic");
+                check.add_css_class("accent");
+                row.add_suffix(&check);
+            }
+
+            row.set_activatable(true);
+            list_box.append(&row);
+        }
+    }
+
+    /// Update the feed selector button label and selection state
+    pub fn set_current_feed_name(&self, name: &str, uri: &str) {
+        if let Some(label) = self.imp().feed_btn_label.borrow().as_ref() {
+            label.set_text(name);
+        }
+        self.imp().current_feed_uri.replace(uri.to_string());
+        self.rebuild_feed_list();
     }
 }

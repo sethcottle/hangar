@@ -99,3 +99,16 @@ window.background entry {
 .new-posts-banner {
     box-shadow: 0 2px 8px alpha(black, 0.3);
 }
+
+/* Feed selector popover */
+popover.menu {
+    background: transparent;
+}
+
+popover.menu > contents {
+    box-shadow: none;
+    background: @popover_bg_color;
+    border: 1px solid @borders;
+    border-radius: 12px;
+}
+
