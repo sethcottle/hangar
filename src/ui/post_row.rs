@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use crate::atproto::Post;
+use gtk4::gdk;
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
@@ -165,6 +166,10 @@ impl PostRow {
 
         if let Some(avatar) = imp.avatar.borrow().as_ref() {
             avatar.set_text(Some(display_name));
+
+            if let Some(avatar_url) = &post.author.avatar {
+                Self::load_avatar(avatar.clone(), avatar_url.clone());
+            }
         }
 
         if let Some(label) = imp.display_name_label.borrow().as_ref() {
@@ -194,6 +199,40 @@ impl PostRow {
         if let Some(label) = imp.like_count_label.borrow().as_ref() {
             label.set_text(&Self::format_count(post.like_count));
         }
+    }
+
+    fn load_avatar(avatar: adw::Avatar, url: String) {
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                if let Ok(response) = reqwest::get(&url).await {
+                    if let Ok(bytes) = response.bytes().await {
+                        let _ = tx.send(bytes.to_vec());
+                    }
+                }
+            });
+        });
+
+        glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
+            match rx.try_recv() {
+                Ok(bytes) => {
+                    let glib_bytes = glib::Bytes::from(&bytes);
+                    let stream = gtk4::gio::MemoryInputStream::from_bytes(&glib_bytes);
+
+                    if let Ok(pixbuf) =
+                        gdk::gdk_pixbuf::Pixbuf::from_stream(&stream, gtk4::gio::Cancellable::NONE)
+                    {
+                        let texture = gdk::Texture::for_pixbuf(&pixbuf);
+                        avatar.set_custom_image(Some(&texture));
+                    }
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+            }
+        });
     }
 
     fn format_count(count: Option<u32>) -> String {

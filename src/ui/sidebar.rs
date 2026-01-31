@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
+use gtk4::gdk;
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
@@ -65,6 +66,7 @@ mod imp {
 
     #[derive(Default)]
     pub struct Sidebar {
+        pub avatar: RefCell<Option<adw::Avatar>>,
         pub nav_list: RefCell<Option<gtk4::ListBox>>,
         pub selected_item: Cell<Option<NavItem>>,
     }
@@ -118,6 +120,8 @@ impl Sidebar {
         avatar_box.append(&avatar);
 
         self.append(&avatar_box);
+
+        self.imp().avatar.replace(Some(avatar));
 
         // Navigation list
         let nav_list = gtk4::ListBox::new();
@@ -201,6 +205,50 @@ impl Sidebar {
 
     pub fn selected_item(&self) -> Option<NavItem> {
         self.imp().selected_item.get()
+    }
+
+    pub fn set_user_avatar(&self, display_name: &str, avatar_url: Option<&str>) {
+        if let Some(avatar) = self.imp().avatar.borrow().as_ref() {
+            avatar.set_text(Some(display_name));
+
+            if let Some(url) = avatar_url {
+                Self::load_avatar(avatar.clone(), url.to_string());
+            }
+        }
+    }
+
+    fn load_avatar(avatar: adw::Avatar, url: String) {
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                if let Ok(response) = reqwest::get(&url).await {
+                    if let Ok(bytes) = response.bytes().await {
+                        let _ = tx.send(bytes.to_vec());
+                    }
+                }
+            });
+        });
+
+        glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
+            match rx.try_recv() {
+                Ok(bytes) => {
+                    let glib_bytes = glib::Bytes::from(&bytes);
+                    let stream = gtk4::gio::MemoryInputStream::from_bytes(&glib_bytes);
+
+                    if let Ok(pixbuf) =
+                        gdk::gdk_pixbuf::Pixbuf::from_stream(&stream, gtk4::gio::Cancellable::NONE)
+                    {
+                        let texture = gdk::Texture::for_pixbuf(&pixbuf);
+                        avatar.set_custom_image(Some(&texture));
+                    }
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+            }
+        });
     }
 }
 

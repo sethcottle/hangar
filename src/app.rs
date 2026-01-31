@@ -8,7 +8,7 @@ use std::cell::RefCell;
 use std::sync::Arc;
 use std::thread;
 
-use crate::atproto::{HangarClient, Post, Session};
+use crate::atproto::{HangarClient, Post, Profile, Session};
 use crate::ui::{HangarWindow, LoginDialog};
 
 mod imp {
@@ -133,6 +133,9 @@ impl HangarApplication {
                             dialog.close();
                         }
 
+                        // Fetch user profile for sidebar avatar
+                        app.fetch_user_profile(&session.did);
+
                         // Fetch timeline
                         app.fetch_timeline();
                         glib::ControlFlow::Break
@@ -160,6 +163,43 @@ impl HangarApplication {
         });
 
         dialog.present();
+    }
+
+    fn fetch_user_profile(&self, did: &str) {
+        let (tx, rx) = std::sync::mpsc::channel::<Result<Profile, String>>();
+
+        let client = self.client();
+        let did = did.to_string();
+        thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async { client.get_profile(&did).await });
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+
+        let app = self.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            match rx.try_recv() {
+                Ok(Ok(profile)) => {
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        let display_name = profile
+                            .display_name
+                            .as_deref()
+                            .unwrap_or(&profile.handle);
+                        window.set_user_avatar(display_name, profile.avatar.as_deref());
+                    }
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(e)) => {
+                    eprintln!("Failed to fetch profile: {}", e);
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    eprintln!("Failed to fetch profile: connection lost");
+                    glib::ControlFlow::Break
+                }
+            }
+        });
     }
 
     fn fetch_timeline(&self) {

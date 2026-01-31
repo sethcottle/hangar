@@ -205,4 +205,10 @@ impl HangarWindow {
             }
         }
     }
+
+    pub fn set_user_avatar(&self, display_name: &str, avatar_url: Option<&str>) {
+        if let Some(sidebar) = self.imp().sidebar.borrow().as_ref() {
+            sidebar.set_user_avatar(display_name, avatar_url);
+        }
+    }
 }

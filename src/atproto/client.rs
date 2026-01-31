@@ -193,6 +193,34 @@ impl HangarClient {
         }
     }
 
+    #[allow(clippy::await_holding_lock)]
+    pub async fn get_profile(&self, actor: &str) -> Result<Profile, ClientError> {
+        let agent_guard = self.agent.read().unwrap();
+        let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
+
+        let params = atrium_api::app::bsky::actor::get_profile::ParametersData {
+            actor: actor
+                .parse()
+                .map_err(|e| ClientError::InvalidResponse(format!("invalid actor: {e}")))?,
+        };
+
+        let output = agent
+            .api
+            .app
+            .bsky
+            .actor
+            .get_profile(params.into())
+            .await
+            .map_err(|e| ClientError::Network(e.to_string()))?;
+
+        Ok(Profile {
+            did: output.data.did.to_string(),
+            handle: output.data.handle.to_string(),
+            display_name: output.data.display_name.clone(),
+            avatar: output.data.avatar.clone(),
+        })
+    }
+
     fn extract_post_record(&self, record: &atrium_api::types::Unknown) -> (String, String) {
         use atrium_api::types::Unknown;
 
