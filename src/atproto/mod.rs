@@ -5,5 +5,6 @@ mod types;
 
 pub use client::HangarClient;
 pub use types::{
-    Embed, ExternalEmbed, ImageEmbed, Post, Profile, QuoteEmbed, SavedFeed, Session, VideoEmbed,
+    Embed, ExternalEmbed, ImageEmbed, Notification, Post, Profile, QuoteEmbed, SavedFeed, Session,
+    VideoEmbed,
 };

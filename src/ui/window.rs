@@ -2,7 +2,7 @@
 
 use super::post_row::PostRow;
 use super::sidebar::Sidebar;
-use crate::atproto::{Post, SavedFeed};
+use crate::atproto::{Notification, Post, SavedFeed};
 use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
 use gtk4::{gio, glib};
@@ -51,6 +51,46 @@ mod post_object {
 
 use post_object::PostObject;
 
+mod notification_object {
+    use super::*;
+
+    mod imp {
+        use super::*;
+
+        #[derive(Default)]
+        pub struct NotificationObject {
+            pub notification: RefCell<Option<Notification>>,
+        }
+
+        #[glib::object_subclass]
+        impl ObjectSubclass for NotificationObject {
+            const NAME: &'static str = "HangarNotificationObject";
+            type Type = super::NotificationObject;
+            type ParentType = glib::Object;
+        }
+
+        impl ObjectImpl for NotificationObject {}
+    }
+
+    glib::wrapper! {
+        pub struct NotificationObject(ObjectSubclass<imp::NotificationObject>);
+    }
+
+    impl NotificationObject {
+        pub fn new(notification: Notification) -> Self {
+            let obj: Self = glib::Object::builder().build();
+            obj.imp().notification.replace(Some(notification));
+            obj
+        }
+
+        pub fn notification(&self) -> Option<Notification> {
+            self.imp().notification.borrow().clone()
+        }
+    }
+}
+
+use notification_object::NotificationObject;
+
 use crate::atproto::Profile;
 
 mod imp {
@@ -59,7 +99,12 @@ mod imp {
     #[derive(Default)]
     pub struct HangarWindow {
         pub sidebar: RefCell<Option<Sidebar>>,
-        pub navigation_view: RefCell<Option<adw::NavigationView>>,
+        // Main content stack for top-level pages (Home, Mentions, etc.)
+        pub main_stack: RefCell<Option<gtk4::Stack>>,
+        // NavigationView for Home section (for thread/profile drill-down)
+        pub home_nav_view: RefCell<Option<adw::NavigationView>>,
+        // NavigationView for Mentions section (for thread/profile drill-down)
+        pub mentions_nav_view: RefCell<Option<adw::NavigationView>>,
         pub timeline_model: RefCell<Option<gio::ListStore>>,
         pub load_more_callback: RefCell<Option<Box<dyn Fn() + 'static>>>,
         pub refresh_callback: RefCell<Option<Box<dyn Fn() + 'static>>>,
@@ -81,6 +126,13 @@ mod imp {
         // Navigation callbacks
         pub post_clicked_callback: RefCell<Option<Box<dyn Fn(Post) + 'static>>>,
         pub profile_clicked_callback: RefCell<Option<Box<dyn Fn(Profile) + 'static>>>,
+        pub nav_changed_callback:
+            RefCell<Option<Box<dyn Fn(crate::ui::sidebar::NavItem) + 'static>>>,
+        // Mentions page state
+        pub mentions_model: RefCell<Option<gio::ListStore>>,
+        pub mentions_load_more_callback: RefCell<Option<Box<dyn Fn() + 'static>>>,
+        pub mentions_scrolled_window: RefCell<Option<gtk4::ScrolledWindow>>,
+        pub mentions_spinner: RefCell<Option<gtk4::Spinner>>,
     }
 
     #[glib::object_subclass]
@@ -129,22 +181,33 @@ impl HangarWindow {
         let separator = gtk4::Separator::new(gtk4::Orientation::Vertical);
         main_box.append(&separator);
 
-        // Use NavigationView for push/pop navigation between screens
-        let nav_view = adw::NavigationView::new();
-        nav_view.set_hexpand(true);
-        nav_view.set_vexpand(true);
+        // Main stack for top-level pages (no animation for sidebar switching)
+        let main_stack = gtk4::Stack::new();
+        main_stack.set_hexpand(true);
+        main_stack.set_vexpand(true);
+        main_stack.set_transition_type(gtk4::StackTransitionType::None);
 
-        // Create the timeline page as the root
+        // Home section: NavigationView for thread/profile drill-down
+        let home_nav_view = adw::NavigationView::new();
         let timeline_page = self.build_timeline_page();
-        nav_view.add(&timeline_page);
+        home_nav_view.add(&timeline_page);
+        main_stack.add_named(&home_nav_view, Some("home"));
 
-        main_box.append(&nav_view);
+        // Mentions section: NavigationView for thread/profile drill-down
+        let mentions_nav_view = adw::NavigationView::new();
+        let mentions_page = self.build_mentions_page();
+        mentions_nav_view.add(&mentions_page);
+        main_stack.add_named(&mentions_nav_view, Some("mentions"));
+
+        main_box.append(&main_stack);
 
         self.set_content(Some(&main_box));
 
         let imp = self.imp();
         imp.sidebar.replace(Some(sidebar));
-        imp.navigation_view.replace(Some(nav_view));
+        imp.main_stack.replace(Some(main_stack));
+        imp.home_nav_view.replace(Some(home_nav_view));
+        imp.mentions_nav_view.replace(Some(mentions_nav_view));
 
         // Add keyboard shortcuts
         self.setup_shortcuts();
@@ -433,21 +496,15 @@ impl HangarWindow {
     }
 
     pub fn set_like_callback<F: Fn(Post, glib::WeakRef<PostRow>) + 'static>(&self, callback: F) {
-        self.imp()
-            .like_callback
-            .replace(Some(Box::new(callback)));
+        self.imp().like_callback.replace(Some(Box::new(callback)));
     }
 
     pub fn set_repost_callback<F: Fn(Post, glib::WeakRef<PostRow>) + 'static>(&self, callback: F) {
-        self.imp()
-            .repost_callback
-            .replace(Some(Box::new(callback)));
+        self.imp().repost_callback.replace(Some(Box::new(callback)));
     }
 
     pub fn set_quote_callback<F: Fn(Post) + 'static>(&self, callback: F) {
-        self.imp()
-            .quote_callback
-            .replace(Some(Box::new(callback)));
+        self.imp().quote_callback.replace(Some(Box::new(callback)));
     }
 
     pub fn set_reply_callback<F: Fn(Post) + 'static>(&self, callback: F) {
@@ -461,11 +518,7 @@ impl HangarWindow {
         if let Some(sidebar) = self.imp().sidebar.borrow().as_ref() {
             let win = self.clone();
             sidebar.connect_compose_clicked(move || {
-                win.imp()
-                    .compose_callback
-                    .borrow()
-                    .as_ref()
-                    .map(|cb| cb());
+                win.imp().compose_callback.borrow().as_ref().map(|cb| cb());
             });
         }
     }
@@ -635,9 +688,10 @@ impl HangarWindow {
             .replace(Some(Box::new(callback)));
     }
 
-    /// Push a thread view page onto the navigation stack
+    /// Push a thread view page onto the current section's navigation stack
     pub fn push_thread_page(&self, post: &Post, thread_posts: Vec<Post>) {
-        let Some(nav_view) = self.imp().navigation_view.borrow().as_ref().cloned() else {
+        let nav_view = self.current_nav_view();
+        let Some(nav_view) = nav_view else {
             return;
         };
 
@@ -645,9 +699,10 @@ impl HangarWindow {
         nav_view.push(&page);
     }
 
-    /// Push a profile view page onto the navigation stack
+    /// Push a profile view page onto the current section's navigation stack
     pub fn push_profile_page(&self, profile: &Profile, posts: Vec<Post>) {
-        let Some(nav_view) = self.imp().navigation_view.borrow().as_ref().cloned() else {
+        let nav_view = self.current_nav_view();
+        let Some(nav_view) = nav_view else {
             return;
         };
 
@@ -655,10 +710,43 @@ impl HangarWindow {
         nav_view.push(&page);
     }
 
-    /// Pop to the timeline (root) page
-    pub fn pop_to_timeline(&self) {
-        if let Some(nav_view) = self.imp().navigation_view.borrow().as_ref() {
-            nav_view.pop_to_tag("timeline");
+    /// Pop to the root page of the current section (used for back navigation within a section)
+    pub fn pop_to_root(&self) {
+        let stack = self.imp().main_stack.borrow();
+        let Some(stack) = stack.as_ref() else { return };
+        let Some(visible_name) = stack.visible_child_name() else {
+            return;
+        };
+
+        // Pop to the root tag for the current section
+        let root_tag = match visible_name.as_str() {
+            "home" => "timeline",
+            "mentions" => "mentions",
+            _ => return,
+        };
+
+        if let Some(nav_view) = self.current_nav_view() {
+            nav_view.pop_to_tag(root_tag);
+        }
+    }
+
+    /// Get the NavigationView for the currently visible stack page
+    fn current_nav_view(&self) -> Option<adw::NavigationView> {
+        let stack = self.imp().main_stack.borrow();
+        let stack = stack.as_ref()?;
+        let visible_name = stack.visible_child_name()?;
+
+        match visible_name.as_str() {
+            "home" => self.imp().home_nav_view.borrow().clone(),
+            "mentions" => self.imp().mentions_nav_view.borrow().clone(),
+            _ => self.imp().home_nav_view.borrow().clone(),
+        }
+    }
+
+    /// Switch to a top-level page (Home, Mentions, etc.) - no animation
+    pub fn switch_to_page(&self, page_name: &str) {
+        if let Some(stack) = self.imp().main_stack.borrow().as_ref() {
+            stack.set_visible_child_name(page_name);
         }
     }
 
@@ -689,10 +777,16 @@ impl HangarWindow {
         let (main_post_vec, reply_posts): (Vec<_>, Vec<_>) = if main_and_replies.is_empty() {
             (vec![main_post.clone()], vec![])
         } else {
-            (vec![main_and_replies[0].clone()], main_and_replies.into_iter().skip(1).collect())
+            (
+                vec![main_and_replies[0].clone()],
+                main_and_replies.into_iter().skip(1).collect(),
+            )
         };
 
-        let the_main_post = main_post_vec.first().cloned().unwrap_or_else(|| main_post.clone());
+        let the_main_post = main_post_vec
+            .first()
+            .cloned()
+            .unwrap_or_else(|| main_post.clone());
 
         // Create scrollable content
         let scroll_content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
@@ -723,25 +817,42 @@ impl HangarWindow {
                         let mut post_with_state = post_for_like.clone();
                         post_with_state.viewer_like = if was_liked { like_uri } else { None };
                         let row_weak = row.downgrade();
-                        win.imp().like_callback.borrow().as_ref().map(|cb| cb(post_with_state, row_weak));
+                        win.imp()
+                            .like_callback
+                            .borrow()
+                            .as_ref()
+                            .map(|cb| cb(post_with_state, row_weak));
                     });
                     let post_for_repost = post.clone();
                     let win = w.clone();
                     post_row.connect_repost_clicked(move |row, was_reposted, repost_uri| {
                         let mut post_with_state = post_for_repost.clone();
-                        post_with_state.viewer_repost = if was_reposted { repost_uri } else { None };
+                        post_with_state.viewer_repost =
+                            if was_reposted { repost_uri } else { None };
                         let row_weak = row.downgrade();
-                        win.imp().repost_callback.borrow().as_ref().map(|cb| cb(post_with_state, row_weak));
+                        win.imp()
+                            .repost_callback
+                            .borrow()
+                            .as_ref()
+                            .map(|cb| cb(post_with_state, row_weak));
                     });
                     let post_for_quote = post.clone();
                     let win = w.clone();
                     post_row.connect_quote_clicked(move || {
-                        win.imp().quote_callback.borrow().as_ref().map(|cb| cb(post_for_quote.clone()));
+                        win.imp()
+                            .quote_callback
+                            .borrow()
+                            .as_ref()
+                            .map(|cb| cb(post_for_quote.clone()));
                     });
                     let post_clone = post.clone();
                     let win = w.clone();
                     post_row.connect_reply_clicked(move || {
-                        win.imp().reply_callback.borrow().as_ref().map(|cb| cb(post_clone.clone()));
+                        win.imp()
+                            .reply_callback
+                            .borrow()
+                            .as_ref()
+                            .map(|cb| cb(post_clone.clone()));
                     });
                 }
             });
@@ -818,7 +929,10 @@ impl HangarWindow {
         // Format: "Posted Sat, Jan 31, 2026 at 12:50 PM"
         format!(
             "Posted {}",
-            post_time.format("%a, %b %d, %Y at %l:%M %p").to_string().trim()
+            post_time
+                .format("%a, %b %d, %Y at %l:%M %p")
+                .to_string()
+                .trim()
         )
     }
 
@@ -831,10 +945,7 @@ impl HangarWindow {
         header.set_show_start_title_buttons(false);
         header.set_show_end_title_buttons(false);
 
-        let display_name = profile
-            .display_name
-            .as_deref()
-            .unwrap_or(&profile.handle);
+        let display_name = profile.display_name.as_deref().unwrap_or(&profile.handle);
         let title = gtk4::Label::new(Some(display_name));
         title.add_css_class("title");
         header.set_title_widget(Some(&title));
@@ -906,7 +1017,11 @@ impl HangarWindow {
                     let mut post_with_state = post_for_like.clone();
                     post_with_state.viewer_like = if was_liked { like_uri } else { None };
                     let row_weak = row.downgrade();
-                    w.imp().like_callback.borrow().as_ref().map(|cb| cb(post_with_state, row_weak));
+                    w.imp()
+                        .like_callback
+                        .borrow()
+                        .as_ref()
+                        .map(|cb| cb(post_with_state, row_weak));
                 });
                 let post_for_repost = post.clone();
                 let w = win.clone();
@@ -914,17 +1029,29 @@ impl HangarWindow {
                     let mut post_with_state = post_for_repost.clone();
                     post_with_state.viewer_repost = if was_reposted { repost_uri } else { None };
                     let row_weak = row.downgrade();
-                    w.imp().repost_callback.borrow().as_ref().map(|cb| cb(post_with_state, row_weak));
+                    w.imp()
+                        .repost_callback
+                        .borrow()
+                        .as_ref()
+                        .map(|cb| cb(post_with_state, row_weak));
                 });
                 let post_for_quote = post.clone();
                 let w = win.clone();
                 post_row.connect_quote_clicked(move || {
-                    w.imp().quote_callback.borrow().as_ref().map(|cb| cb(post_for_quote.clone()));
+                    w.imp()
+                        .quote_callback
+                        .borrow()
+                        .as_ref()
+                        .map(|cb| cb(post_for_quote.clone()));
                 });
                 let post_clone = post.clone();
                 let w = win.clone();
                 post_row.connect_reply_clicked(move || {
-                    w.imp().reply_callback.borrow().as_ref().map(|cb| cb(post_clone.clone()));
+                    w.imp()
+                        .reply_callback
+                        .borrow()
+                        .as_ref()
+                        .map(|cb| cb(post_clone.clone()));
                 });
             }
         });
@@ -947,4 +1074,455 @@ impl HangarWindow {
         page.set_tag(Some("profile"));
         page
     }
+
+    /// Build the mentions page
+    fn build_mentions_page(&self) -> adw::NavigationPage {
+        let content_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        content_box.set_hexpand(true);
+
+        let header = adw::HeaderBar::new();
+        header.set_show_start_title_buttons(false);
+        header.set_show_end_title_buttons(false);
+
+        let title = gtk4::Label::new(Some("Mentions"));
+        title.add_css_class("title");
+        header.set_title_widget(Some(&title));
+
+        let close_btn = gtk4::Button::from_icon_name("window-close-symbolic");
+        close_btn.set_tooltip_text(Some("Close"));
+        close_btn.connect_clicked(glib::clone!(
+            #[weak(rename_to = window)]
+            self,
+            move |_| {
+                window.close();
+            }
+        ));
+        header.pack_end(&close_btn);
+
+        content_box.append(&header);
+        content_box.append(&self.build_mentions_list());
+
+        let page = adw::NavigationPage::new(&content_box, "Mentions");
+        page.set_tag(Some("mentions"));
+        page
+    }
+
+    /// Build the mentions list widget
+    fn build_mentions_list(&self) -> gtk4::Box {
+        let mentions_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        mentions_box.set_vexpand(true);
+
+        let overlay = gtk4::Overlay::new();
+        overlay.set_vexpand(true);
+
+        let model = gio::ListStore::new::<NotificationObject>();
+        let factory = gtk4::SignalListItemFactory::new();
+
+        factory.connect_setup(|_, item| {
+            let row = MentionRow::new();
+            if let Some(list_item) = item.downcast_ref::<gtk4::ListItem>() {
+                list_item.set_child(Some(&row));
+            }
+        });
+
+        let win = self.clone();
+        factory.connect_bind(move |_, item| {
+            if let Some(list_item) = item.downcast_ref::<gtk4::ListItem>()
+                && let Some(notif_object) = list_item.item().and_downcast::<NotificationObject>()
+                && let Some(notif) = notif_object.notification()
+                && let Some(row) = list_item.child().and_downcast::<MentionRow>()
+            {
+                row.bind(&notif);
+                // Connect profile click
+                let profile = notif.author.clone();
+                let w = win.clone();
+                row.connect_profile_clicked(move |_| {
+                    w.imp()
+                        .profile_clicked_callback
+                        .borrow()
+                        .as_ref()
+                        .map(|cb| cb(profile.clone()));
+                });
+                // Connect post click (if there's an associated post)
+                if let Some(post) = notif.post.clone() {
+                    let w = win.clone();
+                    row.connect_clicked(move |_| {
+                        w.imp()
+                            .post_clicked_callback
+                            .borrow()
+                            .as_ref()
+                            .map(|cb| cb(post.clone()));
+                    });
+                }
+            }
+        });
+
+        let selection = gtk4::NoSelection::new(Some(model.clone()));
+        let list_view = gtk4::ListView::new(Some(selection), Some(factory));
+        list_view.add_css_class("background");
+
+        let scrolled = gtk4::ScrolledWindow::new();
+        scrolled.set_vexpand(true);
+        scrolled.set_child(Some(&list_view));
+        overlay.set_child(Some(&scrolled));
+
+        // Loading spinner
+        let spinner = gtk4::Spinner::new();
+        spinner.set_visible(false);
+        spinner.set_halign(gtk4::Align::Center);
+        spinner.set_valign(gtk4::Align::End);
+        spinner.set_margin_bottom(16);
+        overlay.add_overlay(&spinner);
+
+        mentions_box.append(&overlay);
+
+        let imp = self.imp();
+        imp.mentions_model.replace(Some(model));
+        imp.mentions_scrolled_window.replace(Some(scrolled.clone()));
+        imp.mentions_spinner.replace(Some(spinner));
+
+        // Infinite scroll
+        let adj = scrolled.vadjustment();
+        adj.connect_value_changed(glib::clone!(
+            @weak self as win => move |adj| {
+                let value = adj.value();
+                let upper = adj.upper();
+                let page_size = adj.page_size();
+                if value >= upper - page_size - 200.0 {
+                    if let Some(cb) = win.imp().mentions_load_more_callback.borrow().as_ref() {
+                        cb();
+                    }
+                }
+            }
+        ));
+
+        mentions_box
+    }
+
+    /// Show the mentions page (top-level navigation, instant switch)
+    pub fn show_mentions_page(&self) {
+        self.switch_to_page("mentions");
+    }
+
+    /// Show the home/timeline page (top-level navigation, instant switch)
+    pub fn show_home_page(&self) {
+        self.switch_to_page("home");
+    }
+
+    /// Set notifications/mentions in the mentions list
+    pub fn set_mentions(&self, notifications: Vec<Notification>) {
+        if let Some(model) = self.imp().mentions_model.borrow().as_ref() {
+            model.remove_all();
+            for notif in notifications {
+                model.append(&NotificationObject::new(notif));
+            }
+        }
+    }
+
+    /// Append more notifications to the mentions list
+    pub fn append_mentions(&self, notifications: Vec<Notification>) {
+        if let Some(model) = self.imp().mentions_model.borrow().as_ref() {
+            for notif in notifications {
+                model.append(&NotificationObject::new(notif));
+            }
+        }
+    }
+
+    /// Set loading state for mentions
+    pub fn set_mentions_loading(&self, loading: bool) {
+        if let Some(spinner) = self.imp().mentions_spinner.borrow().as_ref() {
+            spinner.set_visible(loading);
+            spinner.set_spinning(loading);
+        }
+    }
+
+    /// Set callback for loading more mentions
+    pub fn set_mentions_load_more_callback<F: Fn() + 'static>(&self, callback: F) {
+        self.imp()
+            .mentions_load_more_callback
+            .replace(Some(Box::new(callback)));
+    }
+
+    /// Set callback for nav item changes
+    pub fn set_nav_changed_callback<F: Fn(crate::ui::sidebar::NavItem) + 'static>(
+        &self,
+        callback: F,
+    ) {
+        self.imp()
+            .nav_changed_callback
+            .replace(Some(Box::new(callback)));
+        if let Some(sidebar) = self.imp().sidebar.borrow().as_ref() {
+            let win = self.clone();
+            sidebar.connect_nav_changed(move |item| {
+                win.imp()
+                    .nav_changed_callback
+                    .borrow()
+                    .as_ref()
+                    .map(|cb| cb(item));
+            });
+        }
+    }
+
+    /// Get sidebar reference
+    pub fn sidebar(&self) -> Option<crate::ui::sidebar::Sidebar> {
+        self.imp().sidebar.borrow().clone()
+    }
 }
+
+/// A row widget for displaying a mention/notification
+mod mention_row {
+    use super::*;
+    use crate::atproto::Notification;
+    use crate::ui::avatar_cache;
+
+    mod imp {
+        use super::*;
+        use std::cell::RefCell;
+
+        #[derive(Default)]
+        pub struct MentionRow {
+            pub avatar: RefCell<Option<adw::Avatar>>,
+            pub name_label: RefCell<Option<gtk4::Label>>,
+            pub handle_label: RefCell<Option<gtk4::Label>>,
+            pub text_label: RefCell<Option<gtk4::Label>>,
+            pub reason_label: RefCell<Option<gtk4::Label>>,
+            pub time_label: RefCell<Option<gtk4::Label>>,
+            pub profile_clicked_callback:
+                RefCell<Option<Box<dyn Fn(&super::MentionRow) + 'static>>>,
+            pub clicked_callback: RefCell<Option<Box<dyn Fn(&super::MentionRow) + 'static>>>,
+        }
+
+        #[glib::object_subclass]
+        impl ObjectSubclass for MentionRow {
+            const NAME: &'static str = "HangarMentionRow";
+            type Type = super::MentionRow;
+            type ParentType = gtk4::Box;
+        }
+
+        impl ObjectImpl for MentionRow {
+            fn constructed(&self) {
+                self.parent_constructed();
+                let obj = self.obj();
+                obj.setup_ui();
+            }
+        }
+
+        impl WidgetImpl for MentionRow {}
+        impl BoxImpl for MentionRow {}
+    }
+
+    glib::wrapper! {
+        pub struct MentionRow(ObjectSubclass<imp::MentionRow>)
+            @extends gtk4::Box, gtk4::Widget,
+            @implements gtk4::Accessible, gtk4::Buildable, gtk4::ConstraintTarget, gtk4::Orientable;
+    }
+
+    impl MentionRow {
+        pub fn new() -> Self {
+            glib::Object::builder()
+                .property("orientation", gtk4::Orientation::Vertical)
+                .property("spacing", 0)
+                .build()
+        }
+
+        fn setup_ui(&self) {
+            self.add_css_class("mention-row");
+            self.set_margin_start(12);
+            self.set_margin_end(12);
+            self.set_margin_top(8);
+            self.set_margin_bottom(8);
+
+            // Main content box (horizontal: avatar + content)
+            let main_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
+
+            // Avatar with click gesture
+            let avatar = adw::Avatar::new(48, None, true);
+            let avatar_click = gtk4::GestureClick::new();
+            let row_weak = self.downgrade();
+            avatar_click.connect_released(move |_, _, _, _| {
+                if let Some(row) = row_weak.upgrade() {
+                    if let Some(cb) = row.imp().profile_clicked_callback.borrow().as_ref() {
+                        cb(&row);
+                    }
+                }
+            });
+            avatar.add_controller(avatar_click);
+            main_box.append(&avatar);
+
+            // Content box (vertical: header + text)
+            let content_box = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+            content_box.set_hexpand(true);
+
+            // Header: reason icon + name + handle + time
+            let header_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+
+            let reason_label = gtk4::Label::new(None);
+            reason_label.add_css_class("dim-label");
+            reason_label.add_css_class("caption");
+            header_box.append(&reason_label);
+
+            let name_label = gtk4::Label::new(None);
+            name_label.add_css_class("heading");
+            name_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+            name_label.set_halign(gtk4::Align::Start);
+            header_box.append(&name_label);
+
+            let handle_label = gtk4::Label::new(None);
+            handle_label.add_css_class("dim-label");
+            handle_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+            handle_label.set_halign(gtk4::Align::Start);
+            header_box.append(&handle_label);
+
+            let spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+            spacer.set_hexpand(true);
+            header_box.append(&spacer);
+
+            let time_label = gtk4::Label::new(None);
+            time_label.add_css_class("dim-label");
+            time_label.add_css_class("caption");
+            header_box.append(&time_label);
+
+            content_box.append(&header_box);
+
+            // Text content
+            let text_label = gtk4::Label::new(None);
+            text_label.set_wrap(true);
+            text_label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+            text_label.set_xalign(0.0);
+            text_label.set_max_width_chars(80);
+            text_label.set_halign(gtk4::Align::Start);
+            content_box.append(&text_label);
+
+            main_box.append(&content_box);
+
+            // Click gesture for the whole row
+            let click = gtk4::GestureClick::new();
+            let row_weak = self.downgrade();
+            click.connect_released(move |_, _, _, _| {
+                if let Some(row) = row_weak.upgrade() {
+                    if let Some(cb) = row.imp().clicked_callback.borrow().as_ref() {
+                        cb(&row);
+                    }
+                }
+            });
+            self.add_controller(click);
+
+            self.append(&main_box);
+
+            // Separator
+            let sep = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+            sep.set_margin_top(8);
+            self.append(&sep);
+
+            let imp = self.imp();
+            imp.avatar.replace(Some(avatar));
+            imp.name_label.replace(Some(name_label));
+            imp.handle_label.replace(Some(handle_label));
+            imp.text_label.replace(Some(text_label));
+            imp.reason_label.replace(Some(reason_label));
+            imp.time_label.replace(Some(time_label));
+        }
+
+        pub fn bind(&self, notification: &Notification) {
+            let imp = self.imp();
+
+            // Avatar
+            if let Some(avatar) = imp.avatar.borrow().as_ref() {
+                let display_name = notification
+                    .author
+                    .display_name
+                    .as_deref()
+                    .unwrap_or(&notification.author.handle);
+                avatar.set_text(Some(display_name));
+                if let Some(url) = &notification.author.avatar {
+                    avatar_cache::load_avatar(avatar.clone(), url.clone());
+                }
+            }
+
+            // Name
+            if let Some(label) = imp.name_label.borrow().as_ref() {
+                let display_name = notification
+                    .author
+                    .display_name
+                    .as_deref()
+                    .unwrap_or(&notification.author.handle);
+                label.set_text(display_name);
+            }
+
+            // Handle
+            if let Some(label) = imp.handle_label.borrow().as_ref() {
+                label.set_text(&format!("@{}", notification.author.handle));
+            }
+
+            // Reason indicator
+            if let Some(label) = imp.reason_label.borrow().as_ref() {
+                let reason_text = match notification.reason.as_str() {
+                    "mention" => "mentioned you",
+                    "reply" => "replied",
+                    "quote" => "quoted you",
+                    _ => &notification.reason,
+                };
+                label.set_text(reason_text);
+            }
+
+            // Text content
+            if let Some(label) = imp.text_label.borrow().as_ref() {
+                if let Some(post) = &notification.post {
+                    label.set_text(&post.text);
+                    label.set_visible(true);
+                } else {
+                    label.set_visible(false);
+                }
+            }
+
+            // Time
+            if let Some(label) = imp.time_label.borrow().as_ref() {
+                label.set_text(&Self::format_relative_time(&notification.indexed_at));
+            }
+        }
+
+        fn format_relative_time(indexed_at: &str) -> String {
+            use chrono::{DateTime, Utc};
+
+            let Ok(post_time) = DateTime::parse_from_rfc3339(indexed_at) else {
+                return String::new();
+            };
+
+            let now = Utc::now();
+            let post_utc = post_time.with_timezone(&Utc);
+            let duration = now.signed_duration_since(post_utc);
+
+            if duration.num_seconds() < 60 {
+                "now".to_string()
+            } else if duration.num_minutes() < 60 {
+                format!("{}m", duration.num_minutes())
+            } else if duration.num_hours() < 24 {
+                format!("{}h", duration.num_hours())
+            } else if duration.num_days() < 7 {
+                format!("{}d", duration.num_days())
+            } else {
+                post_time.format("%b %d").to_string()
+            }
+        }
+
+        pub fn connect_profile_clicked<F: Fn(&Self) + 'static>(&self, callback: F) {
+            self.imp()
+                .profile_clicked_callback
+                .replace(Some(Box::new(callback)));
+        }
+
+        pub fn connect_clicked<F: Fn(&Self) + 'static>(&self, callback: F) {
+            self.imp()
+                .clicked_callback
+                .replace(Some(Box::new(callback)));
+        }
+    }
+
+    impl Default for MentionRow {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+}
+
+use mention_row::MentionRow;

@@ -124,6 +124,22 @@ pub struct SavedFeed {
     pub pinned: bool,
 }
 
+/// Notification from the AT Protocol
+#[derive(Debug, Clone)]
+pub struct Notification {
+    pub uri: String,
+    pub cid: String,
+    pub author: Profile,
+    /// The reason for the notification: "mention", "reply", "quote", "like", "repost", "follow"
+    pub reason: String,
+    /// When the notification was indexed
+    pub indexed_at: String,
+    /// Whether this notification has been seen
+    pub is_read: bool,
+    /// The post associated with this notification (for mentions, replies, quotes)
+    pub post: Option<Post>,
+}
+
 impl SavedFeed {
     /// Create the default "Following" (home timeline) feed
     pub fn home() -> Self {

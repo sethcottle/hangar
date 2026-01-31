@@ -204,8 +204,14 @@ impl PostRow {
         actions.append(&reply_btn);
 
         // Repost menu button with popover
-        let (repost_btn_box, repost_count, repost_menu_btn, repost_item, repost_item_label, quote_item) =
-            Self::create_repost_menu_button();
+        let (
+            repost_btn_box,
+            repost_count,
+            repost_menu_btn,
+            repost_item,
+            repost_item_label,
+            quote_item,
+        ) = Self::create_repost_menu_button();
         actions.append(&repost_btn_box);
 
         let (like_btn, like_count, like_btn_ref) =
@@ -260,7 +266,14 @@ impl PostRow {
     }
 
     /// Create a repost menu button with "Repost"/"Undo Repost" and "Quote" options
-    fn create_repost_menu_button() -> (gtk4::Box, gtk4::Label, gtk4::MenuButton, gtk4::Button, gtk4::Label, gtk4::Button) {
+    fn create_repost_menu_button() -> (
+        gtk4::Box,
+        gtk4::Label,
+        gtk4::MenuButton,
+        gtk4::Button,
+        gtk4::Label,
+        gtk4::Button,
+    ) {
         let btn_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
 
         // Create popover content
@@ -306,7 +319,14 @@ impl PostRow {
         count_label.add_css_class("dim-label");
         btn_box.append(&count_label);
 
-        (btn_box, count_label, menu_btn, repost_item, repost_item_label, quote_item)
+        (
+            btn_box,
+            count_label,
+            menu_btn,
+            repost_item,
+            repost_item_label,
+            quote_item,
+        )
     }
 
     pub fn connect_like_clicked<F: Fn(&PostRow, bool, Option<String>) + 'static>(&self, f: F) {
@@ -466,9 +486,7 @@ impl PostRow {
 
     /// Set callback for when the post content area is clicked (to open thread)
     pub fn set_post_clicked_callback<F: Fn(Post) + 'static>(&self, f: F) {
-        self.imp()
-            .post_clicked_callback
-            .replace(Some(Box::new(f)));
+        self.imp().post_clicked_callback.replace(Some(Box::new(f)));
     }
 
     /// Set callback for when the avatar/profile is clicked (to open profile)

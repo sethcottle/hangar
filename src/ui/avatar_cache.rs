@@ -43,8 +43,7 @@ fn apply_avatar_bytes(avatar: &adw::Avatar, bytes: &[u8]) {
     let glib_bytes = glib::Bytes::from(bytes);
     let stream = gtk4::gio::MemoryInputStream::from_bytes(&glib_bytes);
 
-    if let Ok(pixbuf) =
-        gdk::gdk_pixbuf::Pixbuf::from_stream(&stream, gtk4::gio::Cancellable::NONE)
+    if let Ok(pixbuf) = gdk::gdk_pixbuf::Pixbuf::from_stream(&stream, gtk4::gio::Cancellable::NONE)
     {
         let texture = gdk::Texture::for_pixbuf(&pixbuf);
         avatar.set_custom_image(Some(&texture));
@@ -62,24 +61,24 @@ pub fn load_avatar(avatar: adw::Avatar, url: String) {
         return;
     }
 
-    glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
-        match reply_rx.try_recv() {
+    glib::timeout_add_local(
+        std::time::Duration::from_millis(16),
+        move || match reply_rx.try_recv() {
             Ok(bytes) => {
                 apply_avatar_bytes(&avatar, &bytes);
                 glib::ControlFlow::Break
             }
             Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
             Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
-        }
-    });
+        },
+    );
 }
 
 fn apply_bytes_to_picture(picture: &gtk4::Picture, bytes: &[u8]) {
     let glib_bytes = glib::Bytes::from(bytes);
     let stream = gtk4::gio::MemoryInputStream::from_bytes(&glib_bytes);
 
-    if let Ok(pixbuf) =
-        gdk::gdk_pixbuf::Pixbuf::from_stream(&stream, gtk4::gio::Cancellable::NONE)
+    if let Ok(pixbuf) = gdk::gdk_pixbuf::Pixbuf::from_stream(&stream, gtk4::gio::Cancellable::NONE)
     {
         let texture = gdk::Texture::for_pixbuf(&pixbuf);
         picture.set_paintable(Some(&texture));
@@ -97,14 +96,15 @@ pub fn load_image_into_picture(picture: gtk4::Picture, url: String) {
         return;
     }
 
-    glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
-        match reply_rx.try_recv() {
+    glib::timeout_add_local(
+        std::time::Duration::from_millis(16),
+        move || match reply_rx.try_recv() {
             Ok(bytes) => {
                 apply_bytes_to_picture(&picture, &bytes);
                 glib::ControlFlow::Break
             }
             Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
             Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
-        }
-    });
+        },
+    );
 }

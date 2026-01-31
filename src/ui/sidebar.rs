@@ -23,7 +23,7 @@ impl NavItem {
     pub fn icon_name(&self) -> &'static str {
         match self {
             Self::Home => "go-home-symbolic",
-            Self::Mentions => "mail-unread-symbolic",
+            Self::Mentions => "system-users-symbolic",
             Self::Activity => "preferences-system-notifications-symbolic",
             Self::Chat => "chat-message-new-symbolic",
             Self::Profile => "avatar-default-symbolic",
@@ -221,6 +221,32 @@ impl Sidebar {
 
             if let Some(url) = avatar_url {
                 avatar_cache::load_avatar(avatar.clone(), url.to_string());
+            }
+        }
+    }
+
+    pub fn connect_nav_changed<F: Fn(NavItem) + 'static>(&self, callback: F) {
+        if let Some(nav_list) = self.imp().nav_list.borrow().as_ref() {
+            let sidebar_weak = self.downgrade();
+            nav_list.connect_row_activated(move |_, row| {
+                let index = row.index() as usize;
+                if let Some(item) = NavItem::all().get(index) {
+                    if let Some(sidebar) = sidebar_weak.upgrade() {
+                        sidebar.imp().selected_item.set(Some(*item));
+                    }
+                    callback(*item);
+                }
+            });
+        }
+    }
+
+    pub fn select_nav_item(&self, item: NavItem) {
+        if let Some(nav_list) = self.imp().nav_list.borrow().as_ref() {
+            if let Some(index) = NavItem::all().iter().position(|i| *i == item) {
+                if let Some(row) = nav_list.row_at_index(index as i32) {
+                    nav_list.select_row(Some(&row));
+                    self.imp().selected_item.set(Some(item));
+                }
             }
         }
     }

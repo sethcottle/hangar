@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use crate::atproto::types::{
-    Embed, ExternalEmbed, ImageEmbed, Post, Profile, QuoteEmbed, ReplyContext, RepostReason,
-    SavedFeed, Session, VideoEmbed,
+    Embed, ExternalEmbed, ImageEmbed, Notification, Post, Profile, QuoteEmbed, ReplyContext,
+    RepostReason, SavedFeed, Session, VideoEmbed,
 };
 use crate::config::DEFAULT_PDS;
 use atrium_api::agent::AtpAgent;
@@ -552,7 +552,10 @@ impl HangarClient {
     pub async fn like(&self, uri: &str, cid: &str) -> Result<String, ClientError> {
         let agent_guard = self.agent.read().unwrap();
         let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
-        let session = agent.get_session().await.ok_or(ClientError::NotAuthenticated)?;
+        let session = agent
+            .get_session()
+            .await
+            .ok_or(ClientError::NotAuthenticated)?;
 
         let record_json = serde_json::json!({
             "$type": "app.bsky.feed.like",
@@ -591,7 +594,10 @@ impl HangarClient {
     pub async fn repost(&self, uri: &str, cid: &str) -> Result<String, ClientError> {
         let agent_guard = self.agent.read().unwrap();
         let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
-        let session = agent.get_session().await.ok_or(ClientError::NotAuthenticated)?;
+        let session = agent
+            .get_session()
+            .await
+            .ok_or(ClientError::NotAuthenticated)?;
 
         let record_json = serde_json::json!({
             "$type": "app.bsky.feed.repost",
@@ -713,7 +719,10 @@ impl HangarClient {
     ) -> Result<(), ClientError> {
         let agent_guard = self.agent.read().unwrap();
         let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
-        let session = agent.get_session().await.ok_or(ClientError::NotAuthenticated)?;
+        let session = agent
+            .get_session()
+            .await
+            .ok_or(ClientError::NotAuthenticated)?;
 
         let record_json = serde_json::json!({
             "$type": "app.bsky.feed.post",
@@ -762,7 +771,10 @@ impl HangarClient {
     ) -> Result<(), ClientError> {
         let agent_guard = self.agent.read().unwrap();
         let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
-        let session = agent.get_session().await.ok_or(ClientError::NotAuthenticated)?;
+        let session = agent
+            .get_session()
+            .await
+            .ok_or(ClientError::NotAuthenticated)?;
 
         let mut record_json = serde_json::json!({
             "$type": "app.bsky.feed.post",
@@ -864,11 +876,7 @@ impl HangarClient {
 
                         // We'll need to fetch the display name separately
                         // For now, use the rkey from URI as a fallback name
-                        let display_name = uri
-                            .split('/')
-                            .last()
-                            .unwrap_or("Feed")
-                            .to_string();
+                        let display_name = uri.split('/').last().unwrap_or("Feed").to_string();
 
                         feeds.push(SavedFeed {
                             feed_type,
@@ -970,10 +978,7 @@ impl HangarClient {
 
     /// Get a post thread (the main post and its replies)
     #[allow(clippy::await_holding_lock)]
-    pub async fn get_thread(
-        &self,
-        post_uri: &str,
-    ) -> Result<Vec<Post>, ClientError> {
+    pub async fn get_thread(&self, post_uri: &str) -> Result<Vec<Post>, ClientError> {
         let agent_guard = self.agent.read().unwrap();
         let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
 
@@ -1003,7 +1008,9 @@ impl HangarClient {
     /// Recursively extract posts from a thread view
     fn extract_thread_posts(
         &self,
-        thread: &atrium_api::types::Union<atrium_api::app::bsky::feed::get_post_thread::OutputThreadRefs>,
+        thread: &atrium_api::types::Union<
+            atrium_api::app::bsky::feed::get_post_thread::OutputThreadRefs,
+        >,
         posts: &mut Vec<Post>,
     ) {
         use atrium_api::app::bsky::feed::get_post_thread::OutputThreadRefs;
@@ -1036,7 +1043,9 @@ impl HangarClient {
     /// Extract parent posts from thread (going up the chain)
     fn extract_parent_posts(
         &self,
-        parent: &atrium_api::types::Union<atrium_api::app::bsky::feed::defs::ThreadViewPostParentRefs>,
+        parent: &atrium_api::types::Union<
+            atrium_api::app::bsky::feed::defs::ThreadViewPostParentRefs,
+        >,
         posts: &mut Vec<Post>,
     ) {
         use atrium_api::app::bsky::feed::defs::ThreadViewPostParentRefs;
@@ -1061,7 +1070,9 @@ impl HangarClient {
     /// Extract reply posts from thread
     fn extract_reply_posts(
         &self,
-        reply: &atrium_api::types::Union<atrium_api::app::bsky::feed::defs::ThreadViewPostRepliesItem>,
+        reply: &atrium_api::types::Union<
+            atrium_api::app::bsky::feed::defs::ThreadViewPostRepliesItem,
+        >,
         posts: &mut Vec<Post>,
     ) {
         use atrium_api::app::bsky::feed::defs::ThreadViewPostRepliesItem;
@@ -1158,6 +1169,129 @@ impl HangarClient {
             .collect();
 
         Ok((posts, output.data.cursor))
+    }
+
+    /// Get notifications (mentions, replies, quotes, likes, reposts, follows)
+    /// If `mentions_only` is true, filters to just mentions, replies, and quotes
+    #[allow(clippy::await_holding_lock)]
+    pub async fn get_notifications(
+        &self,
+        cursor: Option<&str>,
+        mentions_only: bool,
+    ) -> Result<(Vec<Notification>, Option<String>), ClientError> {
+        let agent_guard = self.agent.read().unwrap();
+        let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
+
+        let params = atrium_api::app::bsky::notification::list_notifications::ParametersData {
+            cursor: cursor.map(String::from),
+            limit: None,
+            priority: None,
+            reasons: None,
+            seen_at: None,
+        };
+
+        let output = agent
+            .api
+            .app
+            .bsky
+            .notification
+            .list_notifications(params.into())
+            .await
+            .map_err(|e| ClientError::Network(e.to_string()))?;
+
+        let notifications: Vec<Notification> = output
+            .data
+            .notifications
+            .into_iter()
+            .filter_map(|notif| {
+                let reason = notif.data.reason.clone();
+
+                // If mentions_only, filter to just mentions/replies/quotes
+                if mentions_only && reason != "mention" && reason != "reply" && reason != "quote" {
+                    return None;
+                }
+
+                let author = Profile {
+                    did: notif.data.author.data.did.to_string(),
+                    handle: notif.data.author.data.handle.to_string(),
+                    display_name: notif.data.author.data.display_name.clone(),
+                    avatar: notif.data.author.data.avatar.clone(),
+                };
+
+                // Extract post data if this is a post-based notification
+                let post = self.extract_notification_post(&notif);
+
+                Some(Notification {
+                    uri: notif.data.uri.clone(),
+                    cid: notif.data.cid.as_ref().to_string(),
+                    author,
+                    reason,
+                    indexed_at: notif.data.indexed_at.as_str().to_string(),
+                    is_read: notif.data.is_read,
+                    post,
+                })
+            })
+            .collect();
+
+        Ok((notifications, output.data.cursor))
+    }
+
+    /// Extract post data from a notification record
+    fn extract_notification_post(
+        &self,
+        notif: &atrium_api::app::bsky::notification::list_notifications::Notification,
+    ) -> Option<Post> {
+        use atrium_api::types::Unknown;
+
+        // The record contains the post data for mentions/replies/quotes
+        let reason = &notif.data.reason;
+        if reason != "mention" && reason != "reply" && reason != "quote" {
+            return None;
+        }
+
+        // Extract text and created_at from record
+        let (text, created_at) = match &notif.data.record {
+            Unknown::Object(map) => {
+                let text = map
+                    .get("text")
+                    .and_then(|dm| serde_json::to_value(dm).ok())
+                    .and_then(|v| v.as_str().map(String::from))
+                    .unwrap_or_default();
+
+                let created_at = map
+                    .get("createdAt")
+                    .and_then(|dm| serde_json::to_value(dm).ok())
+                    .and_then(|v| v.as_str().map(String::from))
+                    .unwrap_or_default();
+
+                (text, created_at)
+            }
+            _ => (String::new(), String::new()),
+        };
+
+        let author = Profile {
+            did: notif.data.author.data.did.to_string(),
+            handle: notif.data.author.data.handle.to_string(),
+            display_name: notif.data.author.data.display_name.clone(),
+            avatar: notif.data.author.data.avatar.clone(),
+        };
+
+        Some(Post {
+            uri: notif.data.uri.clone(),
+            cid: notif.data.cid.as_ref().to_string(),
+            author,
+            text,
+            created_at,
+            indexed_at: notif.data.indexed_at.as_str().to_string(),
+            like_count: None,
+            repost_count: None,
+            reply_count: None,
+            embed: None,
+            viewer_like: None,
+            viewer_repost: None,
+            repost_reason: None,
+            reply_context: None,
+        })
     }
 }
 

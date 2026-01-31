@@ -8,10 +8,10 @@ use std::cell::RefCell;
 use std::sync::Arc;
 use std::thread;
 
-use crate::atproto::{HangarClient, Post, Profile, SavedFeed, Session};
+use crate::atproto::{HangarClient, Notification, Post, Profile, SavedFeed, Session};
 use crate::state::SessionManager;
 use crate::ui::post_row::PostRow;
-use crate::ui::{ComposeDialog, HangarWindow, LoginDialog, QuoteContext, ReplyContext};
+use crate::ui::{ComposeDialog, HangarWindow, LoginDialog, NavItem, QuoteContext, ReplyContext};
 
 mod imp {
     use super::*;
@@ -31,6 +31,9 @@ mod imp {
         pub checking_new_posts: RefCell<bool>,
         /// The currently selected feed
         pub current_feed: RefCell<Option<SavedFeed>>,
+        /// Mentions state
+        pub mentions_cursor: RefCell<Option<String>>,
+        pub mentions_loading_more: RefCell<bool>,
     }
 
     #[glib::object_subclass]
@@ -147,6 +150,16 @@ mod imp {
                 app_clone.open_profile_view(profile);
             });
 
+            let app_clone = app.clone();
+            window.set_nav_changed_callback(move |item| {
+                app_clone.handle_nav_change(item);
+            });
+
+            let app_clone = app.clone();
+            window.set_mentions_load_more_callback(move || {
+                app_clone.fetch_mentions_more();
+            });
+
             window.present();
 
             app.try_restore_session();
@@ -187,7 +200,10 @@ impl HangarApplication {
             let rt = tokio::runtime::Runtime::new().unwrap();
             let result = rt.block_on(async {
                 let session = SessionManager::load().await.map_err(|e| e.to_string())?;
-                client.resume_session(&session).await.map_err(|e| e.to_string())?;
+                client
+                    .resume_session(&session)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 Ok(session)
             });
             let _ = tx.send(result);
@@ -239,7 +255,10 @@ impl HangarApplication {
             thread::spawn(move || {
                 let rt = tokio::runtime::Runtime::new().unwrap();
                 let result = rt.block_on(async {
-                    let session = client.login(&handle, &password).await.map_err(|e| e.to_string())?;
+                    let session = client
+                        .login(&handle, &password)
+                        .await
+                        .map_err(|e| e.to_string())?;
                     if let Err(e) = SessionManager::store(&session).await {
                         eprintln!("Failed to persist session: {}", e);
                     }
@@ -311,10 +330,8 @@ impl HangarApplication {
             match rx.try_recv() {
                 Ok(Ok(profile)) => {
                     if let Some(window) = app.imp().window.borrow().as_ref() {
-                        let display_name = profile
-                            .display_name
-                            .as_deref()
-                            .unwrap_or(&profile.handle);
+                        let display_name =
+                            profile.display_name.as_deref().unwrap_or(&profile.handle);
                         window.set_user_avatar(display_name, profile.avatar.as_deref());
                     }
                     glib::ControlFlow::Break
@@ -510,8 +527,8 @@ impl HangarApplication {
 
             thread::spawn(move || {
                 let rt = tokio::runtime::Runtime::new().unwrap();
-                let result =
-                    rt.block_on(async { client.create_reply(&text, &parent_uri, &parent_cid).await });
+                let result = rt
+                    .block_on(async { client.create_reply(&text, &parent_uri, &parent_cid).await });
                 let _ = tx.send(result.map_err(|e| e.to_string()));
             });
 
@@ -579,8 +596,11 @@ impl HangarApplication {
 
             thread::spawn(move || {
                 let rt = tokio::runtime::Runtime::new().unwrap();
-                let result =
-                    rt.block_on(async { client.create_quote_post(&text, &quoted_uri, &quoted_cid).await });
+                let result = rt.block_on(async {
+                    client
+                        .create_quote_post(&text, &quoted_uri, &quoted_cid)
+                        .await
+                });
                 let _ = tx.send(result.map_err(|e| e.to_string()));
             });
 
@@ -1052,6 +1072,129 @@ impl HangarApplication {
                 Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     eprintln!("Failed to fetch profile feed: connection lost");
+                    glib::ControlFlow::Break
+                }
+            }
+        });
+    }
+
+    /// Handle navigation item changes from the sidebar
+    fn handle_nav_change(&self, item: NavItem) {
+        match item {
+            NavItem::Home => {
+                if let Some(window) = self.imp().window.borrow().as_ref() {
+                    window.show_home_page();
+                }
+            }
+            NavItem::Mentions => {
+                self.open_mentions_view();
+            }
+            // Other nav items not yet implemented
+            _ => {}
+        }
+    }
+
+    /// Open the mentions view
+    fn open_mentions_view(&self) {
+        // Switch to mentions page (instant, no animation)
+        if let Some(window) = self.imp().window.borrow().as_ref() {
+            window.show_mentions_page();
+        }
+
+        // Only fetch if we haven't loaded mentions yet
+        if self.imp().mentions_cursor.borrow().is_none() {
+            self.fetch_mentions();
+        }
+    }
+
+    /// Fetch mentions (notifications filtered to mentions/replies/quotes)
+    fn fetch_mentions(&self) {
+        let (tx, rx) =
+            std::sync::mpsc::channel::<Result<(Vec<Notification>, Option<String>), String>>();
+        let client = self.client();
+
+        thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async { client.get_notifications(None, true).await });
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+
+        let app = self.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            match rx.try_recv() {
+                Ok(Ok((notifications, next_cursor))) => {
+                    app.imp().mentions_cursor.replace(next_cursor);
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.set_mentions(notifications);
+                    }
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(e)) => {
+                    eprintln!("Failed to fetch mentions: {}", e);
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    eprintln!("Failed to fetch mentions: connection lost");
+                    glib::ControlFlow::Break
+                }
+            }
+        });
+    }
+
+    /// Fetch more mentions for infinite scroll
+    fn fetch_mentions_more(&self) {
+        if *self.imp().mentions_loading_more.borrow() {
+            return;
+        }
+        let cursor = match self.imp().mentions_cursor.borrow().as_ref() {
+            Some(c) => c.clone(),
+            None => return,
+        };
+        self.imp().mentions_loading_more.replace(true);
+
+        if let Some(window) = self.imp().window.borrow().as_ref() {
+            window.set_mentions_loading(true);
+        }
+
+        let (tx, rx) =
+            std::sync::mpsc::channel::<Result<(Vec<Notification>, Option<String>), String>>();
+        let client = self.client();
+
+        thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async { client.get_notifications(Some(&cursor), true).await });
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+
+        let app = self.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            match rx.try_recv() {
+                Ok(Ok((notifications, next_cursor))) => {
+                    app.imp().mentions_loading_more.replace(false);
+                    app.imp().mentions_cursor.replace(next_cursor);
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.set_mentions_loading(false);
+                        if !notifications.is_empty() {
+                            window.append_mentions(notifications);
+                        }
+                    }
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(e)) => {
+                    app.imp().mentions_loading_more.replace(false);
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.set_mentions_loading(false);
+                    }
+                    eprintln!("Failed to fetch more mentions: {}", e);
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    app.imp().mentions_loading_more.replace(false);
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.set_mentions_loading(false);
+                    }
                     glib::ControlFlow::Break
                 }
             }

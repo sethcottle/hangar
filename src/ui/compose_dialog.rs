@@ -266,21 +266,15 @@ impl ComposeDialog {
     }
 
     pub fn connect_post<F: Fn(String) + 'static>(&self, callback: F) {
-        self.imp()
-            .post_callback
-            .replace(Some(Box::new(callback)));
+        self.imp().post_callback.replace(Some(Box::new(callback)));
     }
 
     pub fn connect_reply<F: Fn(String, String, String) + 'static>(&self, callback: F) {
-        self.imp()
-            .reply_callback
-            .replace(Some(Box::new(callback)));
+        self.imp().reply_callback.replace(Some(Box::new(callback)));
     }
 
     pub fn connect_quote<F: Fn(String, String, String) + 'static>(&self, callback: F) {
-        self.imp()
-            .quote_callback
-            .replace(Some(Box::new(callback)));
+        self.imp().quote_callback.replace(Some(Box::new(callback)));
     }
 
     pub fn set_loading(&self, loading: bool) {
