@@ -1028,6 +1028,7 @@ version = "0.1.0"
 dependencies = [
  "atrium-api",
  "atrium-xrpc-client",
+ "chrono",
  "gtk4",
  "libadwaita",
  "once_cell",

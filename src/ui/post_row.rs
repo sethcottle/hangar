@@ -209,8 +209,25 @@ impl PostRow {
         if indexed_at.is_empty() {
             return String::new();
         }
-        // Placeholder until we add proper relative time formatting
-        "now".to_string()
+
+        let Ok(post_time) = chrono::DateTime::parse_from_rfc3339(indexed_at) else {
+            return String::new();
+        };
+
+        let now = chrono::Utc::now();
+        let duration = now.signed_duration_since(post_time);
+
+        if duration.num_seconds() < 60 {
+            "now".to_string()
+        } else if duration.num_minutes() < 60 {
+            format!("{}m", duration.num_minutes())
+        } else if duration.num_hours() < 24 {
+            format!("{}h", duration.num_hours())
+        } else if duration.num_days() < 7 {
+            format!("{}d", duration.num_days())
+        } else {
+            post_time.format("%b %d").to_string()
+        }
     }
 }
 
