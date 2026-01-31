@@ -360,17 +360,15 @@ impl HangarWindow {
         ));
         overlay.add_overlay(&new_posts_btn);
 
-        timeline_box.append(&overlay);
-
-        // Loading spinner at bottom
-        let spinner_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-        spinner_box.set_halign(gtk4::Align::Center);
-        spinner_box.set_margin_top(12);
-        spinner_box.set_margin_bottom(12);
+        // Loading spinner as an overlay at the bottom
         let spinner = gtk4::Spinner::new();
         spinner.set_visible(false);
-        spinner_box.append(&spinner);
-        timeline_box.append(&spinner_box);
+        spinner.set_halign(gtk4::Align::Center);
+        spinner.set_valign(gtk4::Align::End);
+        spinner.set_margin_bottom(16);
+        overlay.add_overlay(&spinner);
+
+        timeline_box.append(&overlay);
 
         let imp = self.imp();
         imp.timeline_model.replace(Some(model));

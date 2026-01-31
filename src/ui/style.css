@@ -50,6 +50,13 @@
 /* Post embed images */
 .post-embed-image {
     border-radius: 12px;
+    overflow: hidden;
+    border: none;
+    background: transparent;
+}
+
+.post-embed-image > picture {
+    border-radius: 12px;
 }
 
 /* Action buttons */

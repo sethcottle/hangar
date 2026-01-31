@@ -168,7 +168,7 @@ impl PostRow {
         actions.append(&repost_btn_box);
 
         let (like_btn, like_count, like_btn_ref) =
-            Self::create_action_button("heart-outline-symbolic");
+            Self::create_action_button("emote-love-symbolic");
         actions.append(&like_btn);
 
         let spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
@@ -299,7 +299,6 @@ impl PostRow {
         if let Some(btn) = imp.like_btn.borrow().as_ref() {
             if was_liked {
                 btn.remove_css_class("liked");
-                btn.set_icon_name("heart-outline-symbolic");
                 imp.is_liked.replace(false);
                 // Clear the like URI since we're unliking
                 imp.viewer_like_uri.replace(None);
@@ -311,7 +310,6 @@ impl PostRow {
                 }
             } else {
                 btn.add_css_class("liked");
-                btn.set_icon_name("heart-filled-symbolic");
                 imp.is_liked.replace(true);
                 // Note: we don't have the new like URI yet, but that's OK for visual state
                 // Increment count
@@ -523,14 +521,12 @@ impl PostRow {
         imp.viewer_like_uri.replace(post.viewer_like.clone());
         imp.viewer_repost_uri.replace(post.viewer_repost.clone());
 
-        // Update like button state and icon
+        // Update like button state
         if let Some(btn) = imp.like_btn.borrow().as_ref() {
             if post.viewer_like.is_some() {
                 btn.add_css_class("liked");
-                btn.set_icon_name("heart-filled-symbolic");
             } else {
                 btn.remove_css_class("liked");
-                btn.set_icon_name("heart-outline-symbolic");
             }
         }
 
@@ -607,64 +603,110 @@ impl PostRow {
 
     /// Render images with smart layout based on count
     fn render_images(&self, container: &gtk4::Box, images: &[ImageEmbed]) {
+        // Create a container for the image grid
+        let grid_container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        grid_container.add_css_class("image-grid");
+
         match images.len() {
-            0 => {}
+            0 => return,
             1 => {
-                // Single image, wider
+                // Single image - preserve aspect ratio with max height constraint
                 let img = &images[0];
-                let picture = self.create_image_widget(&img.thumb, 400, 225);
-                container.append(&picture);
+
+                // Use a frame with overflow hidden and max height to constrain tall images
+                let frame = gtk4::Frame::new(None);
+                frame.set_hexpand(true);
+                frame.set_overflow(gtk4::Overflow::Hidden);
+                frame.add_css_class("post-embed-image");
+                // Max height of 400px for single images - prevents tall images from dominating
+                frame.set_size_request(-1, -1);
+
+                let picture = gtk4::Picture::new();
+                picture.set_hexpand(true);
+                picture.set_can_shrink(true);
+                picture.set_keep_aspect_ratio(true);
+                // Set a reasonable max height via widget height request
+                picture.set_size_request(-1, 400);
+
+                frame.set_child(Some(&picture));
+                avatar_cache::load_image_into_picture(picture, img.thumb.clone());
+                grid_container.append(&frame);
             }
             2 => {
-                // Two images side by side
+                // Two images side by side, both square-ish
                 let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
-                for img in images {
-                    let picture = self.create_image_widget(&img.thumb, 196, 196);
-                    row.append(&picture);
+                row.set_homogeneous(true);
+
+                for img in images.iter() {
+                    let cell = self.create_image_cell(&img.thumb, 200);
+                    row.append(&cell);
                 }
-                container.append(&row);
+                grid_container.append(&row);
             }
             3 => {
-                // One large left, two small stacked right
+                // One tall left, two stacked right
                 let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
-                let left = self.create_image_widget(&images[0].thumb, 196, 196);
+                row.set_homogeneous(true);
+
+                // Left image - tall (spans both rows visually)
+                let left = self.create_image_cell(&images[0].thumb, 260);
                 row.append(&left);
 
+                // Right column with two stacked images
                 let right_col = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
-                let top_right = self.create_image_widget(&images[1].thumb, 196, 96);
-                let bot_right = self.create_image_widget(&images[2].thumb, 196, 96);
+                let top_right = self.create_image_cell(&images[1].thumb, 128);
+                let bot_right = self.create_image_cell(&images[2].thumb, 128);
                 right_col.append(&top_right);
                 right_col.append(&bot_right);
                 row.append(&right_col);
 
-                container.append(&row);
+                grid_container.append(&row);
             }
             _ => {
                 // 4+ images: 2x2 grid
-                let grid = gtk4::Grid::new();
-                grid.set_row_spacing(4);
-                grid.set_column_spacing(4);
-                grid.add_css_class("image-grid");
+                let top_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+                top_row.set_homogeneous(true);
+                let bot_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+                bot_row.set_homogeneous(true);
 
                 for (i, img) in images.iter().take(4).enumerate() {
-                    let picture = self.create_image_widget(&img.thumb, 196, 130);
-                    grid.attach(&picture, (i % 2) as i32, (i / 2) as i32, 1, 1);
+                    let cell = self.create_image_cell(&img.thumb, 150);
+                    if i < 2 {
+                        top_row.append(&cell);
+                    } else {
+                        bot_row.append(&cell);
+                    }
                 }
 
-                container.append(&grid);
+                grid_container.append(&top_row);
+                grid_container.set_spacing(4);
+                grid_container.append(&bot_row);
             }
         }
+
+        container.append(&grid_container);
     }
 
-    /// Create an image widget with specified dimensions
-    fn create_image_widget(&self, url: &str, width: i32, height: i32) -> gtk4::Picture {
+    /// Create an image cell that fills a fixed height container
+    fn create_image_cell(&self, url: &str, height: i32) -> gtk4::Frame {
+        // Frame acts as the clipping container
+        let frame = gtk4::Frame::new(None);
+        frame.set_hexpand(true);
+        frame.set_size_request(-1, height);
+        frame.set_overflow(gtk4::Overflow::Hidden);
+        frame.add_css_class("post-embed-image");
+
+        // Create picture - stretch to fill (no aspect ratio preservation for "cover" effect)
         let picture = gtk4::Picture::new();
-        picture.set_keep_aspect_ratio(true);
+        picture.set_hexpand(true);
+        picture.set_vexpand(true);
         picture.set_can_shrink(true);
-        picture.set_size_request(width, height);
-        picture.add_css_class("post-embed-image");
-        avatar_cache::load_image_into_picture(picture.clone(), url.to_string());
-        picture
+        picture.set_keep_aspect_ratio(false); // Stretch to fill the cell
+
+        frame.set_child(Some(&picture));
+        avatar_cache::load_image_into_picture(picture, url.to_string());
+
+        frame
     }
 
     /// Render an external link card

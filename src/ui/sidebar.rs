@@ -27,7 +27,7 @@ impl NavItem {
             Self::Activity => "preferences-system-notifications-symbolic",
             Self::Chat => "chat-message-new-symbolic",
             Self::Profile => "avatar-default-symbolic",
-            Self::Likes => "heart-symbolic",
+            Self::Likes => "emote-love-symbolic",
             Self::Bookmarks => "bookmark-new-symbolic",
             Self::Search => "system-search-symbolic",
         }
