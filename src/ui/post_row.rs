@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use crate::atproto::Post;
+use crate::atproto::{Embed, ImageEmbed, Post};
 use crate::ui::avatar_cache;
 use gtk4::glib;
 use gtk4::prelude::*;
@@ -23,12 +23,24 @@ mod imp {
         pub repost_count_label: RefCell<Option<gtk4::Label>>,
         pub like_count_label: RefCell<Option<gtk4::Label>>,
         pub like_btn: RefCell<Option<gtk4::Button>>,
-        pub repost_btn: RefCell<Option<gtk4::Button>>,
+        pub repost_btn: RefCell<Option<gtk4::MenuButton>>,
         pub like_handler_id: RefCell<Option<glib::SignalHandlerId>>,
         pub repost_handler_id: RefCell<Option<glib::SignalHandlerId>>,
+        pub quote_handler_id: RefCell<Option<glib::SignalHandlerId>>,
         pub reply_handler_id: RefCell<Option<glib::SignalHandlerId>>,
         pub reply_btn: RefCell<Option<gtk4::Button>>,
-        pub images_box: RefCell<Option<gtk4::FlowBox>>,
+        pub repost_item: RefCell<Option<gtk4::Button>>,
+        pub repost_item_label: RefCell<Option<gtk4::Label>>,
+        pub quote_item: RefCell<Option<gtk4::Button>>,
+        // New fields for rich embeds and context
+        pub repost_row: RefCell<Option<gtk4::Box>>,
+        pub reply_indicator: RefCell<Option<gtk4::Label>>,
+        pub embed_container: RefCell<Option<gtk4::Box>>,
+        // Track current like/repost state (may differ from original post after user actions)
+        pub is_liked: RefCell<bool>,
+        pub is_reposted: RefCell<bool>,
+        pub viewer_like_uri: RefCell<Option<String>>,
+        pub viewer_repost_uri: RefCell<Option<String>>,
     }
 
     #[glib::object_subclass]
@@ -69,7 +81,22 @@ impl PostRow {
         self.set_margin_end(16);
         self.set_margin_top(12);
         self.set_margin_bottom(12);
-        self.add_css_class("card");
+        self.add_css_class("post-row");
+
+        // Repost attribution row (above header, shows "Reposted by X")
+        let repost_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+        repost_row.set_margin_bottom(8);
+        repost_row.add_css_class("repost-attribution");
+        let repost_icon = gtk4::Image::from_icon_name("media-playlist-repeat-symbolic");
+        repost_icon.add_css_class("dim-label");
+        repost_icon.set_pixel_size(14);
+        repost_row.append(&repost_icon);
+        let repost_label = gtk4::Label::new(None);
+        repost_label.add_css_class("dim-label");
+        repost_label.add_css_class("caption");
+        repost_row.append(&repost_label);
+        repost_row.set_visible(false);
+        self.append(&repost_row);
 
         // Header row: avatar + name + handle + time
         let header = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
@@ -80,11 +107,22 @@ impl PostRow {
         let name_box = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
         name_box.set_hexpand(true);
 
+        // Top row: display name + reply indicator
+        let name_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
         let display_name = gtk4::Label::new(None);
         display_name.set_halign(gtk4::Align::Start);
         display_name.add_css_class("heading");
         display_name.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-        name_box.append(&display_name);
+        name_row.append(&display_name);
+
+        // Reply indicator (shows "replying to @handle")
+        let reply_indicator = gtk4::Label::new(None);
+        reply_indicator.add_css_class("dim-label");
+        reply_indicator.add_css_class("caption");
+        reply_indicator.set_visible(false);
+        name_row.append(&reply_indicator);
+
+        name_box.append(&name_row);
 
         let handle = gtk4::Label::new(None);
         handle.set_halign(gtk4::Align::Start);
@@ -109,16 +147,12 @@ impl PostRow {
         content.set_xalign(0.0);
         self.append(&content);
 
-        // Images (embed thumbnails)
-        let images_box = gtk4::FlowBox::new();
-        images_box.set_selection_mode(gtk4::SelectionMode::None);
-        images_box.set_max_children_per_line(3);
-        images_box.set_min_children_per_line(1);
-        images_box.set_homogeneous(false);
-        images_box.set_row_spacing(8);
-        images_box.set_column_spacing(8);
-        images_box.add_css_class("post-images");
-        self.append(&images_box);
+        // Unified embed container (images, videos, external cards, quotes)
+        let embed_container = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+        embed_container.set_margin_top(8);
+        embed_container.add_css_class("post-embed");
+        embed_container.set_visible(false);
+        self.append(&embed_container);
 
         // Action bar
         let actions = gtk4::Box::new(gtk4::Orientation::Horizontal, 24);
@@ -128,9 +162,10 @@ impl PostRow {
             Self::create_action_button("mail-reply-sender-symbolic");
         actions.append(&reply_btn);
 
-        let (repost_btn, repost_count, repost_btn_ref) =
-            Self::create_action_button("media-playlist-repeat-symbolic");
-        actions.append(&repost_btn);
+        // Repost menu button with popover
+        let (repost_btn_box, repost_count, repost_menu_btn, repost_item, repost_item_label, quote_item) =
+            Self::create_repost_menu_button();
+        actions.append(&repost_btn_box);
 
         let (like_btn, like_count, like_btn_ref) =
             Self::create_action_button("heart-outline-symbolic");
@@ -158,9 +193,14 @@ impl PostRow {
         imp.repost_count_label.replace(Some(repost_count));
         imp.like_count_label.replace(Some(like_count));
         imp.like_btn.replace(Some(like_btn_ref));
-        imp.repost_btn.replace(Some(repost_btn_ref));
+        imp.repost_btn.replace(Some(repost_menu_btn));
+        imp.repost_item.replace(Some(repost_item));
+        imp.repost_item_label.replace(Some(repost_item_label));
+        imp.quote_item.replace(Some(quote_item));
         imp.reply_btn.replace(Some(reply_btn_ref));
-        imp.images_box.replace(Some(images_box));
+        imp.repost_row.replace(Some(repost_row));
+        imp.reply_indicator.replace(Some(reply_indicator));
+        imp.embed_container.replace(Some(embed_container));
     }
 
     fn create_action_button(icon_name: &str) -> (gtk4::Box, gtk4::Label, gtk4::Button) {
@@ -178,7 +218,57 @@ impl PostRow {
         (btn_box, count_label, btn)
     }
 
-    pub fn connect_like_clicked<F: Fn() + 'static>(&self, f: F) {
+    /// Create a repost menu button with "Repost"/"Undo Repost" and "Quote" options
+    fn create_repost_menu_button() -> (gtk4::Box, gtk4::Label, gtk4::MenuButton, gtk4::Button, gtk4::Label, gtk4::Button) {
+        let btn_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+
+        // Create popover content
+        let popover_box = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+        popover_box.set_margin_top(8);
+        popover_box.set_margin_bottom(8);
+        popover_box.set_margin_start(8);
+        popover_box.set_margin_end(8);
+
+        let repost_item = gtk4::Button::new();
+        let repost_content = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        let repost_icon = gtk4::Image::from_icon_name("media-playlist-repeat-symbolic");
+        repost_content.append(&repost_icon);
+        let repost_item_label = gtk4::Label::new(Some("Repost"));
+        repost_content.append(&repost_item_label);
+        repost_item.set_child(Some(&repost_content));
+        repost_item.add_css_class("flat");
+        popover_box.append(&repost_item);
+
+        let quote_item = gtk4::Button::new();
+        let quote_content = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        let quote_icon = gtk4::Image::from_icon_name("mail-reply-sender-symbolic");
+        quote_content.append(&quote_icon);
+        quote_content.append(&gtk4::Label::new(Some("Quote")));
+        quote_item.set_child(Some(&quote_content));
+        quote_item.add_css_class("flat");
+        popover_box.append(&quote_item);
+
+        let popover = gtk4::Popover::new();
+        popover.set_child(Some(&popover_box));
+        popover.add_css_class("menu");
+        popover.set_has_arrow(false);
+
+        let menu_btn = gtk4::MenuButton::new();
+        menu_btn.set_icon_name("media-playlist-repeat-symbolic");
+        menu_btn.add_css_class("flat");
+        menu_btn.add_css_class("circular");
+        menu_btn.set_popover(Some(&popover));
+
+        btn_box.append(&menu_btn);
+
+        let count_label = gtk4::Label::new(Some("0"));
+        count_label.add_css_class("dim-label");
+        btn_box.append(&count_label);
+
+        (btn_box, count_label, menu_btn, repost_item, repost_item_label, quote_item)
+    }
+
+    pub fn connect_like_clicked<F: Fn(&PostRow, bool, Option<String>) + 'static>(&self, f: F) {
         let imp = self.imp();
         if let Some(id) = imp.like_handler_id.take() {
             if let Some(btn) = imp.like_btn.borrow().as_ref() {
@@ -186,21 +276,139 @@ impl PostRow {
             }
         }
         if let Some(btn) = imp.like_btn.borrow().as_ref() {
-            let id = btn.connect_clicked(move |_| f());
+            // Toggle visual state optimistically when clicked
+            let post_row = self.clone();
+            let id = btn.connect_clicked(move |_| {
+                // Capture current state BEFORE toggling
+                let was_liked = post_row.is_liked();
+                let like_uri = post_row.viewer_like_uri();
+                // Toggle visual state
+                post_row.toggle_like_visual();
+                // Call callback with self, state info: (was_liked, like_uri_if_unliking)
+                f(&post_row, was_liked, like_uri);
+            });
             imp.like_handler_id.replace(Some(id));
         }
     }
 
-    pub fn connect_repost_clicked<F: Fn() + 'static>(&self, f: F) {
+    /// Toggle the like button visual state (optimistic update)
+    pub fn toggle_like_visual(&self) {
+        let imp = self.imp();
+        let was_liked = *imp.is_liked.borrow();
+
+        if let Some(btn) = imp.like_btn.borrow().as_ref() {
+            if was_liked {
+                btn.remove_css_class("liked");
+                btn.set_icon_name("heart-outline-symbolic");
+                imp.is_liked.replace(false);
+                // Clear the like URI since we're unliking
+                imp.viewer_like_uri.replace(None);
+                // Decrement count
+                if let Some(label) = imp.like_count_label.borrow().as_ref() {
+                    if let Ok(count) = label.text().parse::<i32>() {
+                        label.set_text(&Self::format_count(Some((count - 1).max(0) as u32)));
+                    }
+                }
+            } else {
+                btn.add_css_class("liked");
+                btn.set_icon_name("heart-filled-symbolic");
+                imp.is_liked.replace(true);
+                // Note: we don't have the new like URI yet, but that's OK for visual state
+                // Increment count
+                if let Some(label) = imp.like_count_label.borrow().as_ref() {
+                    if let Ok(count) = label.text().parse::<i32>() {
+                        label.set_text(&Self::format_count(Some((count + 1) as u32)));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Connect callback for the "Repost" menu item
+    pub fn connect_repost_clicked<F: Fn(&PostRow, bool, Option<String>) + 'static>(&self, f: F) {
         let imp = self.imp();
         if let Some(id) = imp.repost_handler_id.take() {
-            if let Some(btn) = imp.repost_btn.borrow().as_ref() {
+            if let Some(btn) = imp.repost_item.borrow().as_ref() {
                 btn.disconnect(id);
             }
         }
-        if let Some(btn) = imp.repost_btn.borrow().as_ref() {
-            let id = btn.connect_clicked(move |_| f());
+        if let Some(btn) = imp.repost_item.borrow().as_ref() {
+            // Close popover when clicked
+            let menu_btn = imp.repost_btn.borrow();
+            let popover = menu_btn.as_ref().and_then(|m| m.popover());
+            let post_row = self.clone();
+            let id = btn.connect_clicked(move |_| {
+                if let Some(p) = &popover {
+                    p.popdown();
+                }
+                // Capture current state BEFORE toggling
+                let was_reposted = post_row.is_reposted();
+                let repost_uri = post_row.viewer_repost_uri();
+                // Toggle visual state
+                post_row.toggle_repost_visual();
+                // Call callback with self, state info
+                f(&post_row, was_reposted, repost_uri);
+            });
             imp.repost_handler_id.replace(Some(id));
+        }
+    }
+
+    /// Toggle the repost button visual state (optimistic update)
+    pub fn toggle_repost_visual(&self) {
+        let imp = self.imp();
+        let was_reposted = *imp.is_reposted.borrow();
+
+        if let Some(btn) = imp.repost_btn.borrow().as_ref() {
+            if was_reposted {
+                btn.remove_css_class("reposted");
+                imp.is_reposted.replace(false);
+                imp.viewer_repost_uri.replace(None);
+                // Decrement count
+                if let Some(label) = imp.repost_count_label.borrow().as_ref() {
+                    if let Ok(count) = label.text().parse::<i32>() {
+                        label.set_text(&Self::format_count(Some((count - 1).max(0) as u32)));
+                    }
+                }
+                // Update menu item label
+                if let Some(label) = imp.repost_item_label.borrow().as_ref() {
+                    label.set_text("Repost");
+                }
+            } else {
+                btn.add_css_class("reposted");
+                imp.is_reposted.replace(true);
+                // Increment count
+                if let Some(label) = imp.repost_count_label.borrow().as_ref() {
+                    if let Ok(count) = label.text().parse::<i32>() {
+                        label.set_text(&Self::format_count(Some((count + 1) as u32)));
+                    }
+                }
+                // Update menu item label
+                if let Some(label) = imp.repost_item_label.borrow().as_ref() {
+                    label.set_text("Undo Repost");
+                }
+            }
+        }
+    }
+
+    /// Connect callback for the "Quote" menu item
+    pub fn connect_quote_clicked<F: Fn() + 'static>(&self, f: F) {
+        let imp = self.imp();
+        if let Some(id) = imp.quote_handler_id.take() {
+            if let Some(btn) = imp.quote_item.borrow().as_ref() {
+                btn.disconnect(id);
+            }
+        }
+        if let Some(btn) = imp.quote_item.borrow().as_ref() {
+            // Close popover when clicked
+            let menu_btn = imp.repost_btn.borrow();
+            let popover = menu_btn.as_ref().and_then(|m| m.popover());
+            let id = btn.connect_clicked(move |_| {
+                if let Some(p) = &popover {
+                    p.popdown();
+                }
+                f();
+            });
+            imp.quote_handler_id.replace(Some(id));
         }
     }
 
@@ -220,6 +428,37 @@ impl PostRow {
     pub fn bind(&self, post: &Post) {
         let imp = self.imp();
         imp.post.replace(Some(post.clone()));
+
+        // Show/hide repost attribution
+        if let Some(repost_row) = imp.repost_row.borrow().as_ref() {
+            if let Some(reason) = &post.repost_reason {
+                let name = reason
+                    .by
+                    .display_name
+                    .as_deref()
+                    .unwrap_or(&reason.by.handle);
+                // Find the label inside the repost row
+                if let Some(label) = repost_row.last_child() {
+                    if let Ok(label) = label.downcast::<gtk4::Label>() {
+                        label.set_text(&format!("Reposted by {}", name));
+                    }
+                }
+                repost_row.set_visible(true);
+            } else {
+                repost_row.set_visible(false);
+            }
+        }
+
+        // Show/hide reply indicator
+        if let Some(reply_indicator) = imp.reply_indicator.borrow().as_ref() {
+            if let Some(context) = &post.reply_context {
+                // Always show @handle for clarity
+                reply_indicator.set_text(&format!("↩ @{}", context.parent_author.handle));
+                reply_indicator.set_visible(true);
+            } else {
+                reply_indicator.set_visible(false);
+            }
+        }
 
         let display_name = post
             .author
@@ -251,21 +490,19 @@ impl PostRow {
             label.set_text(&post.text);
         }
 
-        // Clear and repopulate images
-        if let Some(images_box) = imp.images_box.borrow().as_ref() {
-            while let Some(child) = images_box.first_child() {
-                images_box.remove(&child);
+        // Render embed content
+        if let Some(container) = imp.embed_container.borrow().as_ref() {
+            // Clear previous embeds
+            while let Some(child) = container.first_child() {
+                container.remove(&child);
             }
-            for url in &post.images {
-                let picture = gtk4::Picture::new();
-                picture.set_keep_aspect_ratio(true);
-                picture.set_can_shrink(true);
-                picture.set_size_request(200, 200);
-                picture.add_css_class("post-embed-image");
-                images_box.insert(&picture, -1);
-                avatar_cache::load_image_into_picture(picture, url.clone());
+
+            if let Some(embed) = &post.embed {
+                self.render_embed(container, embed);
+                container.set_visible(true);
+            } else {
+                container.set_visible(false);
             }
-            images_box.set_visible(!post.images.is_empty());
         }
 
         if let Some(label) = imp.reply_count_label.borrow().as_ref() {
@@ -280,16 +517,24 @@ impl PostRow {
             label.set_text(&Self::format_count(post.like_count));
         }
 
-        // Update like button state
+        // Track like/repost state for toggle operations
+        imp.is_liked.replace(post.viewer_like.is_some());
+        imp.is_reposted.replace(post.viewer_repost.is_some());
+        imp.viewer_like_uri.replace(post.viewer_like.clone());
+        imp.viewer_repost_uri.replace(post.viewer_repost.clone());
+
+        // Update like button state and icon
         if let Some(btn) = imp.like_btn.borrow().as_ref() {
             if post.viewer_like.is_some() {
                 btn.add_css_class("liked");
+                btn.set_icon_name("heart-filled-symbolic");
             } else {
                 btn.remove_css_class("liked");
+                btn.set_icon_name("heart-outline-symbolic");
             }
         }
 
-        // Update repost button state
+        // Update repost button state and menu label
         if let Some(btn) = imp.repost_btn.borrow().as_ref() {
             if post.viewer_repost.is_some() {
                 btn.add_css_class("reposted");
@@ -297,6 +542,278 @@ impl PostRow {
                 btn.remove_css_class("reposted");
             }
         }
+        // Update repost menu item label
+        if let Some(label) = imp.repost_item_label.borrow().as_ref() {
+            if post.viewer_repost.is_some() {
+                label.set_text("Undo Repost");
+            } else {
+                label.set_text("Repost");
+            }
+        }
+    }
+
+    /// Check if the post is currently liked (tracks local state after user actions)
+    pub fn is_liked(&self) -> bool {
+        *self.imp().is_liked.borrow()
+    }
+
+    /// Check if the post is currently reposted (tracks local state after user actions)
+    pub fn is_reposted(&self) -> bool {
+        *self.imp().is_reposted.borrow()
+    }
+
+    /// Get the viewer's like URI (if liked)
+    pub fn viewer_like_uri(&self) -> Option<String> {
+        self.imp().viewer_like_uri.borrow().clone()
+    }
+
+    /// Get the viewer's repost URI (if reposted)
+    pub fn viewer_repost_uri(&self) -> Option<String> {
+        self.imp().viewer_repost_uri.borrow().clone()
+    }
+
+    /// Set the viewer's like URI (after a successful like operation)
+    pub fn set_viewer_like_uri(&self, uri: Option<String>) {
+        self.imp().viewer_like_uri.replace(uri);
+    }
+
+    /// Set the viewer's repost URI (after a successful repost operation)
+    pub fn set_viewer_repost_uri(&self, uri: Option<String>) {
+        self.imp().viewer_repost_uri.replace(uri);
+    }
+
+    /// Render embed content into the container
+    fn render_embed(&self, container: &gtk4::Box, embed: &Embed) {
+        match embed {
+            Embed::Images(images) => {
+                self.render_images(container, images);
+            }
+            Embed::External(ext) => {
+                self.render_external_card(container, ext);
+            }
+            Embed::Video(video) => {
+                self.render_video(container, video);
+            }
+            Embed::Quote(quote) => {
+                self.render_quote(container, quote);
+            }
+            Embed::QuoteWithMedia { quote, media } => {
+                // Render media first, then quote below
+                self.render_embed(container, media);
+                self.render_quote(container, quote);
+            }
+        }
+    }
+
+    /// Render images with smart layout based on count
+    fn render_images(&self, container: &gtk4::Box, images: &[ImageEmbed]) {
+        match images.len() {
+            0 => {}
+            1 => {
+                // Single image, wider
+                let img = &images[0];
+                let picture = self.create_image_widget(&img.thumb, 400, 225);
+                container.append(&picture);
+            }
+            2 => {
+                // Two images side by side
+                let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+                for img in images {
+                    let picture = self.create_image_widget(&img.thumb, 196, 196);
+                    row.append(&picture);
+                }
+                container.append(&row);
+            }
+            3 => {
+                // One large left, two small stacked right
+                let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+                let left = self.create_image_widget(&images[0].thumb, 196, 196);
+                row.append(&left);
+
+                let right_col = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+                let top_right = self.create_image_widget(&images[1].thumb, 196, 96);
+                let bot_right = self.create_image_widget(&images[2].thumb, 196, 96);
+                right_col.append(&top_right);
+                right_col.append(&bot_right);
+                row.append(&right_col);
+
+                container.append(&row);
+            }
+            _ => {
+                // 4+ images: 2x2 grid
+                let grid = gtk4::Grid::new();
+                grid.set_row_spacing(4);
+                grid.set_column_spacing(4);
+                grid.add_css_class("image-grid");
+
+                for (i, img) in images.iter().take(4).enumerate() {
+                    let picture = self.create_image_widget(&img.thumb, 196, 130);
+                    grid.attach(&picture, (i % 2) as i32, (i / 2) as i32, 1, 1);
+                }
+
+                container.append(&grid);
+            }
+        }
+    }
+
+    /// Create an image widget with specified dimensions
+    fn create_image_widget(&self, url: &str, width: i32, height: i32) -> gtk4::Picture {
+        let picture = gtk4::Picture::new();
+        picture.set_keep_aspect_ratio(true);
+        picture.set_can_shrink(true);
+        picture.set_size_request(width, height);
+        picture.add_css_class("post-embed-image");
+        avatar_cache::load_image_into_picture(picture.clone(), url.to_string());
+        picture
+    }
+
+    /// Render an external link card
+    fn render_external_card(&self, container: &gtk4::Box, ext: &crate::atproto::ExternalEmbed) {
+        let card = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
+        card.add_css_class("external-card");
+
+        // Thumbnail (if available)
+        if let Some(thumb_url) = &ext.thumb {
+            let thumb = gtk4::Picture::new();
+            thumb.set_keep_aspect_ratio(true);
+            thumb.set_can_shrink(true);
+            thumb.set_size_request(100, 100);
+            thumb.add_css_class("external-thumb");
+            avatar_cache::load_image_into_picture(thumb.clone(), thumb_url.clone());
+            card.append(&thumb);
+        }
+
+        // Text content
+        let text_box = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+        text_box.set_hexpand(true);
+        text_box.set_valign(gtk4::Align::Center);
+
+        let title = gtk4::Label::new(Some(&ext.title));
+        title.set_halign(gtk4::Align::Start);
+        title.add_css_class("external-title");
+        title.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        title.set_max_width_chars(50);
+        text_box.append(&title);
+
+        if !ext.description.is_empty() {
+            let desc = gtk4::Label::new(Some(&ext.description));
+            desc.set_halign(gtk4::Align::Start);
+            desc.add_css_class("dim-label");
+            desc.add_css_class("caption");
+            desc.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+            desc.set_lines(2);
+            desc.set_max_width_chars(60);
+            text_box.append(&desc);
+        }
+
+        // Extract domain from URI
+        if let Ok(url) = url::Url::parse(&ext.uri) {
+            if let Some(domain) = url.host_str() {
+                let domain_label = gtk4::Label::new(Some(domain));
+                domain_label.set_halign(gtk4::Align::Start);
+                domain_label.add_css_class("dim-label");
+                domain_label.add_css_class("caption");
+                text_box.append(&domain_label);
+            }
+        }
+
+        card.append(&text_box);
+        container.append(&card);
+    }
+
+    /// Render a video embed
+    fn render_video(&self, container: &gtk4::Box, video: &crate::atproto::VideoEmbed) {
+        let overlay = gtk4::Overlay::new();
+        overlay.add_css_class("video-embed");
+
+        // Thumbnail
+        let thumb = gtk4::Picture::new();
+        thumb.set_keep_aspect_ratio(true);
+        thumb.set_can_shrink(true);
+        thumb.set_size_request(400, 225);
+        thumb.add_css_class("post-embed-image");
+
+        if let Some(thumb_url) = &video.thumbnail {
+            avatar_cache::load_image_into_picture(thumb.clone(), thumb_url.clone());
+        }
+        overlay.set_child(Some(&thumb));
+
+        // Play button overlay
+        let play_btn = gtk4::Button::from_icon_name("media-playback-start-symbolic");
+        play_btn.add_css_class("circular");
+        play_btn.add_css_class("osd");
+        play_btn.set_halign(gtk4::Align::Center);
+        play_btn.set_valign(gtk4::Align::Center);
+
+        // Open video in browser when clicked
+        let playlist_url = video.playlist.clone();
+        play_btn.connect_clicked(move |_| {
+            let _ = open::that(&playlist_url);
+        });
+
+        overlay.add_overlay(&play_btn);
+
+        container.append(&overlay);
+    }
+
+    /// Render a quote post card
+    fn render_quote(&self, container: &gtk4::Box, quote: &crate::atproto::QuoteEmbed) {
+        let card = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+        card.add_css_class("quote-card");
+
+        // Author row
+        let author_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+
+        let avatar = adw::Avatar::new(24, None, true);
+        let author_name = quote
+            .author
+            .display_name
+            .as_deref()
+            .unwrap_or(&quote.author.handle);
+        avatar.set_text(Some(author_name));
+        if let Some(avatar_url) = &quote.author.avatar {
+            avatar_cache::load_avatar(avatar.clone(), avatar_url.clone());
+        }
+        author_row.append(&avatar);
+
+        let name_label = gtk4::Label::new(Some(author_name));
+        name_label.add_css_class("heading");
+        name_label.add_css_class("caption");
+        author_row.append(&name_label);
+
+        let handle_label = gtk4::Label::new(Some(&format!("@{}", quote.author.handle)));
+        handle_label.add_css_class("dim-label");
+        handle_label.add_css_class("caption");
+        author_row.append(&handle_label);
+
+        let time_label = gtk4::Label::new(Some(&Self::format_timestamp(&quote.indexed_at)));
+        time_label.add_css_class("dim-label");
+        time_label.add_css_class("caption");
+        time_label.set_hexpand(true);
+        time_label.set_halign(gtk4::Align::End);
+        author_row.append(&time_label);
+
+        card.append(&author_row);
+
+        // Quote text
+        if !quote.text.is_empty() {
+            let text_label = gtk4::Label::new(Some(&quote.text));
+            text_label.set_halign(gtk4::Align::Start);
+            text_label.set_wrap(true);
+            text_label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+            text_label.set_xalign(0.0);
+            text_label.add_css_class("caption");
+            card.append(&text_label);
+        }
+
+        // Nested embed (if any)
+        if let Some(nested_embed) = &quote.embed {
+            let nested_container = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+            self.render_embed(&nested_container, nested_embed);
+            card.append(&nested_container);
+        }
+
+        container.append(&card);
     }
 
     fn format_count(count: Option<u32>) -> String {

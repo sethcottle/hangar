@@ -11,6 +11,73 @@ pub struct Session {
     pub refresh_jwt: String,
 }
 
+/// External link card embed (URLs with previews)
+#[derive(Debug, Clone)]
+pub struct ExternalEmbed {
+    pub uri: String,
+    pub title: String,
+    pub description: String,
+    pub thumb: Option<String>,
+}
+
+/// Video embed
+#[derive(Debug, Clone)]
+pub struct VideoEmbed {
+    pub playlist: String,
+    pub thumbnail: Option<String>,
+    pub alt: Option<String>,
+    pub aspect_ratio: Option<(u32, u32)>,
+}
+
+/// Quote post embed (embedded record view)
+#[derive(Debug, Clone)]
+pub struct QuoteEmbed {
+    pub uri: String,
+    pub cid: String,
+    pub author: Profile,
+    pub text: String,
+    pub indexed_at: String,
+    /// Nested embed within the quoted post
+    pub embed: Option<Box<Embed>>,
+}
+
+/// All possible embed types for a post
+#[derive(Debug, Clone)]
+pub enum Embed {
+    Images(Vec<ImageEmbed>),
+    External(ExternalEmbed),
+    Video(VideoEmbed),
+    Quote(QuoteEmbed),
+    /// Quote post with additional media attached
+    QuoteWithMedia {
+        quote: QuoteEmbed,
+        media: Box<Embed>,
+    },
+}
+
+/// Single image with metadata
+#[derive(Debug, Clone)]
+pub struct ImageEmbed {
+    pub thumb: String,
+    pub fullsize: String,
+    pub alt: String,
+    pub aspect_ratio: Option<(u32, u32)>,
+}
+
+/// Repost attribution (who reposted this into the feed)
+#[derive(Debug, Clone)]
+pub struct RepostReason {
+    pub by: Profile,
+    pub indexed_at: String,
+}
+
+/// Reply context (who this post is replying to)
+#[derive(Debug, Clone)]
+pub struct ReplyContext {
+    pub parent_author: Profile,
+    pub root_author: Profile,
+}
+
 #[derive(Debug, Clone)]
 pub struct Post {
     pub uri: String,
@@ -22,11 +89,16 @@ pub struct Post {
     pub like_count: Option<u32>,
     pub repost_count: Option<u32>,
     pub reply_count: Option<u32>,
-    pub images: Vec<String>,
+    /// Rich embed content (images, external links, videos, quotes)
+    pub embed: Option<Embed>,
     /// URI of the viewer's like record, if they liked this post
     pub viewer_like: Option<String>,
     /// URI of the viewer's repost record, if they reposted this post
     pub viewer_repost: Option<String>,
+    /// Repost attribution if this appeared in feed via repost
+    pub repost_reason: Option<RepostReason>,
+    /// Reply context if this post is a reply
+    pub reply_context: Option<ReplyContext>,
 }
 
 #[derive(Debug, Clone)]

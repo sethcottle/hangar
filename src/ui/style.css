@@ -37,42 +37,48 @@
     min-height: 48px;
 }
 
-/* Post card styling */
-.card {
-    background-color: @card_bg_color;
-    border-radius: 12px;
+/* Post row styling - cleaner look without heavy card background */
+.post-row {
     padding: 16px;
-    margin: 8px 0;
+    border-bottom: 1px solid alpha(@borders, 0.5);
+}
+
+.post-row .heading {
+    font-weight: 600;
+}
+
+/* Post embed images */
+.post-embed-image {
+    border-radius: 12px;
+}
+
+/* Action buttons */
+.flat.circular {
+    min-width: 32px;
+    min-height: 32px;
+    padding: 4px;
+}
+
+/* Legacy card class for backwards compatibility */
+.card {
+    padding: 16px;
+    border-bottom: 1px solid alpha(@borders, 0.5);
 }
 
 .card .heading {
     font-weight: 600;
 }
 
-/* Post embed images */
-.card .post-images {
-    margin-top: 8px;
+/* Liked state - use accent color (blue by default, follows system theme) */
+.flat.circular.liked,
+button.flat.circular.liked {
+    color: @accent_color;
 }
 
-.card .post-embed-image {
-    border-radius: 8px;
-}
-
-/* Action buttons in post cards */
-.card .flat.circular {
-    min-width: 32px;
-    min-height: 32px;
-    padding: 4px;
-}
-
-/* Liked state - red/pink */
-.card .flat.circular.liked {
-    color: @error_color;
-}
-
-/* Reposted state - green */
-.card .flat.circular.reposted {
-    color: @success_color;
+/* Reposted state - use accent color to match like button */
+.flat.circular.reposted,
+menubutton.flat.circular.reposted > button {
+    color: @accent_color;
 }
 
 /* Error label styling */
@@ -110,5 +116,80 @@ popover.menu > contents {
     background: @popover_bg_color;
     border: 1px solid @borders;
     border-radius: 12px;
+}
+
+/* Repost attribution */
+.post-row .repost-attribution {
+    margin-bottom: 4px;
+}
+
+.post-row .repost-attribution image {
+    opacity: 0.7;
+}
+
+/* Reply indicator */
+.post-row .reply-indicator {
+    font-size: 0.85em;
+    opacity: 0.7;
+}
+
+/* External link card */
+.external-card {
+    background-color: alpha(@card_bg_color, 0.6);
+    border: 1px solid alpha(@borders, 0.5);
+    border-radius: 12px;
+    padding: 12px;
+}
+
+.external-card .external-thumb {
+    border-radius: 8px;
+    min-width: 100px;
+    min-height: 100px;
+}
+
+.external-card .external-title {
+    font-weight: 600;
+    font-size: 0.95em;
+}
+
+/* Video embed */
+.video-embed {
+    border-radius: 12px;
+    overflow: hidden;
+}
+
+.video-embed .osd.circular {
+    background-color: alpha(black, 0.6);
+    min-width: 48px;
+    min-height: 48px;
+}
+
+.video-embed .osd.circular:hover {
+    background-color: alpha(black, 0.8);
+}
+
+/* Quote post card */
+.quote-card {
+    background-color: alpha(@window_bg_color, 0.4);
+    border: 1px solid alpha(@borders, 0.5);
+    border-radius: 12px;
+    padding: 12px;
+}
+
+/* Nested quote (quote of a quote) */
+.quote-card .quote-card {
+    background-color: alpha(@window_bg_color, 0.3);
+    margin-top: 8px;
+}
+
+/* Image grid layouts */
+.post-embed .image-grid {
+    border-radius: 12px;
+    overflow: hidden;
+}
+
+/* Caption class for smaller text */
+.caption {
+    font-size: 0.85em;
 }
 

@@ -3,10 +3,10 @@
 mod avatar_cache;
 mod compose_dialog;
 mod login_dialog;
-mod post_row;
+pub mod post_row;
 mod sidebar;
 mod window;
 
-pub use compose_dialog::{ComposeDialog, ReplyContext};
+pub use compose_dialog::{ComposeDialog, QuoteContext, ReplyContext};
 pub use login_dialog::LoginDialog;
 pub use window::HangarWindow;

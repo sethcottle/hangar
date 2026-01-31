@@ -10,7 +10,8 @@ use std::thread;
 
 use crate::atproto::{HangarClient, Post, Profile, SavedFeed, Session};
 use crate::state::SessionManager;
-use crate::ui::{ComposeDialog, HangarWindow, LoginDialog, ReplyContext};
+use crate::ui::post_row::PostRow;
+use crate::ui::{ComposeDialog, HangarWindow, LoginDialog, QuoteContext, ReplyContext};
 
 mod imp {
     use super::*;
@@ -102,13 +103,18 @@ mod imp {
             });
 
             let app_clone = app.clone();
-            window.set_like_callback(move |uri, cid| {
-                app_clone.do_like(&uri, &cid);
+            window.set_like_callback(move |post, post_row_weak| {
+                app_clone.toggle_like(&post, post_row_weak);
             });
 
             let app_clone = app.clone();
-            window.set_repost_callback(move |uri, cid| {
-                app_clone.do_repost(&uri, &cid);
+            window.set_repost_callback(move |post, post_row_weak| {
+                app_clone.toggle_repost(&post, post_row_weak);
+            });
+
+            let app_clone = app.clone();
+            window.set_quote_callback(move |post| {
+                app_clone.open_quote_dialog(post);
             });
 
             let app_clone = app.clone();
@@ -358,21 +364,42 @@ impl HangarApplication {
         });
     }
 
-    fn do_like(&self, uri: &str, cid: &str) {
-        let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    fn toggle_like(&self, post: &Post, post_row_weak: glib::WeakRef<PostRow>) {
+        // Result type: Ok(Some(uri)) for like success, Ok(None) for unlike success, Err for failure
+        let (tx, rx) = std::sync::mpsc::channel::<Result<Option<String>, String>>();
         let client = self.client();
-        let uri = uri.to_string();
-        let cid = cid.to_string();
-        thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            let result = rt.block_on(async { client.like(&uri, &cid).await });
-            let _ = tx.send(result.map_err(|e| e.to_string()));
-        });
+
+        // Check if already liked - if so, unlike
+        if let Some(like_uri) = &post.viewer_like {
+            let like_uri = like_uri.clone();
+            thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                let result = rt.block_on(async { client.unlike(&like_uri).await });
+                let _ = tx.send(result.map(|_| None).map_err(|e| e.to_string()));
+            });
+        } else {
+            // Not liked yet, create like
+            let uri = post.uri.clone();
+            let cid = post.cid.clone();
+            thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                let result = rt.block_on(async { client.like(&uri, &cid).await });
+                let _ = tx.send(result.map(Some).map_err(|e| e.to_string()));
+            });
+        }
+
         glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
             match rx.try_recv() {
-                Ok(Ok(())) => glib::ControlFlow::Break,
+                Ok(Ok(new_like_uri)) => {
+                    // Update the PostRow's like URI state if it still exists
+                    if let Some(post_row) = post_row_weak.upgrade() {
+                        post_row.set_viewer_like_uri(new_like_uri);
+                    }
+                    glib::ControlFlow::Break
+                }
                 Ok(Err(e)) => {
-                    eprintln!("Like failed: {}", e);
+                    eprintln!("Like/unlike failed: {}", e);
+                    // TODO: Revert visual state on failure
                     glib::ControlFlow::Break
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
@@ -509,21 +536,111 @@ impl HangarApplication {
         dialog.present();
     }
 
-    fn do_repost(&self, uri: &str, cid: &str) {
-        let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
-        let client = self.client();
-        let uri = uri.to_string();
-        let cid = cid.to_string();
-        thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            let result = rt.block_on(async { client.repost(&uri, &cid).await });
-            let _ = tx.send(result.map_err(|e| e.to_string()));
+    fn open_quote_dialog(&self, quoted_post: Post) {
+        let window = match self.imp().window.borrow().as_ref() {
+            Some(w) => w.clone(),
+            None => return,
+        };
+
+        let context = QuoteContext {
+            uri: quoted_post.uri.clone(),
+            cid: quoted_post.cid.clone(),
+            author_handle: quoted_post.author.handle.clone(),
+            text: quoted_post.text.clone(),
+        };
+
+        let dialog = ComposeDialog::new_quote(&window, context);
+
+        let app = self.clone();
+        let dialog_weak = dialog.downgrade();
+
+        dialog.connect_quote(move |text, quoted_uri, quoted_cid| {
+            if let Some(dialog) = dialog_weak.upgrade() {
+                dialog.set_loading(true);
+                dialog.hide_error();
+            }
+
+            let app = app.clone();
+            let dialog_weak = dialog_weak.clone();
+
+            let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+            let client = app.client();
+            let text = text.to_string();
+
+            thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                let result =
+                    rt.block_on(async { client.create_quote_post(&text, &quoted_uri, &quoted_cid).await });
+                let _ = tx.send(result.map_err(|e| e.to_string()));
+            });
+
+            glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+                match rx.try_recv() {
+                    Ok(Ok(())) => {
+                        if let Some(dialog) = dialog_weak.upgrade() {
+                            dialog.set_loading(false);
+                            dialog.close();
+                        }
+                        app.fetch_timeline();
+                        glib::ControlFlow::Break
+                    }
+                    Ok(Err(e)) => {
+                        if let Some(dialog) = dialog_weak.upgrade() {
+                            dialog.set_loading(false);
+                            dialog.show_error(&e);
+                        }
+                        glib::ControlFlow::Break
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        if let Some(dialog) = dialog_weak.upgrade() {
+                            dialog.set_loading(false);
+                        }
+                        glib::ControlFlow::Break
+                    }
+                }
+            });
         });
+
+        dialog.present();
+    }
+
+    fn toggle_repost(&self, post: &Post, post_row_weak: glib::WeakRef<PostRow>) {
+        // Result type: Ok(Some(uri)) for repost success, Ok(None) for unrepost success, Err for failure
+        let (tx, rx) = std::sync::mpsc::channel::<Result<Option<String>, String>>();
+        let client = self.client();
+
+        // Check if already reposted - if so, delete repost
+        if let Some(repost_uri) = &post.viewer_repost {
+            let repost_uri = repost_uri.clone();
+            thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                let result = rt.block_on(async { client.delete_repost(&repost_uri).await });
+                let _ = tx.send(result.map(|_| None).map_err(|e| e.to_string()));
+            });
+        } else {
+            // Not reposted yet, create repost
+            let uri = post.uri.clone();
+            let cid = post.cid.clone();
+            thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                let result = rt.block_on(async { client.repost(&uri, &cid).await });
+                let _ = tx.send(result.map(Some).map_err(|e| e.to_string()));
+            });
+        }
+
         glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
             match rx.try_recv() {
-                Ok(Ok(())) => glib::ControlFlow::Break,
+                Ok(Ok(new_repost_uri)) => {
+                    // Update the PostRow's repost URI state if it still exists
+                    if let Some(post_row) = post_row_weak.upgrade() {
+                        post_row.set_viewer_repost_uri(new_repost_uri);
+                    }
+                    glib::ControlFlow::Break
+                }
                 Ok(Err(e)) => {
-                    eprintln!("Repost failed: {}", e);
+                    eprintln!("Repost/unrepost failed: {}", e);
+                    // TODO: Revert visual state on failure
                     glib::ControlFlow::Break
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,

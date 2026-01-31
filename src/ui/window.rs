@@ -60,8 +60,9 @@ mod imp {
         pub timeline_model: RefCell<Option<gio::ListStore>>,
         pub load_more_callback: RefCell<Option<Box<dyn Fn() + 'static>>>,
         pub refresh_callback: RefCell<Option<Box<dyn Fn() + 'static>>>,
-        pub like_callback: RefCell<Option<Box<dyn Fn(String, String) + 'static>>>,
-        pub repost_callback: RefCell<Option<Box<dyn Fn(String, String) + 'static>>>,
+        pub like_callback: RefCell<Option<Box<dyn Fn(Post, glib::WeakRef<PostRow>) + 'static>>>,
+        pub repost_callback: RefCell<Option<Box<dyn Fn(Post, glib::WeakRef<PostRow>) + 'static>>>,
+        pub quote_callback: RefCell<Option<Box<dyn Fn(Post) + 'static>>>,
         pub reply_callback: RefCell<Option<Box<dyn Fn(Post) + 'static>>>,
         pub compose_callback: RefCell<Option<Box<dyn Fn() + 'static>>>,
         pub loading_spinner: RefCell<Option<gtk4::Spinner>>,
@@ -296,17 +297,30 @@ impl HangarWindow {
                     && let Some(post_row) = list_item.child().and_downcast::<PostRow>()
                 {
                     post_row.bind(&post);
-                    let uri = post.uri.clone();
-                    let cid = post.cid.clone();
+                    // Like callback receives (post_row, was_liked, like_uri) captured before toggle
+                    let post_for_like = post.clone();
                     let w = win.clone();
-                    post_row.connect_like_clicked(move || {
-                        w.imp().like_callback.borrow().as_ref().map(|cb| cb(uri.clone(), cid.clone()));
+                    post_row.connect_like_clicked(move |row, was_liked, like_uri| {
+                        let mut post_with_state = post_for_like.clone();
+                        // If it was liked, we're unliking, so pass the like_uri
+                        // If it wasn't liked, we're liking, so pass None
+                        post_with_state.viewer_like = if was_liked { like_uri } else { None };
+                        let row_weak = row.downgrade();
+                        w.imp().like_callback.borrow().as_ref().map(|cb| cb(post_with_state, row_weak));
                     });
-                    let uri = post.uri.clone();
-                    let cid = post.cid.clone();
+                    // Repost callback receives (post_row, was_reposted, repost_uri) captured before toggle
+                    let post_for_repost = post.clone();
                     let w = win.clone();
-                    post_row.connect_repost_clicked(move || {
-                        w.imp().repost_callback.borrow().as_ref().map(|cb| cb(uri.clone(), cid.clone()));
+                    post_row.connect_repost_clicked(move |row, was_reposted, repost_uri| {
+                        let mut post_with_state = post_for_repost.clone();
+                        post_with_state.viewer_repost = if was_reposted { repost_uri } else { None };
+                        let row_weak = row.downgrade();
+                        w.imp().repost_callback.borrow().as_ref().map(|cb| cb(post_with_state, row_weak));
+                    });
+                    let post_for_quote = post.clone();
+                    let w = win.clone();
+                    post_row.connect_quote_clicked(move || {
+                        w.imp().quote_callback.borrow().as_ref().map(|cb| cb(post_for_quote.clone()));
                     });
                     let post_clone = post.clone();
                     let w = win.clone();
@@ -393,15 +407,21 @@ impl HangarWindow {
             .replace(Some(Box::new(callback)));
     }
 
-    pub fn set_like_callback<F: Fn(String, String) + 'static>(&self, callback: F) {
+    pub fn set_like_callback<F: Fn(Post, glib::WeakRef<PostRow>) + 'static>(&self, callback: F) {
         self.imp()
             .like_callback
             .replace(Some(Box::new(callback)));
     }
 
-    pub fn set_repost_callback<F: Fn(String, String) + 'static>(&self, callback: F) {
+    pub fn set_repost_callback<F: Fn(Post, glib::WeakRef<PostRow>) + 'static>(&self, callback: F) {
         self.imp()
             .repost_callback
+            .replace(Some(Box::new(callback)));
+    }
+
+    pub fn set_quote_callback<F: Fn(Post) + 'static>(&self, callback: F) {
+        self.imp()
+            .quote_callback
             .replace(Some(Box::new(callback)));
     }
 

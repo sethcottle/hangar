@@ -4,4 +4,6 @@ mod client;
 mod types;
 
 pub use client::HangarClient;
-pub use types::{Post, Profile, SavedFeed, Session};
+pub use types::{
+    Embed, ExternalEmbed, ImageEmbed, Post, Profile, QuoteEmbed, SavedFeed, Session, VideoEmbed,
+};

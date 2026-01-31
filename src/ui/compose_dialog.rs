@@ -13,6 +13,15 @@ pub struct ReplyContext {
     pub author_handle: String,
 }
 
+/// Context for quoting a post
+#[derive(Clone)]
+pub struct QuoteContext {
+    pub uri: String,
+    pub cid: String,
+    pub author_handle: String,
+    pub text: String,
+}
+
 mod imp {
     use super::*;
     use std::cell::RefCell;
@@ -23,9 +32,12 @@ mod imp {
         pub post_button: RefCell<Option<gtk4::Button>>,
         pub error_label: RefCell<Option<gtk4::Label>>,
         pub reply_context: RefCell<Option<ReplyContext>>,
+        pub quote_context: RefCell<Option<QuoteContext>>,
         pub reply_label: RefCell<Option<gtk4::Label>>,
+        pub quote_preview: RefCell<Option<gtk4::Box>>,
         pub post_callback: RefCell<Option<Box<dyn Fn(String) + 'static>>>,
         pub reply_callback: RefCell<Option<Box<dyn Fn(String, String, String) + 'static>>>,
+        pub quote_callback: RefCell<Option<Box<dyn Fn(String, String, String) + 'static>>>,
     }
 
     #[glib::object_subclass]
@@ -79,6 +91,19 @@ impl ComposeDialog {
         dialog
     }
 
+    pub fn new_quote(parent: &impl IsA<gtk4::Window>, context: QuoteContext) -> Self {
+        let dialog: Self = glib::Object::builder()
+            .property("title", "Quote Post")
+            .property("modal", true)
+            .property("transient-for", parent)
+            .property("default-width", 420)
+            .property("default-height", 340)
+            .property("resizable", true)
+            .build();
+        dialog.set_quote_context(context);
+        dialog
+    }
+
     fn set_reply_context(&self, context: ReplyContext) {
         let imp = self.imp();
         if let Some(label) = imp.reply_label.borrow().as_ref() {
@@ -86,6 +111,39 @@ impl ComposeDialog {
             label.set_visible(true);
         }
         imp.reply_context.replace(Some(context));
+    }
+
+    fn set_quote_context(&self, context: QuoteContext) {
+        let imp = self.imp();
+        // Show quote preview card
+        if let Some(preview) = imp.quote_preview.borrow().as_ref() {
+            // Clear existing children
+            while let Some(child) = preview.first_child() {
+                preview.remove(&child);
+            }
+
+            let header = gtk4::Label::new(Some(&format!("@{}", context.author_handle)));
+            header.set_halign(gtk4::Align::Start);
+            header.add_css_class("dim-label");
+            header.add_css_class("caption");
+            preview.append(&header);
+
+            // Show truncated text
+            let text = if context.text.len() > 100 {
+                format!("{}...", &context.text[..100])
+            } else {
+                context.text.clone()
+            };
+            let text_label = gtk4::Label::new(Some(&text));
+            text_label.set_halign(gtk4::Align::Start);
+            text_label.set_wrap(true);
+            text_label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+            text_label.add_css_class("caption");
+            preview.append(&text_label);
+
+            preview.set_visible(true);
+        }
+        imp.quote_context.replace(Some(context));
     }
 
     fn setup_ui(&self) {
@@ -139,6 +197,12 @@ impl ComposeDialog {
 
         form_box.append(&scrolled);
 
+        // Quote preview card (shown when quoting)
+        let quote_preview = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+        quote_preview.add_css_class("quote-card");
+        quote_preview.set_visible(false);
+        form_box.append(&quote_preview);
+
         let error_label = gtk4::Label::new(None);
         error_label.set_halign(gtk4::Align::Start);
         error_label.add_css_class("dim-label");
@@ -155,6 +219,7 @@ impl ComposeDialog {
         imp.post_button.replace(Some(post_btn));
         imp.error_label.replace(Some(error_label));
         imp.reply_label.replace(Some(reply_label));
+        imp.quote_preview.replace(Some(quote_preview));
 
         let dialog_weak = self.downgrade();
         if let Some(btn) = imp.post_button.borrow().as_ref() {
@@ -191,6 +256,10 @@ impl ComposeDialog {
             if let Some(cb) = imp.reply_callback.borrow().as_ref() {
                 cb(text, ctx.uri.clone(), ctx.cid.clone());
             }
+        } else if let Some(ctx) = imp.quote_context.borrow().as_ref() {
+            if let Some(cb) = imp.quote_callback.borrow().as_ref() {
+                cb(text, ctx.uri.clone(), ctx.cid.clone());
+            }
         } else if let Some(cb) = imp.post_callback.borrow().as_ref() {
             cb(text);
         }
@@ -205,6 +274,12 @@ impl ComposeDialog {
     pub fn connect_reply<F: Fn(String, String, String) + 'static>(&self, callback: F) {
         self.imp()
             .reply_callback
+            .replace(Some(Box::new(callback)));
+    }
+
+    pub fn connect_quote<F: Fn(String, String, String) + 'static>(&self, callback: F) {
+        self.imp()
+            .quote_callback
             .replace(Some(Box::new(callback)));
     }
 
