@@ -24,6 +24,14 @@ pub enum ClientError {
 
 type Agent = AtpAgent<MemorySessionStore, ReqwestClient>;
 
+/// Internal struct for reply references
+struct ReplyRef {
+    root_uri: String,
+    root_cid: String,
+    parent_uri: String,
+    parent_cid: String,
+}
+
 /// Wraps atrium so the rest of the app only sees our own types.
 pub struct HangarClient {
     agent: RwLock<Option<Agent>>,
@@ -179,6 +187,14 @@ impl HangarClient {
 
         let images = self.extract_post_images(&post_view.data.embed);
 
+        // Extract viewer state (like/repost URIs)
+        let (viewer_like, viewer_repost) = post_view
+            .data
+            .viewer
+            .as_ref()
+            .map(|v| (v.data.like.clone(), v.data.repost.clone()))
+            .unwrap_or((None, None));
+
         Post {
             uri: post_view.data.uri,
             cid: post_view.data.cid.as_ref().to_string(),
@@ -195,6 +211,8 @@ impl HangarClient {
             like_count: post_view.data.like_count.map(|c| c as u32),
             indexed_at: post_view.data.indexed_at.as_str().to_string(),
             images,
+            viewer_like,
+            viewer_repost,
         }
     }
 
@@ -323,15 +341,52 @@ impl HangarClient {
 
     #[allow(clippy::await_holding_lock)]
     pub async fn create_post(&self, text: &str) -> Result<(), ClientError> {
+        self.create_post_internal(text, None).await
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    pub async fn create_reply(
+        &self,
+        text: &str,
+        parent_uri: &str,
+        parent_cid: &str,
+    ) -> Result<(), ClientError> {
+        // For a reply, we need the root of the thread.
+        // If replying to a top-level post, root = parent.
+        // If replying to a reply, we'd need to fetch the thread to get the root.
+        // For now, we treat parent as root (works for direct replies to top-level posts).
+        let reply = ReplyRef {
+            root_uri: parent_uri.to_string(),
+            root_cid: parent_cid.to_string(),
+            parent_uri: parent_uri.to_string(),
+            parent_cid: parent_cid.to_string(),
+        };
+        self.create_post_internal(text, Some(reply)).await
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    async fn create_post_internal(
+        &self,
+        text: &str,
+        reply: Option<ReplyRef>,
+    ) -> Result<(), ClientError> {
         let agent_guard = self.agent.read().unwrap();
         let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
         let session = agent.get_session().await.ok_or(ClientError::NotAuthenticated)?;
 
-        let record_json = serde_json::json!({
+        let mut record_json = serde_json::json!({
             "$type": "app.bsky.feed.post",
             "text": text,
             "createdAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
         });
+
+        if let Some(r) = reply {
+            record_json["reply"] = serde_json::json!({
+                "root": { "uri": r.root_uri, "cid": r.root_cid },
+                "parent": { "uri": r.parent_uri, "cid": r.parent_cid }
+            });
+        }
+
         let record: Unknown = serde_json::from_value(record_json)
             .map_err(|e| ClientError::InvalidResponse(e.to_string()))?;
 

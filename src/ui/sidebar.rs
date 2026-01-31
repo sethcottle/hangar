@@ -24,11 +24,11 @@ impl NavItem {
         match self {
             Self::Home => "go-home-symbolic",
             Self::Mentions => "mail-unread-symbolic",
-            Self::Activity => "bell-outline-symbolic",
-            Self::Chat => "user-available-symbolic",
+            Self::Activity => "preferences-system-notifications-symbolic",
+            Self::Chat => "chat-message-new-symbolic",
             Self::Profile => "avatar-default-symbolic",
-            Self::Likes => "emblem-favorite-symbolic",
-            Self::Bookmarks => "user-bookmarks-symbolic",
+            Self::Likes => "heart-symbolic",
+            Self::Bookmarks => "bookmark-new-symbolic",
             Self::Search => "system-search-symbolic",
         }
     }

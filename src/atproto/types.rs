@@ -23,6 +23,10 @@ pub struct Post {
     pub repost_count: Option<u32>,
     pub reply_count: Option<u32>,
     pub images: Vec<String>,
+    /// URI of the viewer's like record, if they liked this post
+    pub viewer_like: Option<String>,
+    /// URI of the viewer's repost record, if they reposted this post
+    pub viewer_repost: Option<String>,
 }
 
 #[derive(Debug, Clone)]

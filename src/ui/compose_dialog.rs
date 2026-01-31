@@ -5,6 +5,14 @@ use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
 use libadwaita as adw;
 
+/// Context for replying to a post
+#[derive(Clone)]
+pub struct ReplyContext {
+    pub uri: String,
+    pub cid: String,
+    pub author_handle: String,
+}
+
 mod imp {
     use super::*;
     use std::cell::RefCell;
@@ -14,7 +22,10 @@ mod imp {
         pub text_view: RefCell<Option<gtk4::TextView>>,
         pub post_button: RefCell<Option<gtk4::Button>>,
         pub error_label: RefCell<Option<gtk4::Label>>,
+        pub reply_context: RefCell<Option<ReplyContext>>,
+        pub reply_label: RefCell<Option<gtk4::Label>>,
         pub post_callback: RefCell<Option<Box<dyn Fn(String) + 'static>>>,
+        pub reply_callback: RefCell<Option<Box<dyn Fn(String, String, String) + 'static>>>,
     }
 
     #[glib::object_subclass]
@@ -55,6 +66,28 @@ impl ComposeDialog {
             .build()
     }
 
+    pub fn new_reply(parent: &impl IsA<gtk4::Window>, context: ReplyContext) -> Self {
+        let dialog: Self = glib::Object::builder()
+            .property("title", "Reply")
+            .property("modal", true)
+            .property("transient-for", parent)
+            .property("default-width", 420)
+            .property("default-height", 280)
+            .property("resizable", true)
+            .build();
+        dialog.set_reply_context(context);
+        dialog
+    }
+
+    fn set_reply_context(&self, context: ReplyContext) {
+        let imp = self.imp();
+        if let Some(label) = imp.reply_label.borrow().as_ref() {
+            label.set_text(&format!("Replying to @{}", context.author_handle));
+            label.set_visible(true);
+        }
+        imp.reply_context.replace(Some(context));
+    }
+
     fn setup_ui(&self) {
         let content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
 
@@ -84,6 +117,12 @@ impl ComposeDialog {
         form_box.set_margin_top(12);
         form_box.set_margin_bottom(12);
         form_box.set_vexpand(true);
+
+        let reply_label = gtk4::Label::new(None);
+        reply_label.set_halign(gtk4::Align::Start);
+        reply_label.add_css_class("dim-label");
+        reply_label.set_visible(false);
+        form_box.append(&reply_label);
 
         let text_view = gtk4::TextView::new();
         text_view.set_wrap_mode(gtk4::WrapMode::WordChar);
@@ -115,6 +154,7 @@ impl ComposeDialog {
         imp.text_view.replace(Some(text_view));
         imp.post_button.replace(Some(post_btn));
         imp.error_label.replace(Some(error_label));
+        imp.reply_label.replace(Some(reply_label));
 
         let dialog_weak = self.downgrade();
         if let Some(btn) = imp.post_button.borrow().as_ref() {
@@ -146,7 +186,12 @@ impl ComposeDialog {
             return;
         }
 
-        if let Some(cb) = self.imp().post_callback.borrow().as_ref() {
+        let imp = self.imp();
+        if let Some(ctx) = imp.reply_context.borrow().as_ref() {
+            if let Some(cb) = imp.reply_callback.borrow().as_ref() {
+                cb(text, ctx.uri.clone(), ctx.cid.clone());
+            }
+        } else if let Some(cb) = imp.post_callback.borrow().as_ref() {
             cb(text);
         }
     }
@@ -154,6 +199,12 @@ impl ComposeDialog {
     pub fn connect_post<F: Fn(String) + 'static>(&self, callback: F) {
         self.imp()
             .post_callback
+            .replace(Some(Box::new(callback)));
+    }
+
+    pub fn connect_reply<F: Fn(String, String, String) + 'static>(&self, callback: F) {
+        self.imp()
+            .reply_callback
             .replace(Some(Box::new(callback)));
     }
 

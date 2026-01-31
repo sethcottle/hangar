@@ -10,7 +10,7 @@ use std::thread;
 
 use crate::atproto::{HangarClient, Post, Profile, Session};
 use crate::state::SessionManager;
-use crate::ui::{ComposeDialog, HangarWindow, LoginDialog};
+use crate::ui::{ComposeDialog, HangarWindow, LoginDialog, ReplyContext};
 
 mod imp {
     use super::*;
@@ -22,6 +22,12 @@ mod imp {
         pub window: RefCell<Option<HangarWindow>>,
         pub timeline_cursor: RefCell<Option<String>>,
         pub loading_more: RefCell<bool>,
+        /// The URI of the newest post we've shown the user (anchor for new posts detection)
+        pub newest_post_uri: RefCell<Option<String>>,
+        /// Pending new posts that arrived while user was scrolled away
+        pub pending_new_posts: RefCell<Vec<Post>>,
+        /// Whether we're currently checking for new posts
+        pub checking_new_posts: RefCell<bool>,
     }
 
     #[glib::object_subclass]
@@ -45,12 +51,32 @@ mod imp {
         fn startup(&self) {
             self.parent_startup();
 
+            // Register custom icons
+            let display = gtk4::gdk::Display::default().expect("Could not get default display");
+            let icon_theme = gtk4::IconTheme::for_display(&display);
+
+            // Add our bundled icons path - try multiple locations for development vs installed
+            if let Ok(exe_path) = std::env::current_exe() {
+                if let Some(exe_dir) = exe_path.parent() {
+                    // For development: look relative to executable
+                    let dev_icons = exe_dir.join("../assets/icons");
+                    if dev_icons.exists() {
+                        icon_theme.add_search_path(&dev_icons);
+                    }
+                    // Also try assets/icons from cwd
+                    let cwd_icons = std::path::Path::new("assets/icons");
+                    if cwd_icons.exists() {
+                        icon_theme.add_search_path(cwd_icons);
+                    }
+                }
+            }
+
             // Load CSS
             let css_provider = gtk4::CssProvider::new();
             css_provider.load_from_data(include_str!("ui/style.css"));
 
             gtk4::style_context_add_provider_for_display(
-                &gtk4::gdk::Display::default().expect("Could not get default display"),
+                &display,
                 &css_provider,
                 gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
             );
@@ -69,6 +95,11 @@ mod imp {
             });
 
             let app_clone = app.clone();
+            window.set_refresh_callback(move || {
+                app_clone.fetch_timeline();
+            });
+
+            let app_clone = app.clone();
             window.set_like_callback(move |uri, cid| {
                 app_clone.do_like(&uri, &cid);
             });
@@ -79,8 +110,18 @@ mod imp {
             });
 
             let app_clone = app.clone();
+            window.set_reply_callback(move |post| {
+                app_clone.open_reply_dialog(post);
+            });
+
+            let app_clone = app.clone();
             window.set_compose_callback(move || {
                 app_clone.open_compose_dialog();
+            });
+
+            let app_clone = app.clone();
+            window.set_new_posts_callback(move || {
+                app_clone.show_new_posts();
             });
 
             window.present();
@@ -279,9 +320,18 @@ impl HangarApplication {
             match rx.try_recv() {
                 Ok(Ok((posts, next_cursor))) => {
                     app.imp().timeline_cursor.replace(next_cursor);
+                    // Set anchor to the newest post
+                    if let Some(first) = posts.first() {
+                        app.imp().newest_post_uri.replace(Some(first.uri.clone()));
+                    }
+                    // Clear any pending new posts since we just refreshed
+                    app.imp().pending_new_posts.replace(Vec::new());
                     if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.hide_new_posts_banner();
                         window.set_posts(posts);
                     }
+                    // Start background polling for new posts
+                    app.start_new_posts_polling();
                     glib::ControlFlow::Break
                 }
                 Ok(Err(e)) => {
@@ -380,6 +430,74 @@ impl HangarApplication {
         dialog.present();
     }
 
+    fn open_reply_dialog(&self, parent_post: Post) {
+        let window = match self.imp().window.borrow().as_ref() {
+            Some(w) => w.clone(),
+            None => return,
+        };
+
+        let context = ReplyContext {
+            uri: parent_post.uri.clone(),
+            cid: parent_post.cid.clone(),
+            author_handle: parent_post.author.handle.clone(),
+        };
+
+        let dialog = ComposeDialog::new_reply(&window, context);
+
+        let app = self.clone();
+        let dialog_weak = dialog.downgrade();
+
+        dialog.connect_reply(move |text, parent_uri, parent_cid| {
+            if let Some(dialog) = dialog_weak.upgrade() {
+                dialog.set_loading(true);
+                dialog.hide_error();
+            }
+
+            let app = app.clone();
+            let dialog_weak = dialog_weak.clone();
+
+            let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+            let client = app.client();
+            let text = text.to_string();
+
+            thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                let result =
+                    rt.block_on(async { client.create_reply(&text, &parent_uri, &parent_cid).await });
+                let _ = tx.send(result.map_err(|e| e.to_string()));
+            });
+
+            glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+                match rx.try_recv() {
+                    Ok(Ok(())) => {
+                        if let Some(dialog) = dialog_weak.upgrade() {
+                            dialog.set_loading(false);
+                            dialog.close();
+                        }
+                        app.fetch_timeline();
+                        glib::ControlFlow::Break
+                    }
+                    Ok(Err(e)) => {
+                        if let Some(dialog) = dialog_weak.upgrade() {
+                            dialog.set_loading(false);
+                            dialog.show_error(&e);
+                        }
+                        glib::ControlFlow::Break
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        if let Some(dialog) = dialog_weak.upgrade() {
+                            dialog.set_loading(false);
+                        }
+                        glib::ControlFlow::Break
+                    }
+                }
+            });
+        });
+
+        dialog.present();
+    }
+
     fn do_repost(&self, uri: &str, cid: &str) {
         let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
         let client = self.client();
@@ -413,6 +531,11 @@ impl HangarApplication {
         };
         self.imp().loading_more.replace(true);
 
+        // Show loading spinner
+        if let Some(window) = self.imp().window.borrow().as_ref() {
+            window.set_loading_more(true);
+        }
+
         let (tx, rx) = std::sync::mpsc::channel::<Result<(Vec<Post>, Option<String>), String>>();
         let client = self.client();
         thread::spawn(move || {
@@ -427,8 +550,9 @@ impl HangarApplication {
                 Ok(Ok((posts, next_cursor))) => {
                     app.imp().loading_more.replace(false);
                     app.imp().timeline_cursor.replace(next_cursor);
-                    if !posts.is_empty() {
-                        if let Some(window) = app.imp().window.borrow().as_ref() {
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.set_loading_more(false);
+                        if !posts.is_empty() {
                             window.append_posts(posts);
                         }
                     }
@@ -436,16 +560,139 @@ impl HangarApplication {
                 }
                 Ok(Err(e)) => {
                     app.imp().loading_more.replace(false);
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.set_loading_more(false);
+                    }
                     eprintln!("Failed to fetch more timeline: {}", e);
                     glib::ControlFlow::Break
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     app.imp().loading_more.replace(false);
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.set_loading_more(false);
+                    }
                     glib::ControlFlow::Break
                 }
             }
         });
+    }
+
+    fn start_new_posts_polling(&self) {
+        let app = self.clone();
+        // Poll every 30 seconds for new posts
+        glib::timeout_add_seconds_local(30, move || {
+            app.check_for_new_posts();
+            glib::ControlFlow::Continue
+        });
+    }
+
+    fn check_for_new_posts(&self) {
+        // Don't check if we're already checking or if user is at top (they'll see new posts on refresh)
+        if *self.imp().checking_new_posts.borrow() {
+            return;
+        }
+
+        // Only check if we have an anchor
+        let anchor_uri = match self.imp().newest_post_uri.borrow().clone() {
+            Some(uri) => uri,
+            None => return,
+        };
+
+        self.imp().checking_new_posts.replace(true);
+
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(Vec<Post>, Option<String>), String>>();
+        let client = self.client();
+
+        thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async { client.get_timeline(None).await });
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+
+        let app = self.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            match rx.try_recv() {
+                Ok(Ok((posts, _))) => {
+                    app.imp().checking_new_posts.replace(false);
+
+                    // Find posts newer than our anchor
+                    let new_posts: Vec<Post> = posts
+                        .into_iter()
+                        .take_while(|p| p.uri != anchor_uri)
+                        .collect();
+
+                    if !new_posts.is_empty() {
+                        // Check if user is at top - if so, just prepend and update anchor
+                        let is_at_top = app
+                            .imp()
+                            .window
+                            .borrow()
+                            .as_ref()
+                            .map(|w| w.is_at_top())
+                            .unwrap_or(true);
+
+                        if is_at_top {
+                            // User is at top, show new posts immediately
+                            if let Some(first) = new_posts.first() {
+                                app.imp().newest_post_uri.replace(Some(first.uri.clone()));
+                            }
+                            if let Some(window) = app.imp().window.borrow().as_ref() {
+                                window.prepend_posts(new_posts);
+                            }
+                        } else {
+                            // User is scrolled away, accumulate and show banner
+                            let mut pending = app.imp().pending_new_posts.borrow_mut();
+                            for post in new_posts.into_iter().rev() {
+                                // Check if we already have this post
+                                if !pending.iter().any(|p| p.uri == post.uri) {
+                                    pending.insert(0, post);
+                                }
+                            }
+                            let count = pending.len();
+                            drop(pending);
+
+                            if let Some(window) = app.imp().window.borrow().as_ref() {
+                                window.show_new_posts_banner(count);
+                            }
+                        }
+                    }
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(e)) => {
+                    app.imp().checking_new_posts.replace(false);
+                    eprintln!("Failed to check for new posts: {}", e);
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    app.imp().checking_new_posts.replace(false);
+                    glib::ControlFlow::Break
+                }
+            }
+        });
+    }
+
+    fn show_new_posts(&self) {
+        let pending = self.imp().pending_new_posts.borrow().clone();
+        if pending.is_empty() {
+            return;
+        }
+
+        // Update anchor to the newest post
+        if let Some(first) = pending.first() {
+            self.imp().newest_post_uri.replace(Some(first.uri.clone()));
+        }
+
+        // Clear pending
+        self.imp().pending_new_posts.replace(Vec::new());
+
+        // Prepend posts and scroll to top
+        if let Some(window) = self.imp().window.borrow().as_ref() {
+            window.hide_new_posts_banner();
+            window.prepend_posts(pending);
+            window.scroll_to_top();
+        }
     }
 }
 

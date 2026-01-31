@@ -7,6 +7,6 @@ mod post_row;
 mod sidebar;
 mod window;
 
-pub use compose_dialog::ComposeDialog;
+pub use compose_dialog::{ComposeDialog, ReplyContext};
 pub use login_dialog::LoginDialog;
 pub use window::HangarWindow;

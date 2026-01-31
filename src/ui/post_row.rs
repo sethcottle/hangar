@@ -26,6 +26,8 @@ mod imp {
         pub repost_btn: RefCell<Option<gtk4::Button>>,
         pub like_handler_id: RefCell<Option<glib::SignalHandlerId>>,
         pub repost_handler_id: RefCell<Option<glib::SignalHandlerId>>,
+        pub reply_handler_id: RefCell<Option<glib::SignalHandlerId>>,
+        pub reply_btn: RefCell<Option<gtk4::Button>>,
         pub images_box: RefCell<Option<gtk4::FlowBox>>,
     }
 
@@ -122,7 +124,8 @@ impl PostRow {
         let actions = gtk4::Box::new(gtk4::Orientation::Horizontal, 24);
         actions.set_margin_top(8);
 
-        let (reply_btn, reply_count, _) = Self::create_action_button("comment-symbolic");
+        let (reply_btn, reply_count, reply_btn_ref) =
+            Self::create_action_button("mail-reply-sender-symbolic");
         actions.append(&reply_btn);
 
         let (repost_btn, repost_count, repost_btn_ref) =
@@ -130,7 +133,7 @@ impl PostRow {
         actions.append(&repost_btn);
 
         let (like_btn, like_count, like_btn_ref) =
-            Self::create_action_button("emblem-favorite-symbolic");
+            Self::create_action_button("heart-outline-symbolic");
         actions.append(&like_btn);
 
         let spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
@@ -156,6 +159,7 @@ impl PostRow {
         imp.like_count_label.replace(Some(like_count));
         imp.like_btn.replace(Some(like_btn_ref));
         imp.repost_btn.replace(Some(repost_btn_ref));
+        imp.reply_btn.replace(Some(reply_btn_ref));
         imp.images_box.replace(Some(images_box));
     }
 
@@ -197,6 +201,19 @@ impl PostRow {
         if let Some(btn) = imp.repost_btn.borrow().as_ref() {
             let id = btn.connect_clicked(move |_| f());
             imp.repost_handler_id.replace(Some(id));
+        }
+    }
+
+    pub fn connect_reply_clicked<F: Fn() + 'static>(&self, f: F) {
+        let imp = self.imp();
+        if let Some(id) = imp.reply_handler_id.take() {
+            if let Some(btn) = imp.reply_btn.borrow().as_ref() {
+                btn.disconnect(id);
+            }
+        }
+        if let Some(btn) = imp.reply_btn.borrow().as_ref() {
+            let id = btn.connect_clicked(move |_| f());
+            imp.reply_handler_id.replace(Some(id));
         }
     }
 
@@ -261,6 +278,24 @@ impl PostRow {
 
         if let Some(label) = imp.like_count_label.borrow().as_ref() {
             label.set_text(&Self::format_count(post.like_count));
+        }
+
+        // Update like button state
+        if let Some(btn) = imp.like_btn.borrow().as_ref() {
+            if post.viewer_like.is_some() {
+                btn.add_css_class("liked");
+            } else {
+                btn.remove_css_class("liked");
+            }
+        }
+
+        // Update repost button state
+        if let Some(btn) = imp.repost_btn.borrow().as_ref() {
+            if post.viewer_repost.is_some() {
+                btn.add_css_class("reposted");
+            } else {
+                btn.remove_css_class("reposted");
+            }
         }
     }
 

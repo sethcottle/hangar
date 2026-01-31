@@ -65,6 +65,16 @@
     padding: 4px;
 }
 
+/* Liked state - red/pink */
+.card .flat.circular.liked {
+    color: @error_color;
+}
+
+/* Reposted state - green */
+.card .flat.circular.reposted {
+    color: @success_color;
+}
+
 /* Error label styling */
 .error {
     color: @error_color;
@@ -83,4 +93,9 @@
 /* Login dialog styling */
 window.background entry {
     min-height: 36px;
+}
+
+/* New posts banner */
+.new-posts-banner {
+    box-shadow: 0 2px 8px alpha(black, 0.3);
 }
