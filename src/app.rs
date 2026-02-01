@@ -45,6 +45,9 @@ mod imp {
         pub profile_loading_more: RefCell<bool>,
         /// Store the logged-in user's DID for fetching own profile
         pub user_did: RefCell<Option<String>>,
+        /// Likes state
+        pub likes_cursor: RefCell<Option<String>>,
+        pub likes_loading_more: RefCell<bool>,
     }
 
     #[glib::object_subclass]
@@ -189,6 +192,11 @@ mod imp {
             let app_clone = app.clone();
             window.set_profile_load_more_callback(move || {
                 app_clone.fetch_profile_more();
+            });
+
+            let app_clone = app.clone();
+            window.set_likes_load_more_callback(move || {
+                app_clone.fetch_likes_more();
             });
 
             window.present();
@@ -1137,6 +1145,9 @@ impl HangarApplication {
             NavItem::Profile => {
                 self.open_own_profile_view();
             }
+            NavItem::Likes => {
+                self.open_likes_view();
+            }
             // Other nav items not yet implemented
             _ => {}
         }
@@ -1587,6 +1598,124 @@ impl HangarApplication {
                     app.imp().profile_loading_more.replace(false);
                     if let Some(window) = app.imp().window.borrow().as_ref() {
                         window.set_profile_loading(false);
+                    }
+                    glib::ControlFlow::Break
+                }
+            }
+        });
+    }
+
+    /// Open the likes view
+    fn open_likes_view(&self) {
+        // Switch to likes page (instant, no animation)
+        if let Some(window) = self.imp().window.borrow().as_ref() {
+            window.show_likes_page();
+        }
+
+        // Only fetch if we haven't loaded likes yet
+        if self.imp().likes_cursor.borrow().is_none() {
+            self.fetch_likes();
+        }
+    }
+
+    /// Fetch liked posts for the logged-in user
+    fn fetch_likes(&self) {
+        let user_did = match self.imp().user_did.borrow().clone() {
+            Some(did) => did,
+            None => {
+                eprintln!("Cannot fetch likes: no user DID");
+                return;
+            }
+        };
+
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(Vec<Post>, Option<String>), String>>();
+        let client = self.client();
+
+        thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async { client.get_actor_likes(&user_did, None).await });
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+
+        let app = self.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            match rx.try_recv() {
+                Ok(Ok((posts, next_cursor))) => {
+                    app.imp().likes_cursor.replace(next_cursor);
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.set_likes(posts);
+                    }
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(e)) => {
+                    eprintln!("Failed to fetch likes: {}", e);
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    eprintln!("Failed to fetch likes: connection lost");
+                    glib::ControlFlow::Break
+                }
+            }
+        });
+    }
+
+    /// Fetch more liked posts for infinite scroll
+    fn fetch_likes_more(&self) {
+        if *self.imp().likes_loading_more.borrow() {
+            return;
+        }
+        let cursor = match self.imp().likes_cursor.borrow().as_ref() {
+            Some(c) => c.clone(),
+            None => return,
+        };
+        let user_did = match self.imp().user_did.borrow().clone() {
+            Some(did) => did,
+            None => return,
+        };
+        self.imp().likes_loading_more.replace(true);
+
+        if let Some(window) = self.imp().window.borrow().as_ref() {
+            window.set_likes_loading(true);
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(Vec<Post>, Option<String>), String>>();
+        let client = self.client();
+
+        thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result =
+                rt.block_on(async { client.get_actor_likes(&user_did, Some(&cursor)).await });
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+
+        let app = self.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            match rx.try_recv() {
+                Ok(Ok((posts, next_cursor))) => {
+                    app.imp().likes_loading_more.replace(false);
+                    app.imp().likes_cursor.replace(next_cursor);
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.set_likes_loading(false);
+                        if !posts.is_empty() {
+                            window.append_likes(posts);
+                        }
+                    }
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(e)) => {
+                    app.imp().likes_loading_more.replace(false);
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.set_likes_loading(false);
+                    }
+                    eprintln!("Failed to fetch more likes: {}", e);
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    app.imp().likes_loading_more.replace(false);
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.set_likes_loading(false);
                     }
                     glib::ControlFlow::Break
                 }

@@ -204,6 +204,12 @@ mod imp {
         pub profile_followers_label: RefCell<Option<gtk4::Label>>,
         pub profile_following_label: RefCell<Option<gtk4::Label>>,
         pub profile_posts_label: RefCell<Option<gtk4::Label>>,
+        // Likes page state
+        pub likes_nav_view: RefCell<Option<adw::NavigationView>>,
+        pub likes_model: RefCell<Option<gio::ListStore>>,
+        pub likes_load_more_callback: RefCell<Option<Box<dyn Fn() + 'static>>>,
+        pub likes_scrolled_window: RefCell<Option<gtk4::ScrolledWindow>>,
+        pub likes_spinner: RefCell<Option<gtk4::Spinner>>,
     }
 
     #[glib::object_subclass]
@@ -288,6 +294,12 @@ impl HangarWindow {
         profile_nav_view.add(&profile_page);
         main_stack.add_named(&profile_nav_view, Some("profile"));
 
+        // Likes section: NavigationView for liked posts
+        let likes_nav_view = adw::NavigationView::new();
+        let likes_page = self.build_likes_page();
+        likes_nav_view.add(&likes_page);
+        main_stack.add_named(&likes_nav_view, Some("likes"));
+
         main_box.append(&main_stack);
 
         self.set_content(Some(&main_box));
@@ -300,6 +312,7 @@ impl HangarWindow {
         imp.activity_nav_view.replace(Some(activity_nav_view));
         imp.chat_nav_view.replace(Some(chat_nav_view));
         imp.profile_nav_view.replace(Some(profile_nav_view));
+        imp.likes_nav_view.replace(Some(likes_nav_view));
 
         // Add keyboard shortcuts
         self.setup_shortcuts();
@@ -822,6 +835,7 @@ impl HangarWindow {
             "activity" => "activity",
             "chat" => "chat",
             "profile" => "own-profile",
+            "likes" => "likes",
             _ => return,
         };
 
@@ -842,6 +856,7 @@ impl HangarWindow {
             "activity" => self.imp().activity_nav_view.borrow().clone(),
             "chat" => self.imp().chat_nav_view.borrow().clone(),
             "profile" => self.imp().profile_nav_view.borrow().clone(),
+            "likes" => self.imp().likes_nav_view.borrow().clone(),
             _ => self.imp().home_nav_view.borrow().clone(),
         }
     }
@@ -2067,6 +2082,199 @@ impl HangarWindow {
     /// Show the profile page (top-level navigation, instant switch)
     pub fn show_profile_page(&self) {
         self.switch_to_page("profile");
+    }
+
+    /// Build the likes page
+    fn build_likes_page(&self) -> adw::NavigationPage {
+        let content_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        content_box.set_hexpand(true);
+
+        let header = adw::HeaderBar::new();
+        header.set_show_start_title_buttons(false);
+        header.set_show_end_title_buttons(false);
+
+        let title = gtk4::Label::new(Some("Likes"));
+        title.add_css_class("title");
+        header.set_title_widget(Some(&title));
+
+        let close_btn = gtk4::Button::from_icon_name("window-close-symbolic");
+        close_btn.set_tooltip_text(Some("Close"));
+        close_btn.connect_clicked(glib::clone!(
+            #[weak(rename_to = window)]
+            self,
+            move |_| {
+                window.close();
+            }
+        ));
+        header.pack_end(&close_btn);
+
+        content_box.append(&header);
+        content_box.append(&self.build_likes_list());
+
+        let page = adw::NavigationPage::new(&content_box, "Likes");
+        page.set_tag(Some("likes"));
+        page
+    }
+
+    /// Build the likes list widget
+    fn build_likes_list(&self) -> gtk4::Box {
+        let likes_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        likes_box.set_vexpand(true);
+
+        let overlay = gtk4::Overlay::new();
+        overlay.set_vexpand(true);
+
+        let model = gio::ListStore::new::<PostObject>();
+        let factory = gtk4::SignalListItemFactory::new();
+
+        factory.connect_setup(|_, item| {
+            let post_row = PostRow::new();
+            if let Some(list_item) = item.downcast_ref::<gtk4::ListItem>() {
+                list_item.set_child(Some(&post_row));
+            }
+        });
+
+        let win = self.clone();
+        factory.connect_bind(move |_, item| {
+            if let Some(list_item) = item.downcast_ref::<gtk4::ListItem>()
+                && let Some(post_object) = list_item.item().and_downcast::<PostObject>()
+                && let Some(post) = post_object.post()
+                && let Some(post_row) = list_item.child().and_downcast::<PostRow>()
+            {
+                post_row.bind(&post);
+                let post_for_like = post.clone();
+                let w = win.clone();
+                post_row.connect_like_clicked(move |row, was_liked, like_uri| {
+                    let mut post_with_state = post_for_like.clone();
+                    post_with_state.viewer_like = if was_liked { like_uri } else { None };
+                    let row_weak = row.downgrade();
+                    w.imp()
+                        .like_callback
+                        .borrow()
+                        .as_ref()
+                        .map(|cb| cb(post_with_state, row_weak));
+                });
+                let post_for_repost = post.clone();
+                let w = win.clone();
+                post_row.connect_repost_clicked(move |row, was_reposted, repost_uri| {
+                    let mut post_with_state = post_for_repost.clone();
+                    post_with_state.viewer_repost = if was_reposted { repost_uri } else { None };
+                    let row_weak = row.downgrade();
+                    w.imp()
+                        .repost_callback
+                        .borrow()
+                        .as_ref()
+                        .map(|cb| cb(post_with_state, row_weak));
+                });
+                let post_for_quote = post.clone();
+                let w = win.clone();
+                post_row.connect_quote_clicked(move || {
+                    w.imp()
+                        .quote_callback
+                        .borrow()
+                        .as_ref()
+                        .map(|cb| cb(post_for_quote.clone()));
+                });
+                let post_clone = post.clone();
+                let w = win.clone();
+                post_row.connect_reply_clicked(move || {
+                    w.imp()
+                        .reply_callback
+                        .borrow()
+                        .as_ref()
+                        .map(|cb| cb(post_clone.clone()));
+                });
+                // Navigation callbacks for posts in likes
+                let w = win.clone();
+                post_row.set_post_clicked_callback(move |p| {
+                    w.imp()
+                        .post_clicked_callback
+                        .borrow()
+                        .as_ref()
+                        .map(|cb| cb(p));
+                });
+            }
+        });
+
+        let selection = gtk4::NoSelection::new(Some(model.clone()));
+        let list_view = gtk4::ListView::new(Some(selection), Some(factory));
+        list_view.add_css_class("background");
+
+        let scrolled = gtk4::ScrolledWindow::new();
+        scrolled.set_vexpand(true);
+        scrolled.set_child(Some(&list_view));
+        overlay.set_child(Some(&scrolled));
+
+        // Loading spinner
+        let spinner = gtk4::Spinner::new();
+        spinner.set_visible(false);
+        spinner.set_halign(gtk4::Align::Center);
+        spinner.set_valign(gtk4::Align::End);
+        spinner.set_margin_bottom(16);
+        overlay.add_overlay(&spinner);
+
+        likes_box.append(&overlay);
+
+        // Store references
+        let imp = self.imp();
+        imp.likes_model.replace(Some(model));
+        imp.likes_scrolled_window.replace(Some(scrolled.clone()));
+        imp.likes_spinner.replace(Some(spinner));
+
+        // Infinite scroll
+        let adj = scrolled.vadjustment();
+        let win = self.clone();
+        adj.connect_value_changed(move |adj| {
+            let value = adj.value();
+            let upper = adj.upper();
+            let page_size = adj.page_size();
+            if value >= upper - page_size - 200.0 {
+                if let Some(cb) = win.imp().likes_load_more_callback.borrow().as_ref() {
+                    cb();
+                }
+            }
+        });
+
+        likes_box
+    }
+
+    /// Show the likes page (top-level navigation, instant switch)
+    pub fn show_likes_page(&self) {
+        self.switch_to_page("likes");
+    }
+
+    /// Set liked posts in the likes list
+    pub fn set_likes(&self, posts: Vec<Post>) {
+        if let Some(model) = self.imp().likes_model.borrow().as_ref() {
+            model.remove_all();
+            for post in posts {
+                model.append(&PostObject::new(post));
+            }
+        }
+    }
+
+    /// Append more liked posts to the likes list
+    pub fn append_likes(&self, posts: Vec<Post>) {
+        if let Some(model) = self.imp().likes_model.borrow().as_ref() {
+            for post in posts {
+                model.append(&PostObject::new(post));
+            }
+        }
+    }
+
+    /// Set loading state for likes page
+    pub fn set_likes_loading(&self, loading: bool) {
+        if let Some(spinner) = self.imp().likes_spinner.borrow().as_ref() {
+            spinner.set_visible(loading);
+            spinner.set_spinning(loading);
+        }
+    }
+
+    /// Set callback for loading more liked posts
+    pub fn set_likes_load_more_callback<F: Fn() + 'static>(&self, callback: F) {
+        self.imp()
+            .likes_load_more_callback
+            .replace(Some(Box::new(callback)));
     }
 }
 

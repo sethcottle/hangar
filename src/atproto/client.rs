@@ -1190,6 +1190,43 @@ impl HangarClient {
         Ok((posts, output.data.cursor))
     }
 
+    /// Get posts liked by a specific user
+    #[allow(clippy::await_holding_lock)]
+    pub async fn get_actor_likes(
+        &self,
+        actor: &str,
+        cursor: Option<&str>,
+    ) -> Result<(Vec<Post>, Option<String>), ClientError> {
+        let agent_guard = self.agent.read().unwrap();
+        let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
+
+        let params = atrium_api::app::bsky::feed::get_actor_likes::ParametersData {
+            actor: actor
+                .parse()
+                .map_err(|e| ClientError::InvalidResponse(format!("invalid actor: {e}")))?,
+            cursor: cursor.map(String::from),
+            limit: None,
+        };
+
+        let output = agent
+            .api
+            .app
+            .bsky
+            .feed
+            .get_actor_likes(params.into())
+            .await
+            .map_err(|e| ClientError::Network(e.to_string()))?;
+
+        let posts: Vec<Post> = output
+            .data
+            .feed
+            .into_iter()
+            .map(|feed_view| self.convert_feed_view_post(feed_view))
+            .collect();
+
+        Ok((posts, output.data.cursor))
+    }
+
     /// Get notifications (mentions, replies, quotes, likes, reposts, follows)
     /// If `mentions_only` is true, filters to just mentions, replies, and quotes
     #[allow(clippy::await_holding_lock)]
