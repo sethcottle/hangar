@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use crate::atproto::types::{
-    Embed, ExternalEmbed, ImageEmbed, Notification, Post, Profile, QuoteEmbed, ReplyContext,
-    RepostReason, SavedFeed, Session, VideoEmbed,
+    ChatMessage, Conversation, Embed, ExternalEmbed, ImageEmbed, Notification, Post, Profile,
+    QuoteEmbed, ReplyContext, RepostReason, SavedFeed, Session, VideoEmbed,
 };
 use crate::config::DEFAULT_PDS;
 use atrium_api::agent::AtpAgent;
@@ -1292,6 +1292,142 @@ impl HangarClient {
             repost_reason: None,
             reply_context: None,
         })
+    }
+
+    /// Get list of direct message conversations
+    #[allow(clippy::await_holding_lock)]
+    pub async fn get_conversations(
+        &self,
+        cursor: Option<&str>,
+    ) -> Result<(Vec<Conversation>, Option<String>), ClientError> {
+        use atrium_api::agent::bluesky::{AtprotoServiceType, BSKY_CHAT_DID};
+
+        let agent_guard = self.agent.read().unwrap();
+        let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
+
+        // Chat API requires proxying through the chat service
+        let chat_did = BSKY_CHAT_DID
+            .parse()
+            .map_err(|e| ClientError::Network(format!("invalid chat DID: {e}")))?;
+        let chat_api = agent.api_with_proxy(chat_did, AtprotoServiceType::BskyChat);
+
+        let params = atrium_api::chat::bsky::convo::list_convos::ParametersData {
+            cursor: cursor.map(String::from),
+            limit: None,
+        };
+
+        let output = chat_api
+            .chat
+            .bsky
+            .convo
+            .list_convos(params.into())
+            .await
+            .map_err(|e| ClientError::Network(e.to_string()))?;
+
+        let conversations: Vec<Conversation> = output
+            .data
+            .convos
+            .into_iter()
+            .map(|convo| self.convert_convo_view(convo))
+            .collect();
+
+        Ok((conversations, output.data.cursor))
+    }
+
+    /// Get messages for a specific conversation
+    #[allow(clippy::await_holding_lock)]
+    pub async fn get_messages(
+        &self,
+        convo_id: &str,
+        cursor: Option<&str>,
+    ) -> Result<(Vec<ChatMessage>, Option<String>), ClientError> {
+        use atrium_api::agent::bluesky::{AtprotoServiceType, BSKY_CHAT_DID};
+
+        let agent_guard = self.agent.read().unwrap();
+        let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
+
+        // Chat API requires proxying through the chat service
+        let chat_did = BSKY_CHAT_DID
+            .parse()
+            .map_err(|e| ClientError::Network(format!("invalid chat DID: {e}")))?;
+        let chat_api = agent.api_with_proxy(chat_did, AtprotoServiceType::BskyChat);
+
+        let params = atrium_api::chat::bsky::convo::get_messages::ParametersData {
+            convo_id: convo_id.to_string(),
+            cursor: cursor.map(String::from),
+            limit: None,
+        };
+
+        let output = chat_api
+            .chat
+            .bsky
+            .convo
+            .get_messages(params.into())
+            .await
+            .map_err(|e| ClientError::Network(e.to_string()))?;
+
+        use atrium_api::chat::bsky::convo::get_messages::OutputMessagesItem;
+        use atrium_api::types::Union;
+
+        let messages: Vec<ChatMessage> = output
+            .data
+            .messages
+            .into_iter()
+            .filter_map(|msg| match msg {
+                Union::Refs(OutputMessagesItem::ChatBskyConvoDefsMessageView(view)) => {
+                    Some(ChatMessage {
+                        id: view.data.id.clone(),
+                        text: view.data.text.clone(),
+                        sender_did: view.data.sender.data.did.to_string(),
+                        sent_at: view.data.sent_at.as_str().to_string(),
+                    })
+                }
+                // Skip deleted messages
+                Union::Refs(OutputMessagesItem::ChatBskyConvoDefsDeletedMessageView(_)) => None,
+                _ => None,
+            })
+            .collect();
+
+        Ok((messages, output.data.cursor))
+    }
+
+    /// Convert atrium ConvoView to our Conversation type
+    fn convert_convo_view(
+        &self,
+        convo: atrium_api::chat::bsky::convo::defs::ConvoView,
+    ) -> Conversation {
+        use atrium_api::chat::bsky::convo::defs::ConvoViewLastMessageRefs;
+        use atrium_api::types::Union;
+
+        let members: Vec<Profile> = convo
+            .data
+            .members
+            .iter()
+            .map(|m| Profile {
+                did: m.data.did.to_string(),
+                handle: m.data.handle.to_string(),
+                display_name: m.data.display_name.clone(),
+                avatar: m.data.avatar.clone(),
+            })
+            .collect();
+
+        let last_message = convo.data.last_message.as_ref().and_then(|msg| match msg {
+            Union::Refs(ConvoViewLastMessageRefs::MessageView(view)) => Some(ChatMessage {
+                id: view.data.id.clone(),
+                text: view.data.text.clone(),
+                sender_did: view.data.sender.data.did.to_string(),
+                sent_at: view.data.sent_at.as_str().to_string(),
+            }),
+            _ => None,
+        });
+
+        Conversation {
+            id: convo.data.id,
+            members,
+            last_message,
+            unread_count: convo.data.unread_count,
+            muted: convo.data.muted,
+        }
     }
 }
 

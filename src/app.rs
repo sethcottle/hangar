@@ -8,7 +8,7 @@ use std::cell::RefCell;
 use std::sync::Arc;
 use std::thread;
 
-use crate::atproto::{HangarClient, Notification, Post, Profile, SavedFeed, Session};
+use crate::atproto::{Conversation, HangarClient, Notification, Post, Profile, SavedFeed, Session};
 use crate::state::SessionManager;
 use crate::ui::post_row::PostRow;
 use crate::ui::{ComposeDialog, HangarWindow, LoginDialog, NavItem, QuoteContext, ReplyContext};
@@ -37,6 +37,9 @@ mod imp {
         /// Activity state
         pub activity_cursor: RefCell<Option<String>>,
         pub activity_loading_more: RefCell<bool>,
+        /// Chat state
+        pub chat_cursor: RefCell<Option<String>>,
+        pub chat_loading_more: RefCell<bool>,
     }
 
     #[glib::object_subclass]
@@ -166,6 +169,16 @@ mod imp {
             let app_clone = app.clone();
             window.set_activity_load_more_callback(move || {
                 app_clone.fetch_activity_more();
+            });
+
+            let app_clone = app.clone();
+            window.set_chat_load_more_callback(move || {
+                app_clone.fetch_chat_more();
+            });
+
+            let app_clone = app.clone();
+            window.set_conversation_clicked_callback(move |conversation| {
+                app_clone.open_conversation_view(conversation);
             });
 
             window.present();
@@ -327,6 +340,7 @@ impl HangarApplication {
 
         let client = self.client();
         let did = did.to_string();
+        let did_for_window = did.clone();
         thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             let result = rt.block_on(async { client.get_profile(&did).await });
@@ -341,6 +355,8 @@ impl HangarApplication {
                         let display_name =
                             profile.display_name.as_deref().unwrap_or(&profile.handle);
                         window.set_user_avatar(display_name, profile.avatar.as_deref());
+                        // Set current user DID for filtering conversations
+                        window.set_current_user_did(&did_for_window);
                     }
                     glib::ControlFlow::Break
                 }
@@ -1100,6 +1116,9 @@ impl HangarApplication {
             NavItem::Activity => {
                 self.open_activity_view();
             }
+            NavItem::Chat => {
+                self.open_chat_view();
+            }
             // Other nav items not yet implemented
             _ => {}
         }
@@ -1320,6 +1339,123 @@ impl HangarApplication {
                 }
             }
         });
+    }
+
+    /// Open the chat view
+    fn open_chat_view(&self) {
+        // Switch to chat page (instant, no animation)
+        if let Some(window) = self.imp().window.borrow().as_ref() {
+            window.show_chat_page();
+        }
+
+        // Only fetch if we haven't loaded chat yet
+        if self.imp().chat_cursor.borrow().is_none() {
+            self.fetch_conversations();
+        }
+    }
+
+    /// Fetch conversations
+    fn fetch_conversations(&self) {
+        let (tx, rx) =
+            std::sync::mpsc::channel::<Result<(Vec<Conversation>, Option<String>), String>>();
+        let client = self.client();
+
+        thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async { client.get_conversations(None).await });
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+
+        let app = self.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            match rx.try_recv() {
+                Ok(Ok((conversations, next_cursor))) => {
+                    app.imp().chat_cursor.replace(next_cursor);
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.set_conversations(conversations);
+                    }
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(e)) => {
+                    eprintln!("Failed to fetch conversations: {}", e);
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    eprintln!("Failed to fetch conversations: connection lost");
+                    glib::ControlFlow::Break
+                }
+            }
+        });
+    }
+
+    /// Fetch more conversations for infinite scroll
+    fn fetch_chat_more(&self) {
+        if *self.imp().chat_loading_more.borrow() {
+            return;
+        }
+        let cursor = match self.imp().chat_cursor.borrow().as_ref() {
+            Some(c) => c.clone(),
+            None => return,
+        };
+        self.imp().chat_loading_more.replace(true);
+
+        if let Some(window) = self.imp().window.borrow().as_ref() {
+            window.set_chat_loading(true);
+        }
+
+        let (tx, rx) =
+            std::sync::mpsc::channel::<Result<(Vec<Conversation>, Option<String>), String>>();
+        let client = self.client();
+
+        thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async { client.get_conversations(Some(&cursor)).await });
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+
+        let app = self.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            match rx.try_recv() {
+                Ok(Ok((conversations, next_cursor))) => {
+                    app.imp().chat_loading_more.replace(false);
+                    app.imp().chat_cursor.replace(next_cursor);
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.set_chat_loading(false);
+                        if !conversations.is_empty() {
+                            window.append_conversations(conversations);
+                        }
+                    }
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(e)) => {
+                    app.imp().chat_loading_more.replace(false);
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.set_chat_loading(false);
+                    }
+                    eprintln!("Failed to fetch more conversations: {}", e);
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    app.imp().chat_loading_more.replace(false);
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.set_chat_loading(false);
+                    }
+                    glib::ControlFlow::Break
+                }
+            }
+        });
+    }
+
+    /// Open a conversation view (placeholder for now)
+    fn open_conversation_view(&self, conversation: Conversation) {
+        // TODO: Implement conversation detail view with messages
+        eprintln!(
+            "Opening conversation: {} with {} members",
+            conversation.id,
+            conversation.members.len()
+        );
     }
 }
 

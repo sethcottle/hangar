@@ -240,3 +240,8 @@ popover.menu > contents {
     padding: 0;
 }
 
+/* Conversation row styling */
+.conversation-row {
+    padding: 4px 0;
+}
+

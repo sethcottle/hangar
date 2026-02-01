@@ -2,7 +2,7 @@
 
 use super::post_row::PostRow;
 use super::sidebar::Sidebar;
-use crate::atproto::{Notification, Post, SavedFeed};
+use crate::atproto::{Conversation, Notification, Post, SavedFeed};
 use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
 use gtk4::{gio, glib};
@@ -91,6 +91,46 @@ mod notification_object {
 
 use notification_object::NotificationObject;
 
+mod conversation_object {
+    use super::*;
+
+    mod imp {
+        use super::*;
+
+        #[derive(Default)]
+        pub struct ConversationObject {
+            pub conversation: RefCell<Option<Conversation>>,
+        }
+
+        #[glib::object_subclass]
+        impl ObjectSubclass for ConversationObject {
+            const NAME: &'static str = "HangarConversationObject";
+            type Type = super::ConversationObject;
+            type ParentType = glib::Object;
+        }
+
+        impl ObjectImpl for ConversationObject {}
+    }
+
+    glib::wrapper! {
+        pub struct ConversationObject(ObjectSubclass<imp::ConversationObject>);
+    }
+
+    impl ConversationObject {
+        pub fn new(conversation: Conversation) -> Self {
+            let obj: Self = glib::Object::builder().build();
+            obj.imp().conversation.replace(Some(conversation));
+            obj
+        }
+
+        pub fn conversation(&self) -> Option<Conversation> {
+            self.imp().conversation.borrow().clone()
+        }
+    }
+}
+
+use conversation_object::ConversationObject;
+
 use crate::atproto::Profile;
 
 mod imp {
@@ -139,6 +179,15 @@ mod imp {
         pub activity_load_more_callback: RefCell<Option<Box<dyn Fn() + 'static>>>,
         pub activity_scrolled_window: RefCell<Option<gtk4::ScrolledWindow>>,
         pub activity_spinner: RefCell<Option<gtk4::Spinner>>,
+        // Chat page state
+        pub chat_nav_view: RefCell<Option<adw::NavigationView>>,
+        pub chat_model: RefCell<Option<gio::ListStore>>,
+        pub chat_load_more_callback: RefCell<Option<Box<dyn Fn() + 'static>>>,
+        pub chat_scrolled_window: RefCell<Option<gtk4::ScrolledWindow>>,
+        pub chat_spinner: RefCell<Option<gtk4::Spinner>>,
+        pub conversation_clicked_callback: RefCell<Option<Box<dyn Fn(Conversation) + 'static>>>,
+        // Current user info
+        pub current_user_did: RefCell<Option<String>>,
     }
 
     #[glib::object_subclass]
@@ -211,6 +260,12 @@ impl HangarWindow {
         activity_nav_view.add(&activity_page);
         main_stack.add_named(&activity_nav_view, Some("activity"));
 
+        // Chat section: NavigationView for conversation drill-down
+        let chat_nav_view = adw::NavigationView::new();
+        let chat_page = self.build_chat_page();
+        chat_nav_view.add(&chat_page);
+        main_stack.add_named(&chat_nav_view, Some("chat"));
+
         main_box.append(&main_stack);
 
         self.set_content(Some(&main_box));
@@ -221,6 +276,7 @@ impl HangarWindow {
         imp.home_nav_view.replace(Some(home_nav_view));
         imp.mentions_nav_view.replace(Some(mentions_nav_view));
         imp.activity_nav_view.replace(Some(activity_nav_view));
+        imp.chat_nav_view.replace(Some(chat_nav_view));
 
         // Add keyboard shortcuts
         self.setup_shortcuts();
@@ -562,6 +618,11 @@ impl HangarWindow {
         }
     }
 
+    /// Set the current user's DID (used to filter out self in conversations)
+    pub fn set_current_user_did(&self, did: &str) {
+        self.imp().current_user_did.replace(Some(did.to_string()));
+    }
+
     pub fn set_loading_more(&self, loading: bool) {
         if let Some(spinner) = self.imp().loading_spinner.borrow().as_ref() {
             spinner.set_visible(loading);
@@ -736,6 +797,7 @@ impl HangarWindow {
             "home" => "timeline",
             "mentions" => "mentions",
             "activity" => "activity",
+            "chat" => "chat",
             _ => return,
         };
 
@@ -754,6 +816,7 @@ impl HangarWindow {
             "home" => self.imp().home_nav_view.borrow().clone(),
             "mentions" => self.imp().mentions_nav_view.borrow().clone(),
             "activity" => self.imp().activity_nav_view.borrow().clone(),
+            "chat" => self.imp().chat_nav_view.borrow().clone(),
             _ => self.imp().home_nav_view.borrow().clone(),
         }
     }
@@ -1421,6 +1484,165 @@ impl HangarWindow {
             .replace(Some(Box::new(callback)));
     }
 
+    /// Build the chat page
+    fn build_chat_page(&self) -> adw::NavigationPage {
+        let content_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        content_box.set_hexpand(true);
+
+        let header = adw::HeaderBar::new();
+        header.set_show_start_title_buttons(false);
+        header.set_show_end_title_buttons(false);
+
+        let title = gtk4::Label::new(Some("Messages"));
+        title.add_css_class("title");
+        header.set_title_widget(Some(&title));
+
+        let close_btn = gtk4::Button::from_icon_name("window-close-symbolic");
+        close_btn.set_tooltip_text(Some("Close"));
+        close_btn.connect_clicked(glib::clone!(
+            #[weak(rename_to = window)]
+            self,
+            move |_| {
+                window.close();
+            }
+        ));
+        header.pack_end(&close_btn);
+
+        content_box.append(&header);
+        content_box.append(&self.build_chat_list());
+
+        let page = adw::NavigationPage::new(&content_box, "Messages");
+        page.set_tag(Some("chat"));
+        page
+    }
+
+    /// Build the chat conversation list widget
+    fn build_chat_list(&self) -> gtk4::Box {
+        let chat_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        chat_box.set_vexpand(true);
+
+        let overlay = gtk4::Overlay::new();
+        overlay.set_vexpand(true);
+
+        let model = gio::ListStore::new::<ConversationObject>();
+        let factory = gtk4::SignalListItemFactory::new();
+
+        factory.connect_setup(|_, item| {
+            let row = ConversationRow::new();
+            if let Some(list_item) = item.downcast_ref::<gtk4::ListItem>() {
+                list_item.set_child(Some(&row));
+            }
+        });
+
+        let win = self.clone();
+        factory.connect_bind(move |_, item| {
+            if let Some(list_item) = item.downcast_ref::<gtk4::ListItem>()
+                && let Some(convo_object) = list_item.item().and_downcast::<ConversationObject>()
+                && let Some(convo) = convo_object.conversation()
+                && let Some(row) = list_item.child().and_downcast::<ConversationRow>()
+            {
+                let my_did = win.imp().current_user_did.borrow();
+                row.bind(&convo, my_did.as_deref());
+                // Connect click
+                let conversation = convo.clone();
+                let w = win.clone();
+                row.connect_clicked(move |_| {
+                    w.imp()
+                        .conversation_clicked_callback
+                        .borrow()
+                        .as_ref()
+                        .map(|cb| cb(conversation.clone()));
+                });
+            }
+        });
+
+        let selection = gtk4::NoSelection::new(Some(model.clone()));
+        let list_view = gtk4::ListView::new(Some(selection), Some(factory));
+        list_view.add_css_class("background");
+
+        let scrolled = gtk4::ScrolledWindow::new();
+        scrolled.set_vexpand(true);
+        scrolled.set_child(Some(&list_view));
+        overlay.set_child(Some(&scrolled));
+
+        // Loading spinner
+        let spinner = gtk4::Spinner::new();
+        spinner.set_visible(false);
+        spinner.set_halign(gtk4::Align::Center);
+        spinner.set_valign(gtk4::Align::End);
+        spinner.set_margin_bottom(16);
+        overlay.add_overlay(&spinner);
+
+        chat_box.append(&overlay);
+
+        let imp = self.imp();
+        imp.chat_model.replace(Some(model));
+        imp.chat_scrolled_window.replace(Some(scrolled.clone()));
+        imp.chat_spinner.replace(Some(spinner));
+
+        // Infinite scroll
+        let adj = scrolled.vadjustment();
+        let win = self.clone();
+        adj.connect_value_changed(move |adj| {
+            let value = adj.value();
+            let upper = adj.upper();
+            let page_size = adj.page_size();
+            if value >= upper - page_size - 200.0 {
+                if let Some(cb) = win.imp().chat_load_more_callback.borrow().as_ref() {
+                    cb();
+                }
+            }
+        });
+
+        chat_box
+    }
+
+    /// Show the chat page (top-level navigation, instant switch)
+    pub fn show_chat_page(&self) {
+        self.switch_to_page("chat");
+    }
+
+    /// Set conversations in the chat list
+    pub fn set_conversations(&self, conversations: Vec<Conversation>) {
+        if let Some(model) = self.imp().chat_model.borrow().as_ref() {
+            model.remove_all();
+            for convo in conversations {
+                model.append(&ConversationObject::new(convo));
+            }
+        }
+    }
+
+    /// Append more conversations to the chat list
+    pub fn append_conversations(&self, conversations: Vec<Conversation>) {
+        if let Some(model) = self.imp().chat_model.borrow().as_ref() {
+            for convo in conversations {
+                model.append(&ConversationObject::new(convo));
+            }
+        }
+    }
+
+    /// Set loading state for chat
+    pub fn set_chat_loading(&self, loading: bool) {
+        if let Some(spinner) = self.imp().chat_spinner.borrow().as_ref() {
+            spinner.set_visible(loading);
+            spinner.set_spinning(loading);
+        }
+    }
+
+    /// Set callback for loading more conversations
+    pub fn set_chat_load_more_callback<F: Fn() + 'static>(&self, callback: F) {
+        self.imp()
+            .chat_load_more_callback
+            .replace(Some(Box::new(callback)));
+    }
+
+    /// Set callback for when a conversation is clicked
+    pub fn set_conversation_clicked_callback<F: Fn(Conversation) + 'static>(&self, callback: F) {
+        self.imp()
+            .conversation_clicked_callback
+            .replace(Some(Box::new(callback)));
+    }
+
     /// Set callback for nav item changes
     pub fn set_nav_changed_callback<F: Fn(crate::ui::sidebar::NavItem) + 'static>(
         &self,
@@ -2056,3 +2278,252 @@ mod activity_row {
 }
 
 use activity_row::ActivityRow;
+
+/// A row widget for displaying a chat conversation
+mod conversation_row {
+    use super::*;
+    use crate::atproto::Conversation;
+    use crate::ui::avatar_cache;
+
+    mod imp {
+        use super::*;
+        use std::cell::RefCell;
+
+        #[derive(Default)]
+        pub struct ConversationRow {
+            pub avatar: RefCell<Option<adw::Avatar>>,
+            pub name_label: RefCell<Option<gtk4::Label>>,
+            pub preview_label: RefCell<Option<gtk4::Label>>,
+            pub time_label: RefCell<Option<gtk4::Label>>,
+            pub unread_badge: RefCell<Option<gtk4::Label>>,
+            pub clicked_callback: RefCell<Option<Box<dyn Fn(&super::ConversationRow) + 'static>>>,
+        }
+
+        #[glib::object_subclass]
+        impl ObjectSubclass for ConversationRow {
+            const NAME: &'static str = "HangarConversationRow";
+            type Type = super::ConversationRow;
+            type ParentType = gtk4::Box;
+        }
+
+        impl ObjectImpl for ConversationRow {
+            fn constructed(&self) {
+                self.parent_constructed();
+                let obj = self.obj();
+                obj.setup_ui();
+            }
+        }
+
+        impl WidgetImpl for ConversationRow {}
+        impl BoxImpl for ConversationRow {}
+    }
+
+    glib::wrapper! {
+        pub struct ConversationRow(ObjectSubclass<imp::ConversationRow>)
+            @extends gtk4::Box, gtk4::Widget,
+            @implements gtk4::Accessible, gtk4::Buildable, gtk4::ConstraintTarget, gtk4::Orientable;
+    }
+
+    impl ConversationRow {
+        pub fn new() -> Self {
+            glib::Object::builder()
+                .property("orientation", gtk4::Orientation::Vertical)
+                .property("spacing", 0)
+                .build()
+        }
+
+        fn setup_ui(&self) {
+            self.add_css_class("conversation-row");
+            self.set_margin_start(12);
+            self.set_margin_end(12);
+            self.set_margin_top(8);
+            self.set_margin_bottom(8);
+
+            // Main content box (horizontal: avatar + content)
+            let main_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
+
+            // Avatar
+            let avatar = adw::Avatar::new(48, None, true);
+            main_box.append(&avatar);
+
+            // Content box (vertical: name + preview)
+            let content_box = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+            content_box.set_hexpand(true);
+
+            // Header row: name + time
+            let header_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+
+            let name_label = gtk4::Label::new(None);
+            name_label.add_css_class("heading");
+            name_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+            name_label.set_halign(gtk4::Align::Start);
+            name_label.set_hexpand(true);
+            header_box.append(&name_label);
+
+            let time_label = gtk4::Label::new(None);
+            time_label.add_css_class("dim-label");
+            time_label.add_css_class("caption");
+            header_box.append(&time_label);
+
+            content_box.append(&header_box);
+
+            // Preview row: message preview + unread badge
+            let preview_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+
+            let preview_label = gtk4::Label::new(None);
+            preview_label.add_css_class("dim-label");
+            preview_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+            preview_label.set_halign(gtk4::Align::Start);
+            preview_label.set_hexpand(true);
+            preview_label.set_max_width_chars(50);
+            preview_box.append(&preview_label);
+
+            let unread_badge = gtk4::Label::new(None);
+            unread_badge.add_css_class("accent");
+            unread_badge.add_css_class("caption");
+            unread_badge.set_visible(false);
+            preview_box.append(&unread_badge);
+
+            content_box.append(&preview_box);
+
+            main_box.append(&content_box);
+
+            // Click gesture
+            let click = gtk4::GestureClick::new();
+            let row_weak = self.downgrade();
+            click.connect_released(move |_, _, _, _| {
+                if let Some(row) = row_weak.upgrade() {
+                    if let Some(cb) = row.imp().clicked_callback.borrow().as_ref() {
+                        cb(&row);
+                    }
+                }
+            });
+            self.add_controller(click);
+
+            self.append(&main_box);
+
+            // Separator
+            let sep = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+            sep.set_margin_top(8);
+            self.append(&sep);
+
+            let imp = self.imp();
+            imp.avatar.replace(Some(avatar));
+            imp.name_label.replace(Some(name_label));
+            imp.preview_label.replace(Some(preview_label));
+            imp.time_label.replace(Some(time_label));
+            imp.unread_badge.replace(Some(unread_badge));
+        }
+
+        pub fn bind(&self, conversation: &Conversation, my_did: Option<&str>) {
+            let imp = self.imp();
+
+            // Get the other participant(s) - filter out ourselves
+            let other_member = conversation
+                .members
+                .iter()
+                .find(|m| my_did.is_none_or(|did| m.did != did))
+                .or_else(|| conversation.members.first());
+
+            // Avatar
+            if let Some(avatar) = imp.avatar.borrow().as_ref() {
+                if let Some(member) = other_member {
+                    let display_name = member
+                        .display_name
+                        .as_deref()
+                        .unwrap_or(&member.handle);
+                    avatar.set_text(Some(display_name));
+                    if let Some(url) = &member.avatar {
+                        avatar_cache::load_avatar(avatar.clone(), url.clone());
+                    }
+                } else {
+                    avatar.set_text(Some("?"));
+                }
+            }
+
+            // Name
+            if let Some(label) = imp.name_label.borrow().as_ref() {
+                if let Some(member) = other_member {
+                    let display_name = member
+                        .display_name
+                        .as_deref()
+                        .unwrap_or(&member.handle);
+                    label.set_text(display_name);
+                } else {
+                    label.set_text("Unknown");
+                }
+            }
+
+            // Preview (last message)
+            if let Some(label) = imp.preview_label.borrow().as_ref() {
+                if let Some(last_msg) = &conversation.last_message {
+                    label.set_text(&last_msg.text);
+                    label.set_visible(true);
+                } else {
+                    label.set_visible(false);
+                }
+            }
+
+            // Time
+            if let Some(label) = imp.time_label.borrow().as_ref() {
+                if let Some(last_msg) = &conversation.last_message {
+                    label.set_text(&Self::format_relative_time(&last_msg.sent_at));
+                } else {
+                    label.set_text("");
+                }
+            }
+
+            // Unread badge
+            if let Some(badge) = imp.unread_badge.borrow().as_ref() {
+                if conversation.unread_count > 0 {
+                    if conversation.unread_count > 99 {
+                        badge.set_text("99+");
+                    } else {
+                        badge.set_text(&conversation.unread_count.to_string());
+                    }
+                    badge.set_visible(true);
+                } else {
+                    badge.set_visible(false);
+                }
+            }
+        }
+
+        fn format_relative_time(sent_at: &str) -> String {
+            use chrono::{DateTime, Utc};
+
+            let Ok(time) = DateTime::parse_from_rfc3339(sent_at) else {
+                return String::new();
+            };
+
+            let now = Utc::now();
+            let time_utc = time.with_timezone(&Utc);
+            let duration = now.signed_duration_since(time_utc);
+
+            if duration.num_seconds() < 60 {
+                "now".to_string()
+            } else if duration.num_minutes() < 60 {
+                format!("{}m", duration.num_minutes())
+            } else if duration.num_hours() < 24 {
+                format!("{}h", duration.num_hours())
+            } else if duration.num_days() < 7 {
+                format!("{}d", duration.num_days())
+            } else {
+                time.format("%b %d").to_string()
+            }
+        }
+
+        pub fn connect_clicked<F: Fn(&Self) + 'static>(&self, callback: F) {
+            self.imp()
+                .clicked_callback
+                .replace(Some(Box::new(callback)));
+        }
+    }
+
+    impl Default for ConversationRow {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+}
+
+use conversation_row::ConversationRow;

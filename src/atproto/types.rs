@@ -157,3 +157,31 @@ impl SavedFeed {
         self.feed_type == "timeline" || self.uri.is_empty()
     }
 }
+
+/// A direct message conversation
+#[derive(Debug, Clone)]
+pub struct Conversation {
+    /// Unique conversation ID
+    pub id: String,
+    /// Participants in the conversation
+    pub members: Vec<Profile>,
+    /// Last message in the conversation (if any)
+    pub last_message: Option<ChatMessage>,
+    /// Number of unread messages
+    pub unread_count: i64,
+    /// Whether the conversation is muted
+    pub muted: bool,
+}
+
+/// A chat message
+#[derive(Debug, Clone)]
+pub struct ChatMessage {
+    /// Unique message ID
+    pub id: String,
+    /// Message text content
+    pub text: String,
+    /// DID of the sender
+    pub sender_did: String,
+    /// When the message was sent
+    pub sent_at: String,
+}
