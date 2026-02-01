@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MPL-2.0
+#![allow(clippy::type_complexity)]
 
 use gtk4::gdk;
 use gtk4::glib;

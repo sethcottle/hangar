@@ -1,0 +1,67 @@
+# SPDX-License-Identifier: MPL-2.0
+
+name: AppImage
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  appimage:
+    name: Build AppImage
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-4-dev \
+            libadwaita-1-dev \
+            libsecret-1-dev \
+            librsvg2-dev \
+            libfuse2
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Download linuxdeploy
+        run: |
+          curl -sSL https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage -o linuxdeploy
+          curl -sSL https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh -o linuxdeploy-plugin-gtk.sh
+          chmod +x linuxdeploy linuxdeploy-plugin-gtk.sh
+
+      - name: Create AppDir structure
+        run: |
+          mkdir -p AppDir/usr/bin
+          mkdir -p AppDir/usr/share/applications
+          mkdir -p AppDir/usr/share/icons/hicolor/scalable/apps
+          mkdir -p AppDir/usr/share/metainfo
+
+          cp target/release/hangar AppDir/usr/bin/
+          cp data/io.github.sethcottle.Hangar.desktop AppDir/usr/share/applications/
+          cp assets/icons/io.github.sethcottle.Hangar.svg AppDir/usr/share/icons/hicolor/scalable/apps/
+          cp data/io.github.sethcottle.Hangar.metainfo.xml AppDir/usr/share/metainfo/
+
+      - name: Build AppImage
+        run: |
+          export DEPLOY_GTK_VERSION=4
+          ./linuxdeploy --appdir AppDir \
+            --plugin gtk \
+            --desktop-file AppDir/usr/share/applications/io.github.sethcottle.Hangar.desktop \
+            --icon-file AppDir/usr/share/icons/hicolor/scalable/apps/io.github.sethcottle.Hangar.svg \
+            --output appimage
+
+      - name: Upload AppImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: hangar-appimage
+          path: Hangar*.AppImage
+          retention-days: 7

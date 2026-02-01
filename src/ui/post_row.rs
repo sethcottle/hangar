@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
+#![allow(clippy::type_complexity)]
+#![allow(clippy::collapsible_if)]
 
 use crate::atproto::{Embed, ImageEmbed, Post};
 use crate::ui::avatar_cache;

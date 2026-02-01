@@ -2,37 +2,38 @@
 <!-- SPDX-License-Identifier: MPL-2.0 -->
 <component type="desktop-application">
   <id>io.github.sethcottle.Hangar</id>
-  <metadata_license>CC0-1.0</metadata_license>
-  <project_license>MPL-2.0</project_license>
 
   <name>Hangar</name>
   <summary>A native Bluesky client for Linux</summary>
+
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MPL-2.0</project_license>
+
   <description>
     <p>
-      Hangar is a fast, native Bluesky client built for the Linux desktop.
-      No web views, no Electron — just pure GTK4 and Libadwaita.
+      Hangar is a desktop Bluesky client designed specifically for Linux and the
+      GNOME desktop environment. No Electron, no web views, no hybrid UI—just
+      native GTK4 with Libadwaita for a fast, integrated experience.
     </p>
-    <p>Features:</p>
-    <ul>
-      <li>Native GNOME experience with Libadwaita</li>
-      <li>Secure credential storage</li>
-      <li>Fast timeline rendering</li>
-      <li>Keyboard-driven navigation</li>
-    </ul>
+    <p>
+      This is a technical preview. The app is functional but incomplete.
+      Development follows a slice-by-slice methodology—one feature at a time.
+    </p>
   </description>
-
-  <developer id="io.github.sethcottle">
-    <name>Seth Cottle</name>
-  </developer>
 
   <launchable type="desktop-id">io.github.sethcottle.Hangar.desktop</launchable>
 
   <url type="homepage">https://github.com/sethcottle/hangar</url>
   <url type="bugtracker">https://github.com/sethcottle/hangar/issues</url>
+  <url type="vcs-browser">https://github.com/sethcottle/hangar</url>
+
+  <developer id="io.github.sethcottle">
+    <name>Seth Cottle</name>
+  </developer>
 
   <branding>
-    <color type="primary" scheme_preference="light">#62a0ea</color>
-    <color type="primary" scheme_preference="dark">#1c71d8</color>
+    <color type="primary" scheme_preference="light">#3b82f6</color>
+    <color type="primary" scheme_preference="dark">#1d4ed8</color>
   </branding>
 
   <content_rating type="oars-1.1">
@@ -47,13 +48,12 @@
   <supports>
     <control>pointing</control>
     <control>keyboard</control>
-    <control>touch</control>
   </supports>
 
   <releases>
-    <release version="0.1.0" date="2025-01-30">
+    <release version="0.1.0" date="2025-01-01">
       <description>
-        <p>Initial development release.</p>
+        <p>Initial technical preview release.</p>
       </description>
     </release>
   </releases>

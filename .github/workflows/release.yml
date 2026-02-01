@@ -1,0 +1,163 @@
+# SPDX-License-Identifier: MPL-2.0
+
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build-flatpak:
+    name: Build Flatpak
+    runs-on: ubuntu-latest
+    container:
+      image: bilelmoussaoui/flatpak-github-actions:gnome-47
+      options: --privileged
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate Cargo sources
+        run: |
+          dnf install -y python3-toml python3-tomlkit python3-aiohttp
+          curl -sSL https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/master/cargo/flatpak-cargo-generator.py -o flatpak-cargo-generator.py
+          python3 flatpak-cargo-generator.py Cargo.lock -o cargo-sources.json
+
+      - name: Build Flatpak
+        uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          manifest-path: io.github.sethcottle.Hangar.yml
+          bundle: hangar.flatpak
+          upload-artifact: false
+          cache-key: flatpak-builder-${{ github.sha }}
+
+      - name: Upload Flatpak artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hangar-flatpak
+          path: hangar.flatpak
+
+  build-appimage:
+    name: Build AppImage
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-4-dev \
+            libadwaita-1-dev \
+            libsecret-1-dev \
+            librsvg2-dev \
+            libfuse2
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Download linuxdeploy
+        run: |
+          curl -sSL https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage -o linuxdeploy
+          curl -sSL https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh -o linuxdeploy-plugin-gtk.sh
+          chmod +x linuxdeploy linuxdeploy-plugin-gtk.sh
+
+      - name: Create AppDir structure
+        run: |
+          mkdir -p AppDir/usr/bin
+          mkdir -p AppDir/usr/share/applications
+          mkdir -p AppDir/usr/share/icons/hicolor/scalable/apps
+          mkdir -p AppDir/usr/share/metainfo
+
+          cp target/release/hangar AppDir/usr/bin/
+          cp data/io.github.sethcottle.Hangar.desktop AppDir/usr/share/applications/
+          cp assets/icons/io.github.sethcottle.Hangar.svg AppDir/usr/share/icons/hicolor/scalable/apps/
+          cp data/io.github.sethcottle.Hangar.metainfo.xml AppDir/usr/share/metainfo/
+
+      - name: Build AppImage
+        run: |
+          export DEPLOY_GTK_VERSION=4
+          ./linuxdeploy --appdir AppDir \
+            --plugin gtk \
+            --desktop-file AppDir/usr/share/applications/io.github.sethcottle.Hangar.desktop \
+            --icon-file AppDir/usr/share/icons/hicolor/scalable/apps/io.github.sethcottle.Hangar.svg \
+            --output appimage
+
+      - name: Upload AppImage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hangar-appimage
+          path: Hangar*.AppImage
+
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: [build-flatpak, build-appimage]
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get version from Cargo.toml
+        id: version
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Download Flatpak artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: hangar-flatpak
+
+      - name: Download AppImage artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: hangar-appimage
+
+      - name: Create or update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: Hangar v${{ steps.version.outputs.version }}
+          body: |
+            ## Hangar v${{ steps.version.outputs.version }}
+
+            **Technical Preview** — This is an early development release.
+
+            ### Downloads
+
+            - **Flatpak**: `hangar.flatpak` — Install with `flatpak install hangar.flatpak`
+            - **AppImage**: Make executable and run
+
+            ### Security Notice
+
+            This release uses app password authentication. Please use a dedicated [app password](https://bsky.app/settings/app-passwords) rather than your main account password.
+          files: |
+            hangar.flatpak
+            Hangar*.AppImage
+          draft: false
+          prerelease: true
+
+      - name: Upload to DigitalOcean Spaces
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.DO_SPACES_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.DO_SPACES_SECRET }}
+        run: |
+          # Upload Flatpak (AWS CLI is pre-installed on GitHub runners)
+          aws s3 cp hangar.flatpak s3://seth/hangar/releases/hangar.flatpak \
+            --endpoint-url https://nyc3.digitaloceanspaces.com \
+            --acl public-read
+
+          # Upload AppImage (find the actual filename)
+          APPIMAGE=$(ls Hangar*.AppImage)
+          aws s3 cp "$APPIMAGE" s3://seth/hangar/releases/Hangar-x86_64.AppImage \
+            --endpoint-url https://nyc3.digitaloceanspaces.com \
+            --acl public-read

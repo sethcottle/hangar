@@ -7,4 +7,4 @@ Terminal=false
 Type=Application
 Categories=Network;InstantMessaging;GTK;
 Keywords=bluesky;social;atproto;
-StartupWMClass=io.github.sethcottle.Hangar
+StartupNotify=true

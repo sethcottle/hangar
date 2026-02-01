@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MPL-2.0
+#![allow(clippy::collapsible_if)]
 
 use crate::ui::avatar_cache;
 use gtk4::glib;

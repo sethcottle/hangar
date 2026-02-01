@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MPL-2.0
+#![allow(clippy::collapsible_if)]
 
 use crate::atproto::types::{
     ChatMessage, Conversation, Embed, ExternalEmbed, ImageEmbed, Notification, Post, Profile,
@@ -895,7 +896,7 @@ impl HangarClient {
 
                         // We'll need to fetch the display name separately
                         // For now, use the rkey from URI as a fallback name
-                        let display_name = uri.split('/').last().unwrap_or("Feed").to_string();
+                        let display_name = uri.split('/').next_back().unwrap_or("Feed").to_string();
 
                         feeds.push(SavedFeed {
                             feed_type,
@@ -917,7 +918,7 @@ impl HangarClient {
             .collect();
 
         if !feed_uris.is_empty() {
-            if let Ok(generators) = self.get_feed_generators_internal(&agent, &feed_uris).await {
+            if let Ok(generators) = self.get_feed_generators_internal(agent, &feed_uris).await {
                 for (uri, name, description) in generators {
                     if let Some(feed) = feeds.iter_mut().find(|f| f.uri == uri) {
                         feed.display_name = name;

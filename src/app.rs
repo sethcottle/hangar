@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MPL-2.0
+#![allow(clippy::collapsible_if)]
 
 use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;

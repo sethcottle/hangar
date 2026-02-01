@@ -1,4 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
+#![allow(clippy::type_complexity)]
+#![allow(clippy::option_map_unit_fn)]
+#![allow(clippy::collapsible_if)]
+#![allow(clippy::collapsible_else_if)]
 
 use super::post_row::PostRow;
 use super::sidebar::Sidebar;
@@ -498,7 +502,9 @@ impl HangarWindow {
         });
 
         factory.connect_bind(glib::clone!(
-            @strong self as win => move |_, item| {
+            #[strong(rename_to = win)]
+            self,
+            move |_, item| {
                 if let Some(list_item) = item.downcast_ref::<gtk4::ListItem>()
                     && let Some(post_object) = list_item.item().and_downcast::<PostObject>()
                     && let Some(post) = post_object.post()
@@ -514,35 +520,48 @@ impl HangarWindow {
                         // If it wasn't liked, we're liking, so pass None
                         post_with_state.viewer_like = if was_liked { like_uri } else { None };
                         let row_weak = row.downgrade();
-                        w.imp().like_callback.borrow().as_ref().map(|cb| cb(post_with_state, row_weak));
+                        if let Some(cb) = w.imp().like_callback.borrow().as_ref() {
+                            cb(post_with_state, row_weak);
+                        }
                     });
                     // Repost callback receives (post_row, was_reposted, repost_uri) captured before toggle
                     let post_for_repost = post.clone();
                     let w = win.clone();
                     post_row.connect_repost_clicked(move |row, was_reposted, repost_uri| {
                         let mut post_with_state = post_for_repost.clone();
-                        post_with_state.viewer_repost = if was_reposted { repost_uri } else { None };
+                        post_with_state.viewer_repost =
+                            if was_reposted { repost_uri } else { None };
                         let row_weak = row.downgrade();
-                        w.imp().repost_callback.borrow().as_ref().map(|cb| cb(post_with_state, row_weak));
+                        if let Some(cb) = w.imp().repost_callback.borrow().as_ref() {
+                            cb(post_with_state, row_weak);
+                        }
                     });
                     let post_for_quote = post.clone();
                     let w = win.clone();
                     post_row.connect_quote_clicked(move || {
-                        w.imp().quote_callback.borrow().as_ref().map(|cb| cb(post_for_quote.clone()));
+                        if let Some(cb) = w.imp().quote_callback.borrow().as_ref() {
+                            cb(post_for_quote.clone());
+                        }
                     });
                     let post_clone = post.clone();
                     let w = win.clone();
                     post_row.connect_reply_clicked(move || {
-                        w.imp().reply_callback.borrow().as_ref().map(|cb| cb(post_clone.clone()));
+                        if let Some(cb) = w.imp().reply_callback.borrow().as_ref() {
+                            cb(post_clone.clone());
+                        }
                     });
                     // Navigation callbacks
                     let w = win.clone();
                     post_row.set_post_clicked_callback(move |p| {
-                        w.imp().post_clicked_callback.borrow().as_ref().map(|cb| cb(p));
+                        if let Some(cb) = w.imp().post_clicked_callback.borrow().as_ref() {
+                            cb(p);
+                        }
                     });
                     let w = win.clone();
                     post_row.set_profile_clicked_callback(move |profile| {
-                        w.imp().profile_clicked_callback.borrow().as_ref().map(|cb| cb(profile));
+                        if let Some(cb) = w.imp().profile_clicked_callback.borrow().as_ref() {
+                            cb(profile);
+                        }
                     });
                 }
             }
@@ -601,14 +620,16 @@ impl HangarWindow {
 
         let adj = scrolled.vadjustment();
         adj.connect_value_changed(glib::clone!(
-            @weak self as win => move |adj| {
+            #[weak(rename_to = win)]
+            self,
+            move |adj| {
                 let value = adj.value();
                 let upper = adj.upper();
                 let page_size = adj.page_size();
-                if value >= upper - page_size - 200.0 {
-                    if let Some(cb) = win.imp().load_more_callback.borrow().as_ref() {
-                        cb();
-                    }
+                if value >= upper - page_size - 200.0
+                    && let Some(cb) = win.imp().load_more_callback.borrow().as_ref()
+                {
+                    cb();
                 }
             }
         ));
@@ -651,7 +672,9 @@ impl HangarWindow {
         if let Some(sidebar) = self.imp().sidebar.borrow().as_ref() {
             let win = self.clone();
             sidebar.connect_compose_clicked(move || {
-                win.imp().compose_callback.borrow().as_ref().map(|cb| cb());
+                if let Some(cb) = win.imp().compose_callback.borrow().as_ref() {
+                    cb();
+                }
             });
         }
     }
@@ -1344,14 +1367,16 @@ impl HangarWindow {
         // Infinite scroll
         let adj = scrolled.vadjustment();
         adj.connect_value_changed(glib::clone!(
-            @weak self as win => move |adj| {
+            #[weak(rename_to = win)]
+            self,
+            move |adj| {
                 let value = adj.value();
                 let upper = adj.upper();
                 let page_size = adj.page_size();
-                if value >= upper - page_size - 200.0 {
-                    if let Some(cb) = win.imp().mentions_load_more_callback.borrow().as_ref() {
-                        cb();
-                    }
+                if value >= upper - page_size - 200.0
+                    && let Some(cb) = win.imp().mentions_load_more_callback.borrow().as_ref()
+                {
+                    cb();
                 }
             }
         ));
@@ -1518,14 +1543,16 @@ impl HangarWindow {
         // Infinite scroll
         let adj = scrolled.vadjustment();
         adj.connect_value_changed(glib::clone!(
-            @weak self as win => move |adj| {
+            #[weak(rename_to = win)]
+            self,
+            move |adj| {
                 let value = adj.value();
                 let upper = adj.upper();
                 let page_size = adj.page_size();
-                if value >= upper - page_size - 200.0 {
-                    if let Some(cb) = win.imp().activity_load_more_callback.borrow().as_ref() {
-                        cb();
-                    }
+                if value >= upper - page_size - 200.0
+                    && let Some(cb) = win.imp().activity_load_more_callback.borrow().as_ref()
+                {
+                    cb();
                 }
             }
         ));
@@ -2591,7 +2618,12 @@ impl HangarWindow {
     }
 
     /// Show a toast with an action button
-    pub fn show_toast_with_action(&self, message: &str, button_label: &str, action: impl Fn() + 'static) {
+    pub fn show_toast_with_action(
+        &self,
+        message: &str,
+        button_label: &str,
+        action: impl Fn() + 'static,
+    ) {
         if let Some(overlay) = self.imp().toast_overlay.borrow().as_ref() {
             let toast = adw::Toast::new(message);
             toast.set_timeout(5); // 5 seconds for actionable toasts
