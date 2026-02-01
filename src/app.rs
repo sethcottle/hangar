@@ -48,6 +48,10 @@ mod imp {
         /// Likes state
         pub likes_cursor: RefCell<Option<String>>,
         pub likes_loading_more: RefCell<bool>,
+        /// Search state
+        pub search_query: RefCell<Option<String>>,
+        pub search_cursor: RefCell<Option<String>>,
+        pub search_loading_more: RefCell<bool>,
     }
 
     #[glib::object_subclass]
@@ -197,6 +201,16 @@ mod imp {
             let app_clone = app.clone();
             window.set_likes_load_more_callback(move || {
                 app_clone.fetch_likes_more();
+            });
+
+            let app_clone = app.clone();
+            window.set_search_load_more_callback(move || {
+                app_clone.fetch_search_more();
+            });
+
+            let app_clone = app.clone();
+            window.set_search_callback(move |query| {
+                app_clone.execute_search(query);
             });
 
             window.present();
@@ -1148,8 +1162,9 @@ impl HangarApplication {
             NavItem::Likes => {
                 self.open_likes_view();
             }
-            // Search not yet implemented
-            NavItem::Search => {}
+            NavItem::Search => {
+                self.open_search_view();
+            }
         }
     }
 
@@ -1723,6 +1738,133 @@ impl HangarApplication {
         });
     }
 
+    /// Open the search view
+    fn open_search_view(&self) {
+        // Switch to search page
+        if let Some(window) = self.imp().window.borrow().as_ref() {
+            window.show_search_page();
+            window.focus_search_entry();
+        }
+    }
+
+    /// Execute a search with the given query
+    fn execute_search(&self, query: String) {
+        // Clear previous results and reset state
+        self.imp().search_query.replace(Some(query.clone()));
+        self.imp().search_cursor.replace(None);
+        self.imp().search_loading_more.replace(false);
+
+        if let Some(window) = self.imp().window.borrow().as_ref() {
+            window.clear_search_results();
+            window.set_search_loading(true);
+        }
+
+        self.fetch_search(&query);
+    }
+
+    /// Fetch search results
+    fn fetch_search(&self, query: &str) {
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(Vec<Post>, Option<String>), String>>();
+        let client = self.client();
+        let query = query.to_string();
+
+        thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async { client.search_posts(&query, None).await });
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+
+        let app = self.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            match rx.try_recv() {
+                Ok(Ok((posts, next_cursor))) => {
+                    app.imp().search_cursor.replace(next_cursor);
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.set_search_loading(false);
+                        window.set_search_results(posts);
+                    }
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(e)) => {
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.set_search_loading(false);
+                    }
+                    eprintln!("Failed to search: {}", e);
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.set_search_loading(false);
+                    }
+                    eprintln!("Failed to search: connection lost");
+                    glib::ControlFlow::Break
+                }
+            }
+        });
+    }
+
+    /// Fetch more search results for infinite scroll
+    fn fetch_search_more(&self) {
+        if *self.imp().search_loading_more.borrow() {
+            return;
+        }
+        let cursor = match self.imp().search_cursor.borrow().as_ref() {
+            Some(c) => c.clone(),
+            None => return,
+        };
+        let query = match self.imp().search_query.borrow().as_ref() {
+            Some(q) => q.clone(),
+            None => return,
+        };
+        self.imp().search_loading_more.replace(true);
+
+        if let Some(window) = self.imp().window.borrow().as_ref() {
+            window.set_search_loading(true);
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(Vec<Post>, Option<String>), String>>();
+        let client = self.client();
+
+        thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(async { client.search_posts(&query, Some(&cursor)).await });
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+
+        let app = self.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            match rx.try_recv() {
+                Ok(Ok((posts, next_cursor))) => {
+                    app.imp().search_loading_more.replace(false);
+                    app.imp().search_cursor.replace(next_cursor);
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.set_search_loading(false);
+                        if !posts.is_empty() {
+                            window.append_search_results(posts);
+                        }
+                    }
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(e)) => {
+                    app.imp().search_loading_more.replace(false);
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.set_search_loading(false);
+                    }
+                    eprintln!("Failed to fetch more search results: {}", e);
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    app.imp().search_loading_more.replace(false);
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.set_search_loading(false);
+                    }
+                    glib::ControlFlow::Break
+                }
+            }
+        });
+    }
 }
 
 impl Default for HangarApplication {

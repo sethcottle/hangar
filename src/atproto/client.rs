@@ -1487,6 +1487,106 @@ impl HangarClient {
             muted: convo.data.muted,
         }
     }
+
+    /// Search posts by query string
+    #[allow(clippy::await_holding_lock)]
+    pub async fn search_posts(
+        &self,
+        query: &str,
+        cursor: Option<&str>,
+    ) -> Result<(Vec<Post>, Option<String>), ClientError> {
+        let agent_guard = self.agent.read().unwrap();
+        let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
+
+        let params = atrium_api::app::bsky::feed::search_posts::ParametersData {
+            q: query.to_string(),
+            author: None,
+            cursor: cursor.map(String::from),
+            domain: None,
+            lang: None,
+            limit: None,
+            mentions: None,
+            since: None,
+            sort: None,
+            tag: None,
+            until: None,
+            url: None,
+        };
+
+        let output = agent
+            .api
+            .app
+            .bsky
+            .feed
+            .search_posts(params.into())
+            .await
+            .map_err(|e| ClientError::Network(e.to_string()))?;
+
+        let posts: Vec<Post> = output
+            .data
+            .posts
+            .into_iter()
+            .map(|post_view| self.convert_post_view(&post_view))
+            .collect();
+
+        Ok((posts, output.data.cursor))
+    }
+
+    /// Search actors (users) by query string
+    #[allow(clippy::await_holding_lock)]
+    pub async fn search_actors(
+        &self,
+        query: &str,
+        cursor: Option<&str>,
+    ) -> Result<(Vec<Profile>, Option<String>), ClientError> {
+        let agent_guard = self.agent.read().unwrap();
+        let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
+
+        let params = atrium_api::app::bsky::actor::search_actors::ParametersData {
+            q: Some(query.to_string()),
+            cursor: cursor.map(String::from),
+            limit: None,
+            term: None,
+        };
+
+        let output = agent
+            .api
+            .app
+            .bsky
+            .actor
+            .search_actors(params.into())
+            .await
+            .map_err(|e| ClientError::Network(e.to_string()))?;
+
+        let actors: Vec<Profile> = output
+            .data
+            .actors
+            .into_iter()
+            .map(|actor| Profile {
+                did: actor.data.did.to_string(),
+                handle: actor.data.handle.to_string(),
+                display_name: actor.data.display_name.clone(),
+                avatar: actor.data.avatar.clone(),
+                banner: None,
+                description: actor.data.description.clone(),
+                followers_count: None,
+                following_count: None,
+                posts_count: None,
+                viewer_following: actor
+                    .data
+                    .viewer
+                    .as_ref()
+                    .and_then(|v| v.data.following.clone()),
+                viewer_followed_by: actor
+                    .data
+                    .viewer
+                    .as_ref()
+                    .and_then(|v| v.data.followed_by.clone()),
+            })
+            .collect();
+
+        Ok((actors, output.data.cursor))
+    }
 }
 
 impl Default for HangarClient {

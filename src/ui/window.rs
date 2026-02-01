@@ -210,6 +210,14 @@ mod imp {
         pub likes_load_more_callback: RefCell<Option<Box<dyn Fn() + 'static>>>,
         pub likes_scrolled_window: RefCell<Option<gtk4::ScrolledWindow>>,
         pub likes_spinner: RefCell<Option<gtk4::Spinner>>,
+        // Search page state
+        pub search_nav_view: RefCell<Option<adw::NavigationView>>,
+        pub search_model: RefCell<Option<gio::ListStore>>,
+        pub search_load_more_callback: RefCell<Option<Box<dyn Fn() + 'static>>>,
+        pub search_scrolled_window: RefCell<Option<gtk4::ScrolledWindow>>,
+        pub search_spinner: RefCell<Option<gtk4::Spinner>>,
+        pub search_entry: RefCell<Option<gtk4::SearchEntry>>,
+        pub search_callback: RefCell<Option<Box<dyn Fn(String) + 'static>>>,
     }
 
     #[glib::object_subclass]
@@ -300,6 +308,12 @@ impl HangarWindow {
         likes_nav_view.add(&likes_page);
         main_stack.add_named(&likes_nav_view, Some("likes"));
 
+        // Search section: NavigationView for search results
+        let search_nav_view = adw::NavigationView::new();
+        let search_page = self.build_search_page();
+        search_nav_view.add(&search_page);
+        main_stack.add_named(&search_nav_view, Some("search"));
+
         main_box.append(&main_stack);
 
         self.set_content(Some(&main_box));
@@ -313,6 +327,7 @@ impl HangarWindow {
         imp.chat_nav_view.replace(Some(chat_nav_view));
         imp.profile_nav_view.replace(Some(profile_nav_view));
         imp.likes_nav_view.replace(Some(likes_nav_view));
+        imp.search_nav_view.replace(Some(search_nav_view));
 
         // Add keyboard shortcuts
         self.setup_shortcuts();
@@ -836,6 +851,7 @@ impl HangarWindow {
             "chat" => "chat",
             "profile" => "own-profile",
             "likes" => "likes",
+            "search" => "search",
             _ => return,
         };
 
@@ -857,6 +873,7 @@ impl HangarWindow {
             "chat" => self.imp().chat_nav_view.borrow().clone(),
             "profile" => self.imp().profile_nav_view.borrow().clone(),
             "likes" => self.imp().likes_nav_view.borrow().clone(),
+            "search" => self.imp().search_nav_view.borrow().clone(),
             _ => self.imp().home_nav_view.borrow().clone(),
         }
     }
@@ -2277,6 +2294,243 @@ impl HangarWindow {
             .replace(Some(Box::new(callback)));
     }
 
+    // ======== Search Page ========
+
+    fn build_search_page(&self) -> adw::NavigationPage {
+        let content_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        content_box.set_hexpand(true);
+
+        let header = adw::HeaderBar::new();
+        header.set_show_start_title_buttons(false);
+        header.set_show_end_title_buttons(false);
+
+        let title = gtk4::Label::new(Some("Search"));
+        title.add_css_class("title");
+        header.set_title_widget(Some(&title));
+
+        let close_btn = gtk4::Button::from_icon_name("window-close-symbolic");
+        close_btn.set_tooltip_text(Some("Close"));
+        close_btn.connect_clicked(glib::clone!(
+            #[weak(rename_to = window)]
+            self,
+            move |_| {
+                window.close();
+            }
+        ));
+        header.pack_end(&close_btn);
+
+        content_box.append(&header);
+        content_box.append(&self.build_search_content());
+
+        let page = adw::NavigationPage::new(&content_box, "Search");
+        page.set_tag(Some("search"));
+        page
+    }
+
+    /// Build the search content (search bar + results list)
+    fn build_search_content(&self) -> gtk4::Box {
+        let search_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        search_box.set_vexpand(true);
+
+        // Search entry
+        let search_entry = gtk4::SearchEntry::new();
+        search_entry.set_placeholder_text(Some("Search posts…"));
+        search_entry.set_margin_start(12);
+        search_entry.set_margin_end(12);
+        search_entry.set_margin_top(12);
+        search_entry.set_margin_bottom(12);
+
+        // Connect search activation (Enter key)
+        let win = self.clone();
+        search_entry.connect_activate(move |entry| {
+            let query = entry.text().to_string();
+            if !query.is_empty() {
+                if let Some(cb) = win.imp().search_callback.borrow().as_ref() {
+                    cb(query);
+                }
+            }
+        });
+
+        search_box.append(&search_entry);
+
+        // Store search entry reference
+        self.imp().search_entry.replace(Some(search_entry));
+
+        // Results list in overlay (for spinner)
+        let overlay = gtk4::Overlay::new();
+        overlay.set_vexpand(true);
+
+        let model = gio::ListStore::new::<PostObject>();
+        let factory = gtk4::SignalListItemFactory::new();
+
+        factory.connect_setup(|_, item| {
+            let post_row = PostRow::new();
+            if let Some(list_item) = item.downcast_ref::<gtk4::ListItem>() {
+                list_item.set_child(Some(&post_row));
+            }
+        });
+
+        let win = self.clone();
+        factory.connect_bind(move |_, item| {
+            if let Some(list_item) = item.downcast_ref::<gtk4::ListItem>()
+                && let Some(post_object) = list_item.item().and_downcast::<PostObject>()
+                && let Some(post) = post_object.post()
+                && let Some(post_row) = list_item.child().and_downcast::<PostRow>()
+            {
+                post_row.bind(&post);
+                let post_for_like = post.clone();
+                let w = win.clone();
+                post_row.connect_like_clicked(move |row, was_liked, like_uri| {
+                    let mut post_with_state = post_for_like.clone();
+                    post_with_state.viewer_like = if was_liked { like_uri } else { None };
+                    let row_weak = row.downgrade();
+                    w.imp()
+                        .like_callback
+                        .borrow()
+                        .as_ref()
+                        .map(|cb| cb(post_with_state, row_weak));
+                });
+                let post_for_repost = post.clone();
+                let w = win.clone();
+                post_row.connect_repost_clicked(move |row, was_reposted, repost_uri| {
+                    let mut post_with_state = post_for_repost.clone();
+                    post_with_state.viewer_repost = if was_reposted { repost_uri } else { None };
+                    let row_weak = row.downgrade();
+                    w.imp()
+                        .repost_callback
+                        .borrow()
+                        .as_ref()
+                        .map(|cb| cb(post_with_state, row_weak));
+                });
+                let post_for_quote = post.clone();
+                let w = win.clone();
+                post_row.connect_quote_clicked(move || {
+                    w.imp()
+                        .quote_callback
+                        .borrow()
+                        .as_ref()
+                        .map(|cb| cb(post_for_quote.clone()));
+                });
+                let post_clone = post.clone();
+                let w = win.clone();
+                post_row.connect_reply_clicked(move || {
+                    w.imp()
+                        .reply_callback
+                        .borrow()
+                        .as_ref()
+                        .map(|cb| cb(post_clone.clone()));
+                });
+                // Navigation callbacks for posts in search results
+                let w = win.clone();
+                post_row.set_post_clicked_callback(move |p| {
+                    w.imp()
+                        .post_clicked_callback
+                        .borrow()
+                        .as_ref()
+                        .map(|cb| cb(p));
+                });
+            }
+        });
+
+        let selection = gtk4::NoSelection::new(Some(model.clone()));
+        let list_view = gtk4::ListView::new(Some(selection), Some(factory));
+        list_view.add_css_class("background");
+
+        let scrolled = gtk4::ScrolledWindow::new();
+        scrolled.set_vexpand(true);
+        scrolled.set_child(Some(&list_view));
+        overlay.set_child(Some(&scrolled));
+
+        // Loading spinner
+        let spinner = gtk4::Spinner::new();
+        spinner.set_visible(false);
+        spinner.set_halign(gtk4::Align::Center);
+        spinner.set_valign(gtk4::Align::End);
+        spinner.set_margin_bottom(16);
+        overlay.add_overlay(&spinner);
+
+        search_box.append(&overlay);
+
+        // Store references
+        let imp = self.imp();
+        imp.search_model.replace(Some(model));
+        imp.search_scrolled_window.replace(Some(scrolled.clone()));
+        imp.search_spinner.replace(Some(spinner));
+
+        // Infinite scroll
+        let adj = scrolled.vadjustment();
+        let win = self.clone();
+        adj.connect_value_changed(move |adj| {
+            let value = adj.value();
+            let upper = adj.upper();
+            let page_size = adj.page_size();
+            if value >= upper - page_size - 200.0 {
+                if let Some(cb) = win.imp().search_load_more_callback.borrow().as_ref() {
+                    cb();
+                }
+            }
+        });
+
+        search_box
+    }
+
+    /// Show the search page (top-level navigation, instant switch)
+    pub fn show_search_page(&self) {
+        self.switch_to_page("search");
+    }
+
+    /// Set search results in the search list
+    pub fn set_search_results(&self, posts: Vec<Post>) {
+        if let Some(model) = self.imp().search_model.borrow().as_ref() {
+            model.remove_all();
+            for post in posts {
+                model.append(&PostObject::new(post));
+            }
+        }
+    }
+
+    /// Append more search results to the list
+    pub fn append_search_results(&self, posts: Vec<Post>) {
+        if let Some(model) = self.imp().search_model.borrow().as_ref() {
+            for post in posts {
+                model.append(&PostObject::new(post));
+            }
+        }
+    }
+
+    /// Set loading state for search page
+    pub fn set_search_loading(&self, loading: bool) {
+        if let Some(spinner) = self.imp().search_spinner.borrow().as_ref() {
+            spinner.set_visible(loading);
+            spinner.set_spinning(loading);
+        }
+    }
+
+    /// Set callback for loading more search results
+    pub fn set_search_load_more_callback<F: Fn() + 'static>(&self, callback: F) {
+        self.imp()
+            .search_load_more_callback
+            .replace(Some(Box::new(callback)));
+    }
+
+    /// Set callback for when a search is submitted
+    pub fn set_search_callback<F: Fn(String) + 'static>(&self, callback: F) {
+        self.imp().search_callback.replace(Some(Box::new(callback)));
+    }
+
+    /// Clear search results
+    pub fn clear_search_results(&self) {
+        if let Some(model) = self.imp().search_model.borrow().as_ref() {
+            model.remove_all();
+        }
+    }
+
+    /// Focus the search entry
+    pub fn focus_search_entry(&self) {
+        if let Some(entry) = self.imp().search_entry.borrow().as_ref() {
+            entry.grab_focus();
+        }
+    }
 }
 
 /// A row widget for displaying a mention/notification
