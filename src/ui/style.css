@@ -207,3 +207,36 @@ popover.menu > contents {
     margin: 0;
 }
 
+/* Activity row styling */
+.activity-row {
+    padding: 4px 0;
+}
+
+/* Activity badge overlay on avatar */
+.activity-badge {
+    background-color: @window_bg_color;
+    border-radius: 50%;
+    padding: 2px;
+    margin: -4px;
+}
+
+.activity-badge.liked {
+    color: #f91880;
+}
+
+.activity-badge.reposted {
+    color: #00ba7c;
+}
+
+.activity-badge.followed {
+    color: @accent_color;
+}
+
+/* Activity embedded post card */
+.activity-row .card {
+    background-color: alpha(@card_bg_color, 0.4);
+    border: 1px solid alpha(@borders, 0.3);
+    border-radius: 12px;
+    padding: 0;
+}
+

@@ -133,6 +133,12 @@ mod imp {
         pub mentions_load_more_callback: RefCell<Option<Box<dyn Fn() + 'static>>>,
         pub mentions_scrolled_window: RefCell<Option<gtk4::ScrolledWindow>>,
         pub mentions_spinner: RefCell<Option<gtk4::Spinner>>,
+        // Activity page state
+        pub activity_nav_view: RefCell<Option<adw::NavigationView>>,
+        pub activity_model: RefCell<Option<gio::ListStore>>,
+        pub activity_load_more_callback: RefCell<Option<Box<dyn Fn() + 'static>>>,
+        pub activity_scrolled_window: RefCell<Option<gtk4::ScrolledWindow>>,
+        pub activity_spinner: RefCell<Option<gtk4::Spinner>>,
     }
 
     #[glib::object_subclass]
@@ -199,6 +205,12 @@ impl HangarWindow {
         mentions_nav_view.add(&mentions_page);
         main_stack.add_named(&mentions_nav_view, Some("mentions"));
 
+        // Activity section: NavigationView for thread/profile drill-down
+        let activity_nav_view = adw::NavigationView::new();
+        let activity_page = self.build_activity_page();
+        activity_nav_view.add(&activity_page);
+        main_stack.add_named(&activity_nav_view, Some("activity"));
+
         main_box.append(&main_stack);
 
         self.set_content(Some(&main_box));
@@ -208,6 +220,7 @@ impl HangarWindow {
         imp.main_stack.replace(Some(main_stack));
         imp.home_nav_view.replace(Some(home_nav_view));
         imp.mentions_nav_view.replace(Some(mentions_nav_view));
+        imp.activity_nav_view.replace(Some(activity_nav_view));
 
         // Add keyboard shortcuts
         self.setup_shortcuts();
@@ -722,6 +735,7 @@ impl HangarWindow {
         let root_tag = match visible_name.as_str() {
             "home" => "timeline",
             "mentions" => "mentions",
+            "activity" => "activity",
             _ => return,
         };
 
@@ -739,6 +753,7 @@ impl HangarWindow {
         match visible_name.as_str() {
             "home" => self.imp().home_nav_view.borrow().clone(),
             "mentions" => self.imp().mentions_nav_view.borrow().clone(),
+            "activity" => self.imp().activity_nav_view.borrow().clone(),
             _ => self.imp().home_nav_view.borrow().clone(),
         }
     }
@@ -1243,6 +1258,169 @@ impl HangarWindow {
             .replace(Some(Box::new(callback)));
     }
 
+    /// Build the activity page
+    fn build_activity_page(&self) -> adw::NavigationPage {
+        let content_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        content_box.set_hexpand(true);
+
+        let header = adw::HeaderBar::new();
+        header.set_show_start_title_buttons(false);
+        header.set_show_end_title_buttons(false);
+
+        let title = gtk4::Label::new(Some("Activity"));
+        title.add_css_class("title");
+        header.set_title_widget(Some(&title));
+
+        let close_btn = gtk4::Button::from_icon_name("window-close-symbolic");
+        close_btn.set_tooltip_text(Some("Close"));
+        close_btn.connect_clicked(glib::clone!(
+            #[weak(rename_to = window)]
+            self,
+            move |_| {
+                window.close();
+            }
+        ));
+        header.pack_end(&close_btn);
+
+        content_box.append(&header);
+        content_box.append(&self.build_activity_list());
+
+        let page = adw::NavigationPage::new(&content_box, "Activity");
+        page.set_tag(Some("activity"));
+        page
+    }
+
+    /// Build the activity list widget
+    fn build_activity_list(&self) -> gtk4::Box {
+        let activity_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        activity_box.set_vexpand(true);
+
+        let overlay = gtk4::Overlay::new();
+        overlay.set_vexpand(true);
+
+        let model = gio::ListStore::new::<NotificationObject>();
+        let factory = gtk4::SignalListItemFactory::new();
+
+        factory.connect_setup(|_, item| {
+            let row = ActivityRow::new();
+            if let Some(list_item) = item.downcast_ref::<gtk4::ListItem>() {
+                list_item.set_child(Some(&row));
+            }
+        });
+
+        let win = self.clone();
+        factory.connect_bind(move |_, item| {
+            if let Some(list_item) = item.downcast_ref::<gtk4::ListItem>()
+                && let Some(notif_object) = list_item.item().and_downcast::<NotificationObject>()
+                && let Some(notif) = notif_object.notification()
+                && let Some(row) = list_item.child().and_downcast::<ActivityRow>()
+            {
+                row.bind(&notif);
+                // Connect profile click
+                let profile = notif.author.clone();
+                let w = win.clone();
+                row.connect_profile_clicked(move |_| {
+                    w.imp()
+                        .profile_clicked_callback
+                        .borrow()
+                        .as_ref()
+                        .map(|cb| cb(profile.clone()));
+                });
+                // Connect post click (if there's an associated post)
+                if let Some(post) = notif.post.clone() {
+                    let w = win.clone();
+                    row.connect_clicked(move |_| {
+                        w.imp()
+                            .post_clicked_callback
+                            .borrow()
+                            .as_ref()
+                            .map(|cb| cb(post.clone()));
+                    });
+                }
+            }
+        });
+
+        let selection = gtk4::NoSelection::new(Some(model.clone()));
+        let list_view = gtk4::ListView::new(Some(selection), Some(factory));
+        list_view.add_css_class("background");
+
+        let scrolled = gtk4::ScrolledWindow::new();
+        scrolled.set_vexpand(true);
+        scrolled.set_child(Some(&list_view));
+        overlay.set_child(Some(&scrolled));
+
+        // Loading spinner
+        let spinner = gtk4::Spinner::new();
+        spinner.set_visible(false);
+        spinner.set_halign(gtk4::Align::Center);
+        spinner.set_valign(gtk4::Align::End);
+        spinner.set_margin_bottom(16);
+        overlay.add_overlay(&spinner);
+
+        activity_box.append(&overlay);
+
+        let imp = self.imp();
+        imp.activity_model.replace(Some(model));
+        imp.activity_scrolled_window.replace(Some(scrolled.clone()));
+        imp.activity_spinner.replace(Some(spinner));
+
+        // Infinite scroll
+        let adj = scrolled.vadjustment();
+        adj.connect_value_changed(glib::clone!(
+            @weak self as win => move |adj| {
+                let value = adj.value();
+                let upper = adj.upper();
+                let page_size = adj.page_size();
+                if value >= upper - page_size - 200.0 {
+                    if let Some(cb) = win.imp().activity_load_more_callback.borrow().as_ref() {
+                        cb();
+                    }
+                }
+            }
+        ));
+
+        activity_box
+    }
+
+    /// Show the activity page (top-level navigation, instant switch)
+    pub fn show_activity_page(&self) {
+        self.switch_to_page("activity");
+    }
+
+    /// Set notifications in the activity list
+    pub fn set_activity(&self, notifications: Vec<Notification>) {
+        if let Some(model) = self.imp().activity_model.borrow().as_ref() {
+            model.remove_all();
+            for notif in notifications {
+                model.append(&NotificationObject::new(notif));
+            }
+        }
+    }
+
+    /// Append more notifications to the activity list
+    pub fn append_activity(&self, notifications: Vec<Notification>) {
+        if let Some(model) = self.imp().activity_model.borrow().as_ref() {
+            for notif in notifications {
+                model.append(&NotificationObject::new(notif));
+            }
+        }
+    }
+
+    /// Set loading state for activity
+    pub fn set_activity_loading(&self, loading: bool) {
+        if let Some(spinner) = self.imp().activity_spinner.borrow().as_ref() {
+            spinner.set_visible(loading);
+            spinner.set_spinning(loading);
+        }
+    }
+
+    /// Set callback for loading more activity
+    pub fn set_activity_load_more_callback<F: Fn() + 'static>(&self, callback: F) {
+        self.imp()
+            .activity_load_more_callback
+            .replace(Some(Box::new(callback)));
+    }
+
     /// Set callback for nav item changes
     pub fn set_nav_changed_callback<F: Fn(crate::ui::sidebar::NavItem) + 'static>(
         &self,
@@ -1526,3 +1704,355 @@ mod mention_row {
 }
 
 use mention_row::MentionRow;
+
+/// A row widget for displaying activity notifications (likes, follows, reposts, etc.)
+mod activity_row {
+    use super::*;
+    use crate::atproto::Notification;
+    use crate::ui::avatar_cache;
+
+    mod imp {
+        use super::*;
+        use std::cell::RefCell;
+
+        #[derive(Default)]
+        pub struct ActivityRow {
+            pub avatar: RefCell<Option<adw::Avatar>>,
+            pub badge_icon: RefCell<Option<gtk4::Image>>,
+            pub action_label: RefCell<Option<gtk4::Label>>,
+            pub time_label: RefCell<Option<gtk4::Label>>,
+            pub post_card: RefCell<Option<gtk4::Box>>,
+            pub post_author_avatar: RefCell<Option<adw::Avatar>>,
+            pub post_author_label: RefCell<Option<gtk4::Label>>,
+            pub post_text_label: RefCell<Option<gtk4::Label>>,
+            pub post_time_label: RefCell<Option<gtk4::Label>>,
+            pub profile_clicked_callback:
+                RefCell<Option<Box<dyn Fn(&super::ActivityRow) + 'static>>>,
+            pub clicked_callback: RefCell<Option<Box<dyn Fn(&super::ActivityRow) + 'static>>>,
+        }
+
+        #[glib::object_subclass]
+        impl ObjectSubclass for ActivityRow {
+            const NAME: &'static str = "HangarActivityRow";
+            type Type = super::ActivityRow;
+            type ParentType = gtk4::Box;
+        }
+
+        impl ObjectImpl for ActivityRow {
+            fn constructed(&self) {
+                self.parent_constructed();
+                let obj = self.obj();
+                obj.setup_ui();
+            }
+        }
+
+        impl WidgetImpl for ActivityRow {}
+        impl BoxImpl for ActivityRow {}
+    }
+
+    glib::wrapper! {
+        pub struct ActivityRow(ObjectSubclass<imp::ActivityRow>)
+            @extends gtk4::Box, gtk4::Widget,
+            @implements gtk4::Accessible, gtk4::Buildable, gtk4::ConstraintTarget, gtk4::Orientable;
+    }
+
+    impl ActivityRow {
+        pub fn new() -> Self {
+            glib::Object::builder()
+                .property("orientation", gtk4::Orientation::Vertical)
+                .property("spacing", 0)
+                .build()
+        }
+
+        fn setup_ui(&self) {
+            self.add_css_class("activity-row");
+            self.set_margin_start(12);
+            self.set_margin_end(12);
+            self.set_margin_top(12);
+            self.set_margin_bottom(12);
+
+            // Main content box (horizontal: avatar + content)
+            let main_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
+
+            // Avatar with badge overlay
+            let avatar_overlay = gtk4::Overlay::new();
+            let avatar = adw::Avatar::new(48, None, true);
+            avatar_overlay.set_child(Some(&avatar));
+
+            // Badge icon (heart for likes, person+ for follows, etc.)
+            let badge_icon = gtk4::Image::new();
+            badge_icon.set_pixel_size(20);
+            badge_icon.set_halign(gtk4::Align::End);
+            badge_icon.set_valign(gtk4::Align::End);
+            badge_icon.add_css_class("activity-badge");
+            avatar_overlay.add_overlay(&badge_icon);
+
+            // Click gesture for avatar
+            let avatar_click = gtk4::GestureClick::new();
+            let row_weak = self.downgrade();
+            avatar_click.connect_released(move |_, _, _, _| {
+                if let Some(row) = row_weak.upgrade() {
+                    if let Some(cb) = row.imp().profile_clicked_callback.borrow().as_ref() {
+                        cb(&row);
+                    }
+                }
+            });
+            avatar_overlay.add_controller(avatar_click);
+            main_box.append(&avatar_overlay);
+
+            // Content box (vertical: action text + embedded post card)
+            let content_box = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+            content_box.set_hexpand(true);
+
+            // Header: action label + time
+            let header_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+
+            let action_label = gtk4::Label::new(None);
+            action_label.set_wrap(true);
+            action_label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+            action_label.set_xalign(0.0);
+            action_label.set_hexpand(true);
+            action_label.set_halign(gtk4::Align::Start);
+            header_box.append(&action_label);
+
+            let time_label = gtk4::Label::new(None);
+            time_label.add_css_class("dim-label");
+            time_label.add_css_class("caption");
+            time_label.set_valign(gtk4::Align::Start);
+            header_box.append(&time_label);
+
+            content_box.append(&header_box);
+
+            // Embedded post card (for likes/reposts/quotes)
+            let post_card = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+            post_card.add_css_class("card");
+            post_card.set_margin_top(4);
+
+            let card_inner = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+            card_inner.set_margin_start(12);
+            card_inner.set_margin_end(12);
+            card_inner.set_margin_top(8);
+            card_inner.set_margin_bottom(8);
+
+            // Post author row
+            let post_header = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+            let post_author_avatar = adw::Avatar::new(24, None, true);
+            post_header.append(&post_author_avatar);
+
+            let post_author_label = gtk4::Label::new(None);
+            post_author_label.add_css_class("caption");
+            post_author_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+            post_header.append(&post_author_label);
+
+            let post_spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+            post_spacer.set_hexpand(true);
+            post_header.append(&post_spacer);
+
+            let post_time_label = gtk4::Label::new(None);
+            post_time_label.add_css_class("dim-label");
+            post_time_label.add_css_class("caption");
+            post_header.append(&post_time_label);
+
+            card_inner.append(&post_header);
+
+            // Post text
+            let post_text_label = gtk4::Label::new(None);
+            post_text_label.set_wrap(true);
+            post_text_label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+            post_text_label.set_xalign(0.0);
+            post_text_label.set_max_width_chars(80);
+            post_text_label.set_halign(gtk4::Align::Start);
+            card_inner.append(&post_text_label);
+
+            post_card.append(&card_inner);
+            post_card.set_visible(false); // Hidden by default
+            content_box.append(&post_card);
+
+            main_box.append(&content_box);
+
+            // Click gesture for the whole row
+            let click = gtk4::GestureClick::new();
+            let row_weak = self.downgrade();
+            click.connect_released(move |_, _, _, _| {
+                if let Some(row) = row_weak.upgrade() {
+                    if let Some(cb) = row.imp().clicked_callback.borrow().as_ref() {
+                        cb(&row);
+                    }
+                }
+            });
+            self.add_controller(click);
+
+            self.append(&main_box);
+
+            // Separator
+            let sep = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+            sep.set_margin_top(12);
+            self.append(&sep);
+
+            let imp = self.imp();
+            imp.avatar.replace(Some(avatar));
+            imp.badge_icon.replace(Some(badge_icon));
+            imp.action_label.replace(Some(action_label));
+            imp.time_label.replace(Some(time_label));
+            imp.post_card.replace(Some(post_card));
+            imp.post_author_avatar.replace(Some(post_author_avatar));
+            imp.post_author_label.replace(Some(post_author_label));
+            imp.post_text_label.replace(Some(post_text_label));
+            imp.post_time_label.replace(Some(post_time_label));
+        }
+
+        pub fn bind(&self, notification: &Notification) {
+            let imp = self.imp();
+
+            let display_name = notification
+                .author
+                .display_name
+                .as_deref()
+                .unwrap_or(&notification.author.handle);
+
+            // Avatar
+            if let Some(avatar) = imp.avatar.borrow().as_ref() {
+                avatar.set_text(Some(display_name));
+                if let Some(url) = &notification.author.avatar {
+                    avatar_cache::load_avatar(avatar.clone(), url.clone());
+                }
+            }
+
+            // Badge icon based on reason
+            let icon_name = match notification.reason.as_str() {
+                "like" => "emblem-favorite-symbolic",
+                "repost" => "media-playlist-repeat-symbolic",
+                "follow" => "system-users-symbolic",
+                "mention" => "chat-message-new-symbolic",
+                "reply" => "mail-reply-sender-symbolic",
+                "quote" => "edit-copy-symbolic",
+                _ => "dialog-information-symbolic",
+            };
+
+            if let Some(badge) = imp.badge_icon.borrow().as_ref() {
+                badge.set_icon_name(Some(icon_name));
+                // Add color class based on type
+                badge.remove_css_class("liked");
+                badge.remove_css_class("reposted");
+                badge.remove_css_class("followed");
+                match notification.reason.as_str() {
+                    "like" => badge.add_css_class("liked"),
+                    "repost" => badge.add_css_class("reposted"),
+                    "follow" => badge.add_css_class("followed"),
+                    _ => {}
+                }
+            }
+
+            // Action label - use Pango markup for bold name
+            if let Some(label) = imp.action_label.borrow().as_ref() {
+                let action_suffix = match notification.reason.as_str() {
+                    "like" => "liked your post",
+                    "repost" => "reposted your post",
+                    "follow" => "followed you",
+                    "mention" => "mentioned you",
+                    "reply" => "replied to your post",
+                    "quote" => "quoted your post",
+                    other => other,
+                };
+                // Escape display name for markup and make it bold
+                let escaped_name = glib::markup_escape_text(display_name);
+                let markup = format!("<b>{}</b> {}", escaped_name, action_suffix);
+                label.set_use_markup(true);
+                label.set_label(&markup);
+            }
+
+            // Time
+            if let Some(label) = imp.time_label.borrow().as_ref() {
+                label.set_text(&Self::format_relative_time(&notification.indexed_at));
+            }
+
+            // Show post card if there's a post
+            if let Some(post) = &notification.post {
+                if let Some(card) = imp.post_card.borrow().as_ref() {
+                    card.set_visible(true);
+                }
+
+                // Post author avatar
+                if let Some(avatar) = imp.post_author_avatar.borrow().as_ref() {
+                    let post_author_name = post
+                        .author
+                        .display_name
+                        .as_deref()
+                        .unwrap_or(&post.author.handle);
+                    avatar.set_text(Some(post_author_name));
+                    if let Some(url) = &post.author.avatar {
+                        avatar_cache::load_avatar(avatar.clone(), url.clone());
+                    }
+                }
+
+                // Post author label
+                if let Some(label) = imp.post_author_label.borrow().as_ref() {
+                    let post_author_name = post
+                        .author
+                        .display_name
+                        .as_deref()
+                        .unwrap_or(&post.author.handle);
+                    label.set_text(&format!("{} @{}", post_author_name, post.author.handle));
+                }
+
+                // Post text
+                if let Some(label) = imp.post_text_label.borrow().as_ref() {
+                    label.set_text(&post.text);
+                }
+
+                // Post time
+                if let Some(label) = imp.post_time_label.borrow().as_ref() {
+                    label.set_text(&Self::format_relative_time(&post.indexed_at));
+                }
+            } else {
+                if let Some(card) = imp.post_card.borrow().as_ref() {
+                    card.set_visible(false);
+                }
+            }
+        }
+
+        fn format_relative_time(indexed_at: &str) -> String {
+            use chrono::{DateTime, Utc};
+
+            let Ok(post_time) = DateTime::parse_from_rfc3339(indexed_at) else {
+                return String::new();
+            };
+
+            let now = Utc::now();
+            let post_utc = post_time.with_timezone(&Utc);
+            let duration = now.signed_duration_since(post_utc);
+
+            if duration.num_seconds() < 60 {
+                "now".to_string()
+            } else if duration.num_minutes() < 60 {
+                format!("{}m", duration.num_minutes())
+            } else if duration.num_hours() < 24 {
+                format!("{}h", duration.num_hours())
+            } else if duration.num_days() < 7 {
+                format!("{}d", duration.num_days())
+            } else {
+                post_time.format("%b %d").to_string()
+            }
+        }
+
+        pub fn connect_profile_clicked<F: Fn(&Self) + 'static>(&self, callback: F) {
+            self.imp()
+                .profile_clicked_callback
+                .replace(Some(Box::new(callback)));
+        }
+
+        pub fn connect_clicked<F: Fn(&Self) + 'static>(&self, callback: F) {
+            self.imp()
+                .clicked_callback
+                .replace(Some(Box::new(callback)));
+        }
+    }
+
+    impl Default for ActivityRow {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+}
+
+use activity_row::ActivityRow;

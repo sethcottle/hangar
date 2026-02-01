@@ -34,6 +34,9 @@ mod imp {
         /// Mentions state
         pub mentions_cursor: RefCell<Option<String>>,
         pub mentions_loading_more: RefCell<bool>,
+        /// Activity state
+        pub activity_cursor: RefCell<Option<String>>,
+        pub activity_loading_more: RefCell<bool>,
     }
 
     #[glib::object_subclass]
@@ -158,6 +161,11 @@ mod imp {
             let app_clone = app.clone();
             window.set_mentions_load_more_callback(move || {
                 app_clone.fetch_mentions_more();
+            });
+
+            let app_clone = app.clone();
+            window.set_activity_load_more_callback(move || {
+                app_clone.fetch_activity_more();
             });
 
             window.present();
@@ -1089,6 +1097,9 @@ impl HangarApplication {
             NavItem::Mentions => {
                 self.open_mentions_view();
             }
+            NavItem::Activity => {
+                self.open_activity_view();
+            }
             // Other nav items not yet implemented
             _ => {}
         }
@@ -1194,6 +1205,116 @@ impl HangarApplication {
                     app.imp().mentions_loading_more.replace(false);
                     if let Some(window) = app.imp().window.borrow().as_ref() {
                         window.set_mentions_loading(false);
+                    }
+                    glib::ControlFlow::Break
+                }
+            }
+        });
+    }
+
+    /// Open the activity view
+    fn open_activity_view(&self) {
+        // Switch to activity page (instant, no animation)
+        if let Some(window) = self.imp().window.borrow().as_ref() {
+            window.show_activity_page();
+        }
+
+        // Only fetch if we haven't loaded activity yet
+        if self.imp().activity_cursor.borrow().is_none() {
+            self.fetch_activity();
+        }
+    }
+
+    /// Fetch activity (all notifications)
+    fn fetch_activity(&self) {
+        let (tx, rx) =
+            std::sync::mpsc::channel::<Result<(Vec<Notification>, Option<String>), String>>();
+        let client = self.client();
+
+        thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            // Pass false for mentions_only to get all notifications
+            let result = rt.block_on(async { client.get_notifications(None, false).await });
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+
+        let app = self.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            match rx.try_recv() {
+                Ok(Ok((notifications, next_cursor))) => {
+                    app.imp().activity_cursor.replace(next_cursor);
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.set_activity(notifications);
+                    }
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(e)) => {
+                    eprintln!("Failed to fetch activity: {}", e);
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    eprintln!("Failed to fetch activity: connection lost");
+                    glib::ControlFlow::Break
+                }
+            }
+        });
+    }
+
+    /// Fetch more activity for infinite scroll
+    fn fetch_activity_more(&self) {
+        if *self.imp().activity_loading_more.borrow() {
+            return;
+        }
+        let cursor = match self.imp().activity_cursor.borrow().as_ref() {
+            Some(c) => c.clone(),
+            None => return,
+        };
+        self.imp().activity_loading_more.replace(true);
+
+        if let Some(window) = self.imp().window.borrow().as_ref() {
+            window.set_activity_loading(true);
+        }
+
+        let (tx, rx) =
+            std::sync::mpsc::channel::<Result<(Vec<Notification>, Option<String>), String>>();
+        let client = self.client();
+
+        thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            // Pass false for mentions_only to get all notifications
+            let result =
+                rt.block_on(async { client.get_notifications(Some(&cursor), false).await });
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+
+        let app = self.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            match rx.try_recv() {
+                Ok(Ok((notifications, next_cursor))) => {
+                    app.imp().activity_loading_more.replace(false);
+                    app.imp().activity_cursor.replace(next_cursor);
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.set_activity_loading(false);
+                        if !notifications.is_empty() {
+                            window.append_activity(notifications);
+                        }
+                    }
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(e)) => {
+                    app.imp().activity_loading_more.replace(false);
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.set_activity_loading(false);
+                    }
+                    eprintln!("Failed to fetch more activity: {}", e);
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    app.imp().activity_loading_more.replace(false);
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.set_activity_loading(false);
                     }
                     glib::ControlFlow::Break
                 }
