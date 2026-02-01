@@ -4,6 +4,7 @@ use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
 use gtk4::{gio, glib};
 use libadwaita as adw;
+use libadwaita::prelude::*;
 use std::cell::RefCell;
 use std::sync::Arc;
 use std::thread;
@@ -285,7 +286,7 @@ impl HangarApplication {
     }
 
     fn show_login_dialog(&self, window: &HangarWindow) {
-        let dialog = LoginDialog::new(window);
+        let dialog = LoginDialog::new();
 
         let app = self.clone();
         let dialog_weak = dialog.downgrade();
@@ -364,7 +365,7 @@ impl HangarApplication {
             });
         });
 
-        dialog.present();
+        dialog.present(Some(window));
     }
 
     fn fetch_user_profile(&self, did: &str) {
@@ -501,7 +502,7 @@ impl HangarApplication {
             Some(w) => w.clone(),
             None => return,
         };
-        let dialog = ComposeDialog::new(&window);
+        let dialog = ComposeDialog::new();
 
         let app = self.clone();
         let dialog_weak = dialog.downgrade();
@@ -553,7 +554,7 @@ impl HangarApplication {
             });
         });
 
-        dialog.present();
+        dialog.present(Some(&window));
     }
 
     fn open_reply_dialog(&self, parent_post: Post) {
@@ -568,7 +569,7 @@ impl HangarApplication {
             author_handle: parent_post.author.handle.clone(),
         };
 
-        let dialog = ComposeDialog::new_reply(&window, context);
+        let dialog = ComposeDialog::new_reply(context);
 
         let app = self.clone();
         let dialog_weak = dialog.downgrade();
@@ -621,7 +622,7 @@ impl HangarApplication {
             });
         });
 
-        dialog.present();
+        dialog.present(Some(&window));
     }
 
     fn open_quote_dialog(&self, quoted_post: Post) {
@@ -637,7 +638,7 @@ impl HangarApplication {
             text: quoted_post.text.clone(),
         };
 
-        let dialog = ComposeDialog::new_quote(&window, context);
+        let dialog = ComposeDialog::new_quote(context);
 
         let app = self.clone();
         let dialog_weak = dialog.downgrade();
@@ -693,7 +694,7 @@ impl HangarApplication {
             });
         });
 
-        dialog.present();
+        dialog.present(Some(&window));
     }
 
     fn toggle_repost(&self, post: &Post, post_row_weak: glib::WeakRef<PostRow>) {

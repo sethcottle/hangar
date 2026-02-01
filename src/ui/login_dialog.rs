@@ -4,6 +4,8 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
 use libadwaita as adw;
+use libadwaita::prelude::*;
+use libadwaita::subclass::prelude::*;
 
 mod imp {
     use super::*;
@@ -11,8 +13,8 @@ mod imp {
 
     #[derive(Default)]
     pub struct LoginDialog {
-        pub handle_entry: RefCell<Option<gtk4::Entry>>,
-        pub password_entry: RefCell<Option<gtk4::PasswordEntry>>,
+        pub handle_row: RefCell<Option<adw::EntryRow>>,
+        pub password_row: RefCell<Option<adw::PasswordEntryRow>>,
         pub login_button: RefCell<Option<gtk4::Button>>,
         pub spinner: RefCell<Option<gtk4::Spinner>>,
         pub error_label: RefCell<Option<gtk4::Label>>,
@@ -22,7 +24,7 @@ mod imp {
     impl ObjectSubclass for LoginDialog {
         const NAME: &'static str = "HangarLoginDialog";
         type Type = super::LoginDialog;
-        type ParentType = gtk4::Window;
+        type ParentType = adw::Dialog;
     }
 
     impl ObjectImpl for LoginDialog {
@@ -34,36 +36,73 @@ mod imp {
     }
 
     impl WidgetImpl for LoginDialog {}
-    impl WindowImpl for LoginDialog {}
+    impl AdwDialogImpl for LoginDialog {}
 }
 
 glib::wrapper! {
     pub struct LoginDialog(ObjectSubclass<imp::LoginDialog>)
-        @extends gtk4::Window, gtk4::Widget,
-        @implements gtk4::Accessible, gtk4::Buildable, gtk4::ConstraintTarget,
-                    gtk4::Native, gtk4::Root, gtk4::ShortcutManager;
+        @extends adw::Dialog, gtk4::Widget,
+        @implements gtk4::Accessible, gtk4::Buildable, gtk4::ConstraintTarget;
 }
 
 impl LoginDialog {
-    pub fn new(parent: &impl IsA<gtk4::Window>) -> Self {
-        glib::Object::builder()
-            .property("title", "Sign In to Bluesky")
-            .property("modal", true)
-            .property("transient-for", parent)
-            .property("default-width", 400)
-            .property("default-height", 320)
-            .property("resizable", false)
-            .build()
+    pub fn new() -> Self {
+        glib::Object::builder().build()
     }
 
     fn setup_ui(&self) {
-        // Main content box
-        let content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        self.set_title("Sign In to Bluesky");
+        self.set_content_width(400);
+        // Let dialog auto-size height based on content
 
-        // Header bar
-        let header = adw::HeaderBar::new();
-        header.set_show_start_title_buttons(false);
-        header.set_show_end_title_buttons(false);
+        // Main content box
+        let content = gtk4::Box::new(gtk4::Orientation::Vertical, 24);
+        content.set_margin_start(24);
+        content.set_margin_end(24);
+        content.set_margin_top(24);
+        content.set_margin_bottom(24);
+
+        // Description
+        let desc = gtk4::Label::new(Some(
+            "Enter your Bluesky handle and app password to sign in.",
+        ));
+        desc.set_wrap(true);
+        desc.set_justify(gtk4::Justification::Center);
+        desc.add_css_class("dim-label");
+        content.append(&desc);
+
+        // Preferences group with entry rows (GNOME HIG pattern)
+        let prefs_group = adw::PreferencesGroup::new();
+
+        let handle_row = adw::EntryRow::new();
+        handle_row.set_title("Handle");
+        handle_row.set_input_purpose(gtk4::InputPurpose::Email);
+        handle_row.set_text("yourname.bsky.social");
+        handle_row.set_show_apply_button(false);
+        prefs_group.add(&handle_row);
+
+        let password_row = adw::PasswordEntryRow::new();
+        password_row.set_title("App Password");
+        prefs_group.add(&password_row);
+
+        content.append(&prefs_group);
+
+        // Error label (hidden by default)
+        let error_label = gtk4::Label::new(None);
+        error_label.set_halign(gtk4::Align::Start);
+        error_label.add_css_class("error");
+        error_label.set_visible(false);
+        error_label.set_wrap(true);
+        content.append(&error_label);
+
+        // Button box with spinner
+        let button_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
+        button_box.set_halign(gtk4::Align::End);
+        button_box.set_margin_top(12);
+
+        let spinner = gtk4::Spinner::new();
+        spinner.set_visible(false);
+        button_box.append(&spinner);
 
         let cancel_btn = gtk4::Button::with_label("Cancel");
         cancel_btn.connect_clicked(glib::clone!(
@@ -73,87 +112,25 @@ impl LoginDialog {
                 dialog.close();
             }
         ));
-        header.pack_start(&cancel_btn);
-
-        content.append(&header);
-
-        // Form content
-        let form_box = gtk4::Box::new(gtk4::Orientation::Vertical, 16);
-        form_box.set_margin_start(24);
-        form_box.set_margin_end(24);
-        form_box.set_margin_top(16);
-        form_box.set_margin_bottom(24);
-
-        // Description
-        let desc = gtk4::Label::new(Some(
-            "Enter your Bluesky handle and app password to sign in.",
-        ));
-        desc.set_wrap(true);
-        desc.set_halign(gtk4::Align::Start);
-        desc.add_css_class("dim-label");
-        form_box.append(&desc);
-
-        // Handle entry with label
-        let handle_box = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
-        let handle_label = gtk4::Label::new(Some("Handle"));
-        handle_label.set_halign(gtk4::Align::Start);
-        handle_label.add_css_class("dim-label");
-        handle_box.append(&handle_label);
-
-        let handle_entry = gtk4::Entry::new();
-        handle_entry.set_placeholder_text(Some("yourname.bsky.social"));
-        handle_entry.set_input_purpose(gtk4::InputPurpose::Email);
-        handle_box.append(&handle_entry);
-        form_box.append(&handle_box);
-
-        // Password entry with label
-        let password_box = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
-        let password_label = gtk4::Label::new(Some("App Password"));
-        password_label.set_halign(gtk4::Align::Start);
-        password_label.add_css_class("dim-label");
-        password_box.append(&password_label);
-
-        let password_entry = gtk4::PasswordEntry::new();
-        password_entry.set_show_peek_icon(true);
-        password_box.append(&password_entry);
-        form_box.append(&password_box);
-
-        // Error label (hidden by default)
-        let error_label = gtk4::Label::new(None);
-        error_label.set_halign(gtk4::Align::Start);
-        error_label.add_css_class("error");
-        error_label.set_visible(false);
-        error_label.set_wrap(true);
-        form_box.append(&error_label);
-
-        // Button box with spinner
-        let button_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-        button_box.set_halign(gtk4::Align::End);
-        button_box.set_margin_top(8);
-
-        let spinner = gtk4::Spinner::new();
-        spinner.set_visible(false);
-        button_box.append(&spinner);
+        button_box.append(&cancel_btn);
 
         let login_button = gtk4::Button::with_label("Sign In");
         login_button.add_css_class("suggested-action");
         login_button.set_sensitive(false);
         button_box.append(&login_button);
 
-        form_box.append(&button_box);
-
-        content.append(&form_box);
+        content.append(&button_box);
 
         // Connect entry changes to enable/disable login button
         let login_btn_weak = login_button.downgrade();
-        let handle_entry_weak = handle_entry.downgrade();
-        let password_entry_weak = password_entry.downgrade();
+        let handle_row_weak = handle_row.downgrade();
+        let password_row_weak = password_row.downgrade();
 
         let update_button_sensitivity = move || {
             if let (Some(btn), Some(handle), Some(pass)) = (
                 login_btn_weak.upgrade(),
-                handle_entry_weak.upgrade(),
-                password_entry_weak.upgrade(),
+                handle_row_weak.upgrade(),
+                password_row_weak.upgrade(),
             ) {
                 let handle_text = handle.text();
                 let pass_text = pass.text();
@@ -162,15 +139,34 @@ impl LoginDialog {
         };
 
         let update_fn = update_button_sensitivity.clone();
-        handle_entry.connect_changed(move |_| update_fn());
+        handle_row.connect_changed(move |_| update_fn());
 
-        let update_fn = update_button_sensitivity;
-        password_entry.connect_changed(move |_| update_fn());
+        let update_fn = update_button_sensitivity.clone();
+        password_row.connect_changed(move |_| update_fn());
+
+        // Also enable login on Enter key
+        let login_btn_weak2 = login_button.downgrade();
+        handle_row.connect_entry_activated(move |_| {
+            if let Some(btn) = login_btn_weak2.upgrade() {
+                if btn.is_sensitive() {
+                    btn.emit_clicked();
+                }
+            }
+        });
+
+        let login_btn_weak3 = login_button.downgrade();
+        password_row.connect_entry_activated(move |_| {
+            if let Some(btn) = login_btn_weak3.upgrade() {
+                if btn.is_sensitive() {
+                    btn.emit_clicked();
+                }
+            }
+        });
 
         // Store references
         let imp = self.imp();
-        imp.handle_entry.replace(Some(handle_entry));
-        imp.password_entry.replace(Some(password_entry));
+        imp.handle_row.replace(Some(handle_row));
+        imp.password_row.replace(Some(password_row));
         imp.login_button.replace(Some(login_button));
         imp.spinner.replace(Some(spinner));
         imp.error_label.replace(Some(error_label));
@@ -180,7 +176,7 @@ impl LoginDialog {
 
     pub fn handle(&self) -> String {
         self.imp()
-            .handle_entry
+            .handle_row
             .borrow()
             .as_ref()
             .map(|e| e.text().to_string())
@@ -189,7 +185,7 @@ impl LoginDialog {
 
     pub fn password(&self) -> String {
         self.imp()
-            .password_entry
+            .password_row
             .borrow()
             .as_ref()
             .map(|e| e.text().to_string())
@@ -225,11 +221,11 @@ impl LoginDialog {
             button.set_sensitive(!loading);
         }
 
-        if let Some(handle) = imp.handle_entry.borrow().as_ref() {
+        if let Some(handle) = imp.handle_row.borrow().as_ref() {
             handle.set_sensitive(!loading);
         }
 
-        if let Some(password) = imp.password_entry.borrow().as_ref() {
+        if let Some(password) = imp.password_row.borrow().as_ref() {
             password.set_sensitive(!loading);
         }
     }
@@ -246,6 +242,6 @@ impl LoginDialog {
 
 impl Default for LoginDialog {
     fn default() -> Self {
-        panic!("LoginDialog requires a parent window")
+        Self::new()
     }
 }

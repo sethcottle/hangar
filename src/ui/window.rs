@@ -218,6 +218,8 @@ mod imp {
         pub search_spinner: RefCell<Option<gtk4::Spinner>>,
         pub search_entry: RefCell<Option<gtk4::SearchEntry>>,
         pub search_callback: RefCell<Option<Box<dyn Fn(String) + 'static>>>,
+        // Toast overlay for notifications
+        pub toast_overlay: RefCell<Option<adw::ToastOverlay>>,
     }
 
     #[glib::object_subclass]
@@ -316,9 +318,14 @@ impl HangarWindow {
 
         main_box.append(&main_stack);
 
-        self.set_content(Some(&main_box));
+        // Wrap in AdwToastOverlay
+        let toast_overlay = adw::ToastOverlay::new();
+        toast_overlay.set_child(Some(&main_box));
+
+        self.set_content(Some(&toast_overlay));
 
         let imp = self.imp();
+        imp.toast_overlay.replace(Some(toast_overlay));
         imp.sidebar.replace(Some(sidebar));
         imp.main_stack.replace(Some(main_stack));
         imp.home_nav_view.replace(Some(home_nav_view));
@@ -545,9 +552,15 @@ impl HangarWindow {
         let list_view = gtk4::ListView::new(Some(selection), Some(factory));
         list_view.add_css_class("background");
 
+        // Wrap in AdwClamp for proper content width
+        let clamp = adw::Clamp::new();
+        clamp.set_maximum_size(800);
+        clamp.set_tightening_threshold(600);
+        clamp.set_child(Some(&list_view));
+
         let scrolled = gtk4::ScrolledWindow::new();
         scrolled.set_vexpand(true);
-        scrolled.set_child(Some(&list_view));
+        scrolled.set_child(Some(&clamp));
         overlay.set_child(Some(&scrolled));
 
         // "N new posts" banner
@@ -1200,9 +1213,15 @@ impl HangarWindow {
         let list_view = gtk4::ListView::new(Some(selection), Some(factory));
         list_view.add_css_class("background");
 
+        // Wrap in AdwClamp for proper content width
+        let clamp = adw::Clamp::new();
+        clamp.set_maximum_size(800);
+        clamp.set_tightening_threshold(600);
+        clamp.set_child(Some(&list_view));
+
         let scrolled = gtk4::ScrolledWindow::new();
         scrolled.set_vexpand(true);
-        scrolled.set_child(Some(&list_view));
+        scrolled.set_child(Some(&clamp));
         content_box.append(&scrolled);
 
         let page = adw::NavigationPage::new(&content_box, display_name);
@@ -1296,9 +1315,15 @@ impl HangarWindow {
         let list_view = gtk4::ListView::new(Some(selection), Some(factory));
         list_view.add_css_class("background");
 
+        // Wrap in AdwClamp for proper content width
+        let clamp = adw::Clamp::new();
+        clamp.set_maximum_size(800);
+        clamp.set_tightening_threshold(600);
+        clamp.set_child(Some(&list_view));
+
         let scrolled = gtk4::ScrolledWindow::new();
         scrolled.set_vexpand(true);
-        scrolled.set_child(Some(&list_view));
+        scrolled.set_child(Some(&clamp));
         overlay.set_child(Some(&scrolled));
 
         // Loading spinner
@@ -1464,9 +1489,15 @@ impl HangarWindow {
         let list_view = gtk4::ListView::new(Some(selection), Some(factory));
         list_view.add_css_class("background");
 
+        // Wrap in AdwClamp for proper content width
+        let clamp = adw::Clamp::new();
+        clamp.set_maximum_size(800);
+        clamp.set_tightening_threshold(600);
+        clamp.set_child(Some(&list_view));
+
         let scrolled = gtk4::ScrolledWindow::new();
         scrolled.set_vexpand(true);
-        scrolled.set_child(Some(&list_view));
+        scrolled.set_child(Some(&clamp));
         overlay.set_child(Some(&scrolled));
 
         // Loading spinner
@@ -1617,9 +1648,15 @@ impl HangarWindow {
         let list_view = gtk4::ListView::new(Some(selection), Some(factory));
         list_view.add_css_class("background");
 
+        // Wrap in AdwClamp for proper content width
+        let clamp = adw::Clamp::new();
+        clamp.set_maximum_size(800);
+        clamp.set_tightening_threshold(600);
+        clamp.set_child(Some(&list_view));
+
         let scrolled = gtk4::ScrolledWindow::new();
         scrolled.set_vexpand(true);
-        scrolled.set_child(Some(&list_view));
+        scrolled.set_child(Some(&clamp));
         overlay.set_child(Some(&scrolled));
 
         // Loading spinner
@@ -2217,9 +2254,15 @@ impl HangarWindow {
         let list_view = gtk4::ListView::new(Some(selection), Some(factory));
         list_view.add_css_class("background");
 
+        // Wrap in AdwClamp for proper content width
+        let clamp = adw::Clamp::new();
+        clamp.set_maximum_size(800);
+        clamp.set_tightening_threshold(600);
+        clamp.set_child(Some(&list_view));
+
         let scrolled = gtk4::ScrolledWindow::new();
         scrolled.set_vexpand(true);
-        scrolled.set_child(Some(&list_view));
+        scrolled.set_child(Some(&clamp));
         overlay.set_child(Some(&scrolled));
 
         // Loading spinner
@@ -2436,9 +2479,15 @@ impl HangarWindow {
         let list_view = gtk4::ListView::new(Some(selection), Some(factory));
         list_view.add_css_class("background");
 
+        // Wrap in AdwClamp for proper content width
+        let clamp = adw::Clamp::new();
+        clamp.set_maximum_size(800);
+        clamp.set_tightening_threshold(600);
+        clamp.set_child(Some(&list_view));
+
         let scrolled = gtk4::ScrolledWindow::new();
         scrolled.set_vexpand(true);
-        scrolled.set_child(Some(&list_view));
+        scrolled.set_child(Some(&clamp));
         overlay.set_child(Some(&scrolled));
 
         // Loading spinner
@@ -2529,6 +2578,28 @@ impl HangarWindow {
     pub fn focus_search_entry(&self) {
         if let Some(entry) = self.imp().search_entry.borrow().as_ref() {
             entry.grab_focus();
+        }
+    }
+
+    /// Show a toast notification
+    pub fn show_toast(&self, message: &str) {
+        if let Some(overlay) = self.imp().toast_overlay.borrow().as_ref() {
+            let toast = adw::Toast::new(message);
+            toast.set_timeout(3); // 3 seconds
+            overlay.add_toast(toast);
+        }
+    }
+
+    /// Show a toast with an action button
+    pub fn show_toast_with_action(&self, message: &str, button_label: &str, action: impl Fn() + 'static) {
+        if let Some(overlay) = self.imp().toast_overlay.borrow().as_ref() {
+            let toast = adw::Toast::new(message);
+            toast.set_timeout(5); // 5 seconds for actionable toasts
+            toast.set_button_label(Some(button_label));
+            toast.connect_button_clicked(move |_| {
+                action();
+            });
+            overlay.add_toast(toast);
         }
     }
 }

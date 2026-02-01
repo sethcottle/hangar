@@ -4,6 +4,8 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
 use libadwaita as adw;
+use libadwaita::prelude::*;
+use libadwaita::subclass::prelude::*;
 
 /// Context for replying to a post
 #[derive(Clone)]
@@ -44,7 +46,7 @@ mod imp {
     impl ObjectSubclass for ComposeDialog {
         const NAME: &'static str = "HangarComposeDialog";
         type Type = super::ComposeDialog;
-        type ParentType = gtk4::Window;
+        type ParentType = adw::Dialog;
     }
 
     impl ObjectImpl for ComposeDialog {
@@ -56,50 +58,38 @@ mod imp {
     }
 
     impl WidgetImpl for ComposeDialog {}
-    impl WindowImpl for ComposeDialog {}
+    impl AdwDialogImpl for ComposeDialog {}
 }
 
 glib::wrapper! {
     pub struct ComposeDialog(ObjectSubclass<imp::ComposeDialog>)
-        @extends gtk4::Window, gtk4::Widget,
-        @implements gtk4::Accessible, gtk4::Buildable, gtk4::ConstraintTarget,
-                    gtk4::Native, gtk4::Root, gtk4::ShortcutManager;
+        @extends adw::Dialog, gtk4::Widget,
+        @implements gtk4::Accessible, gtk4::Buildable, gtk4::ConstraintTarget;
 }
 
 impl ComposeDialog {
-    pub fn new(parent: &impl IsA<gtk4::Window>) -> Self {
-        glib::Object::builder()
-            .property("title", "New Post")
-            .property("modal", true)
-            .property("transient-for", parent)
-            .property("default-width", 420)
-            .property("default-height", 280)
-            .property("resizable", true)
-            .build()
+    pub fn new() -> Self {
+        let dialog: Self = glib::Object::builder().build();
+        dialog.set_title("New Post");
+        dialog.set_content_width(420);
+        dialog.set_content_height(280);
+        dialog
     }
 
-    pub fn new_reply(parent: &impl IsA<gtk4::Window>, context: ReplyContext) -> Self {
-        let dialog: Self = glib::Object::builder()
-            .property("title", "Reply")
-            .property("modal", true)
-            .property("transient-for", parent)
-            .property("default-width", 420)
-            .property("default-height", 280)
-            .property("resizable", true)
-            .build();
+    pub fn new_reply(context: ReplyContext) -> Self {
+        let dialog: Self = glib::Object::builder().build();
+        dialog.set_title("Reply");
+        dialog.set_content_width(420);
+        dialog.set_content_height(280);
         dialog.set_reply_context(context);
         dialog
     }
 
-    pub fn new_quote(parent: &impl IsA<gtk4::Window>, context: QuoteContext) -> Self {
-        let dialog: Self = glib::Object::builder()
-            .property("title", "Quote Post")
-            .property("modal", true)
-            .property("transient-for", parent)
-            .property("default-width", 420)
-            .property("default-height", 340)
-            .property("resizable", true)
-            .build();
+    pub fn new_quote(context: QuoteContext) -> Self {
+        let dialog: Self = glib::Object::builder().build();
+        dialog.set_title("Quote Post");
+        dialog.set_content_width(420);
+        dialog.set_content_height(340);
         dialog.set_quote_context(context);
         dialog
     }
@@ -147,40 +137,18 @@ impl ComposeDialog {
     }
 
     fn setup_ui(&self) {
-        let content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-
-        let header = adw::HeaderBar::new();
-        header.set_show_start_title_buttons(false);
-        header.set_show_end_title_buttons(false);
-
-        let cancel_btn = gtk4::Button::with_label("Cancel");
-        cancel_btn.connect_clicked(glib::clone!(
-            #[weak(rename_to = dialog)]
-            self,
-            move |_| {
-                dialog.close();
-            }
-        ));
-        header.pack_start(&cancel_btn);
-
-        let post_btn = gtk4::Button::with_label("Post");
-        post_btn.add_css_class("suggested-action");
-        header.pack_end(&post_btn);
-
-        content.append(&header);
-
-        let form_box = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
-        form_box.set_margin_start(12);
-        form_box.set_margin_end(12);
-        form_box.set_margin_top(12);
-        form_box.set_margin_bottom(12);
-        form_box.set_vexpand(true);
+        let content = gtk4::Box::new(gtk4::Orientation::Vertical, 16);
+        content.set_margin_start(24);
+        content.set_margin_end(24);
+        content.set_margin_top(24);
+        content.set_margin_bottom(24);
+        content.set_vexpand(true);
 
         let reply_label = gtk4::Label::new(None);
         reply_label.set_halign(gtk4::Align::Start);
         reply_label.add_css_class("dim-label");
         reply_label.set_visible(false);
-        form_box.append(&reply_label);
+        content.append(&reply_label);
 
         let text_view = gtk4::TextView::new();
         text_view.set_wrap_mode(gtk4::WrapMode::WordChar);
@@ -194,23 +162,41 @@ impl ComposeDialog {
         scrolled.set_vexpand(true);
         scrolled.set_min_content_height(120);
         scrolled.set_child(Some(&text_view));
-
-        form_box.append(&scrolled);
+        content.append(&scrolled);
 
         // Quote preview card (shown when quoting)
         let quote_preview = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
         quote_preview.add_css_class("quote-card");
         quote_preview.set_visible(false);
-        form_box.append(&quote_preview);
+        content.append(&quote_preview);
 
         let error_label = gtk4::Label::new(None);
         error_label.set_halign(gtk4::Align::Start);
         error_label.add_css_class("dim-label");
         error_label.add_css_class("error");
         error_label.set_visible(false);
-        form_box.append(&error_label);
+        content.append(&error_label);
 
-        content.append(&form_box);
+        // Button box at bottom
+        let button_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
+        button_box.set_halign(gtk4::Align::End);
+        button_box.set_margin_top(12);
+
+        let cancel_btn = gtk4::Button::with_label("Cancel");
+        cancel_btn.connect_clicked(glib::clone!(
+            #[weak(rename_to = dialog)]
+            self,
+            move |_| {
+                dialog.close();
+            }
+        ));
+        button_box.append(&cancel_btn);
+
+        let post_btn = gtk4::Button::with_label("Post");
+        post_btn.add_css_class("suggested-action");
+        button_box.append(&post_btn);
+
+        content.append(&button_box);
 
         self.set_child(Some(&content));
 
