@@ -2276,6 +2276,7 @@ impl HangarWindow {
             .likes_load_more_callback
             .replace(Some(Box::new(callback)));
     }
+
 }
 
 /// A row widget for displaying a mention/notification

@@ -1148,8 +1148,8 @@ impl HangarApplication {
             NavItem::Likes => {
                 self.open_likes_view();
             }
-            // Other nav items not yet implemented
-            _ => {}
+            // Search not yet implemented
+            NavItem::Search => {}
         }
     }
 
@@ -1722,6 +1722,7 @@ impl HangarApplication {
             }
         });
     }
+
 }
 
 impl Default for HangarApplication {

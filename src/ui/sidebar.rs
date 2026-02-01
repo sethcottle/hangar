@@ -15,7 +15,6 @@ pub enum NavItem {
     Chat,
     Profile,
     Likes,
-    Bookmarks,
     Search,
 }
 
@@ -28,7 +27,6 @@ impl NavItem {
             Self::Chat => "chat-message-new-symbolic",
             Self::Profile => "avatar-default-symbolic",
             Self::Likes => "emote-love-symbolic",
-            Self::Bookmarks => "bookmark-new-symbolic",
             Self::Search => "system-search-symbolic",
         }
     }
@@ -41,7 +39,6 @@ impl NavItem {
             Self::Chat => "Chat",
             Self::Profile => "Profile",
             Self::Likes => "Likes",
-            Self::Bookmarks => "Bookmarks",
             Self::Search => "Search",
         }
     }
@@ -54,7 +51,6 @@ impl NavItem {
             Self::Chat,
             Self::Profile,
             Self::Likes,
-            Self::Bookmarks,
             Self::Search,
         ]
     }
