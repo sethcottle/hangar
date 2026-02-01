@@ -107,6 +107,44 @@ pub struct Profile {
     pub handle: String,
     pub display_name: Option<String>,
     pub avatar: Option<String>,
+    /// Profile banner image URL
+    pub banner: Option<String>,
+    /// Profile bio/description
+    pub description: Option<String>,
+    /// Number of followers
+    pub followers_count: Option<u32>,
+    /// Number of accounts this user follows
+    pub following_count: Option<u32>,
+    /// Number of posts
+    pub posts_count: Option<u32>,
+    /// Whether the viewer follows this user (URI of follow record)
+    pub viewer_following: Option<String>,
+    /// Whether this user follows the viewer (URI of their follow record)
+    pub viewer_followed_by: Option<String>,
+}
+
+impl Profile {
+    /// Create a minimal profile (used when extracting from posts, etc.)
+    pub fn minimal(
+        did: String,
+        handle: String,
+        display_name: Option<String>,
+        avatar: Option<String>,
+    ) -> Self {
+        Self {
+            did,
+            handle,
+            display_name,
+            avatar,
+            banner: None,
+            description: None,
+            followers_count: None,
+            following_count: None,
+            posts_count: None,
+            viewer_following: None,
+            viewer_followed_by: None,
+        }
+    }
 }
 
 /// Represents a feed that the user can switch to

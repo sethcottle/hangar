@@ -208,12 +208,12 @@ impl HangarClient {
         Post {
             uri: post_view.data.uri,
             cid: post_view.data.cid.as_ref().to_string(),
-            author: Profile {
-                did: author.data.did.to_string(),
-                handle: author.data.handle.to_string(),
-                display_name: author.data.display_name.clone(),
-                avatar: author.data.avatar.clone(),
-            },
+            author: Profile::minimal(
+                author.data.did.to_string(),
+                author.data.handle.to_string(),
+                author.data.display_name.clone(),
+                author.data.avatar.clone(),
+            ),
             text,
             created_at,
             reply_count: post_view.data.reply_count.map(|c| c as u32),
@@ -327,12 +327,12 @@ impl HangarClient {
                 Some(QuoteEmbed {
                     uri: data.uri.clone(),
                     cid: data.cid.as_ref().to_string(),
-                    author: Profile {
-                        did: data.author.data.did.to_string(),
-                        handle: data.author.data.handle.to_string(),
-                        display_name: data.author.data.display_name.clone(),
-                        avatar: data.author.data.avatar.clone(),
-                    },
+                    author: Profile::minimal(
+                        data.author.data.did.to_string(),
+                        data.author.data.handle.to_string(),
+                        data.author.data.display_name.clone(),
+                        data.author.data.avatar.clone(),
+                    ),
                     text,
                     indexed_at: data.indexed_at.as_str().to_string(),
                     embed: nested_embed.map(Box::new),
@@ -466,12 +466,12 @@ impl HangarClient {
         };
 
         Some(RepostReason {
-            by: Profile {
-                did: repost.data.by.data.did.to_string(),
-                handle: repost.data.by.data.handle.to_string(),
-                display_name: repost.data.by.data.display_name.clone(),
-                avatar: repost.data.by.data.avatar.clone(),
-            },
+            by: Profile::minimal(
+                repost.data.by.data.did.to_string(),
+                repost.data.by.data.handle.to_string(),
+                repost.data.by.data.display_name.clone(),
+                repost.data.by.data.avatar.clone(),
+            ),
             indexed_at: repost.data.indexed_at.as_str().to_string(),
         })
     }
@@ -489,12 +489,12 @@ impl HangarClient {
 
         // Extract parent author
         let parent_author = match &reply.data.parent {
-            Union::Refs(ReplyRefParentRefs::PostView(pv)) => Profile {
-                did: pv.data.author.data.did.to_string(),
-                handle: pv.data.author.data.handle.to_string(),
-                display_name: pv.data.author.data.display_name.clone(),
-                avatar: pv.data.author.data.avatar.clone(),
-            },
+            Union::Refs(ReplyRefParentRefs::PostView(pv)) => Profile::minimal(
+                pv.data.author.data.did.to_string(),
+                pv.data.author.data.handle.to_string(),
+                pv.data.author.data.display_name.clone(),
+                pv.data.author.data.avatar.clone(),
+            ),
             Union::Refs(ReplyRefParentRefs::NotFoundPost(_)) => return None,
             Union::Refs(ReplyRefParentRefs::BlockedPost(_)) => return None,
             _ => return None,
@@ -502,12 +502,12 @@ impl HangarClient {
 
         // Extract root author
         let root_author = match &reply.data.root {
-            Union::Refs(ReplyRefRootRefs::PostView(pv)) => Profile {
-                did: pv.data.author.data.did.to_string(),
-                handle: pv.data.author.data.handle.to_string(),
-                display_name: pv.data.author.data.display_name.clone(),
-                avatar: pv.data.author.data.avatar.clone(),
-            },
+            Union::Refs(ReplyRefRootRefs::PostView(pv)) => Profile::minimal(
+                pv.data.author.data.did.to_string(),
+                pv.data.author.data.handle.to_string(),
+                pv.data.author.data.display_name.clone(),
+                pv.data.author.data.avatar.clone(),
+            ),
             Union::Refs(ReplyRefRootRefs::NotFoundPost(_)) => return None,
             Union::Refs(ReplyRefRootRefs::BlockedPost(_)) => return None,
             _ => return None,
@@ -539,11 +539,30 @@ impl HangarClient {
             .await
             .map_err(|e| ClientError::Network(e.to_string()))?;
 
+        // Extract viewer state
+        let viewer_following = output
+            .data
+            .viewer
+            .as_ref()
+            .and_then(|v| v.data.following.clone());
+        let viewer_followed_by = output
+            .data
+            .viewer
+            .as_ref()
+            .and_then(|v| v.data.followed_by.clone());
+
         Ok(Profile {
             did: output.data.did.to_string(),
             handle: output.data.handle.to_string(),
             display_name: output.data.display_name.clone(),
             avatar: output.data.avatar.clone(),
+            banner: output.data.banner.clone(),
+            description: output.data.description.clone(),
+            followers_count: output.data.followers_count.map(|c| c as u32),
+            following_count: output.data.follows_count.map(|c| c as u32),
+            posts_count: output.data.posts_count.map(|c| c as u32),
+            viewer_following,
+            viewer_followed_by,
         })
     }
 
@@ -1112,12 +1131,12 @@ impl HangarClient {
         Post {
             uri: post_view.data.uri.clone(),
             cid: post_view.data.cid.as_ref().to_string(),
-            author: Profile {
-                did: author.data.did.to_string(),
-                handle: author.data.handle.to_string(),
-                display_name: author.data.display_name.clone(),
-                avatar: author.data.avatar.clone(),
-            },
+            author: Profile::minimal(
+                author.data.did.to_string(),
+                author.data.handle.to_string(),
+                author.data.display_name.clone(),
+                author.data.avatar.clone(),
+            ),
             text,
             created_at,
             reply_count: post_view.data.reply_count.map(|c| c as u32),
@@ -1211,12 +1230,12 @@ impl HangarClient {
                     return None;
                 }
 
-                let author = Profile {
-                    did: notif.data.author.data.did.to_string(),
-                    handle: notif.data.author.data.handle.to_string(),
-                    display_name: notif.data.author.data.display_name.clone(),
-                    avatar: notif.data.author.data.avatar.clone(),
-                };
+                let author = Profile::minimal(
+                    notif.data.author.data.did.to_string(),
+                    notif.data.author.data.handle.to_string(),
+                    notif.data.author.data.display_name.clone(),
+                    notif.data.author.data.avatar.clone(),
+                );
 
                 // Extract post data if this is a post-based notification
                 let post = self.extract_notification_post(&notif);
@@ -1269,12 +1288,12 @@ impl HangarClient {
             _ => (String::new(), String::new()),
         };
 
-        let author = Profile {
-            did: notif.data.author.data.did.to_string(),
-            handle: notif.data.author.data.handle.to_string(),
-            display_name: notif.data.author.data.display_name.clone(),
-            avatar: notif.data.author.data.avatar.clone(),
-        };
+        let author = Profile::minimal(
+            notif.data.author.data.did.to_string(),
+            notif.data.author.data.handle.to_string(),
+            notif.data.author.data.display_name.clone(),
+            notif.data.author.data.avatar.clone(),
+        );
 
         Some(Post {
             uri: notif.data.uri.clone(),
@@ -1403,11 +1422,13 @@ impl HangarClient {
             .data
             .members
             .iter()
-            .map(|m| Profile {
-                did: m.data.did.to_string(),
-                handle: m.data.handle.to_string(),
-                display_name: m.data.display_name.clone(),
-                avatar: m.data.avatar.clone(),
+            .map(|m| {
+                Profile::minimal(
+                    m.data.did.to_string(),
+                    m.data.handle.to_string(),
+                    m.data.display_name.clone(),
+                    m.data.avatar.clone(),
+                )
             })
             .collect();
 

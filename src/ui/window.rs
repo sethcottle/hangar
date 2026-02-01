@@ -188,6 +188,22 @@ mod imp {
         pub conversation_clicked_callback: RefCell<Option<Box<dyn Fn(Conversation) + 'static>>>,
         // Current user info
         pub current_user_did: RefCell<Option<String>>,
+        // Profile page state (for own profile in sidebar)
+        pub profile_nav_view: RefCell<Option<adw::NavigationView>>,
+        pub profile_page_model: RefCell<Option<gio::ListStore>>,
+        pub profile_page_spinner: RefCell<Option<gtk4::Spinner>>,
+        pub profile_page_scrolled: RefCell<Option<gtk4::ScrolledWindow>>,
+        pub profile_load_more_callback: RefCell<Option<Box<dyn Fn() + 'static>>>,
+        // Store current profile for updating UI
+        pub current_profile: RefCell<Option<Profile>>,
+        // Profile page widgets (for updating header)
+        pub profile_name_label: RefCell<Option<gtk4::Label>>,
+        pub profile_handle_label: RefCell<Option<gtk4::Label>>,
+        pub profile_bio_label: RefCell<Option<gtk4::Label>>,
+        pub profile_avatar: RefCell<Option<adw::Avatar>>,
+        pub profile_followers_label: RefCell<Option<gtk4::Label>>,
+        pub profile_following_label: RefCell<Option<gtk4::Label>>,
+        pub profile_posts_label: RefCell<Option<gtk4::Label>>,
     }
 
     #[glib::object_subclass]
@@ -266,6 +282,12 @@ impl HangarWindow {
         chat_nav_view.add(&chat_page);
         main_stack.add_named(&chat_nav_view, Some("chat"));
 
+        // Profile section: NavigationView for own profile
+        let profile_nav_view = adw::NavigationView::new();
+        let profile_page = self.build_own_profile_page();
+        profile_nav_view.add(&profile_page);
+        main_stack.add_named(&profile_nav_view, Some("profile"));
+
         main_box.append(&main_stack);
 
         self.set_content(Some(&main_box));
@@ -277,6 +299,7 @@ impl HangarWindow {
         imp.mentions_nav_view.replace(Some(mentions_nav_view));
         imp.activity_nav_view.replace(Some(activity_nav_view));
         imp.chat_nav_view.replace(Some(chat_nav_view));
+        imp.profile_nav_view.replace(Some(profile_nav_view));
 
         // Add keyboard shortcuts
         self.setup_shortcuts();
@@ -798,6 +821,7 @@ impl HangarWindow {
             "mentions" => "mentions",
             "activity" => "activity",
             "chat" => "chat",
+            "profile" => "own-profile",
             _ => return,
         };
 
@@ -817,6 +841,7 @@ impl HangarWindow {
             "mentions" => self.imp().mentions_nav_view.borrow().clone(),
             "activity" => self.imp().activity_nav_view.borrow().clone(),
             "chat" => self.imp().chat_nav_view.borrow().clone(),
+            "profile" => self.imp().profile_nav_view.borrow().clone(),
             _ => self.imp().home_nav_view.borrow().clone(),
         }
     }
@@ -1667,6 +1692,382 @@ impl HangarWindow {
     pub fn sidebar(&self) -> Option<crate::ui::sidebar::Sidebar> {
         self.imp().sidebar.borrow().clone()
     }
+
+    /// Build the own profile page (for Profile tab in sidebar)
+    fn build_own_profile_page(&self) -> adw::NavigationPage {
+        let content_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        content_box.set_hexpand(true);
+
+        let header = adw::HeaderBar::new();
+        header.set_show_start_title_buttons(false);
+        header.set_show_end_title_buttons(false);
+
+        let title = gtk4::Label::new(Some("Profile"));
+        title.add_css_class("title");
+        header.set_title_widget(Some(&title));
+
+        let close_btn = gtk4::Button::from_icon_name("window-close-symbolic");
+        close_btn.set_tooltip_text(Some("Close"));
+        close_btn.connect_clicked(glib::clone!(
+            #[weak(rename_to = window)]
+            self,
+            move |_| {
+                window.close();
+            }
+        ));
+        header.pack_end(&close_btn);
+
+        content_box.append(&header);
+        content_box.append(&self.build_own_profile_content());
+
+        let page = adw::NavigationPage::new(&content_box, "Profile");
+        page.set_tag(Some("own-profile"));
+        page
+    }
+
+    /// Build the own profile content (header + tabs + posts)
+    fn build_own_profile_content(&self) -> gtk4::Box {
+        let profile_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        profile_box.set_vexpand(true);
+
+        // Scrollable content for entire profile
+        let scrolled = gtk4::ScrolledWindow::new();
+        scrolled.set_vexpand(true);
+
+        let scroll_content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+
+        // Profile header section (banner, avatar, info, stats)
+        let header_section = self.build_profile_header_section();
+        scroll_content.append(&header_section);
+
+        // Separator
+        let sep = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+        scroll_content.append(&sep);
+
+        // Posts label
+        let posts_label = gtk4::Label::new(Some("Posts"));
+        posts_label.add_css_class("title-4");
+        posts_label.set_halign(gtk4::Align::Start);
+        posts_label.set_margin_start(16);
+        posts_label.set_margin_top(12);
+        posts_label.set_margin_bottom(8);
+        scroll_content.append(&posts_label);
+
+        // Posts list
+        let overlay = gtk4::Overlay::new();
+        overlay.set_vexpand(true);
+
+        let model = gio::ListStore::new::<PostObject>();
+        let factory = gtk4::SignalListItemFactory::new();
+
+        factory.connect_setup(|_, item| {
+            let post_row = PostRow::new();
+            if let Some(list_item) = item.downcast_ref::<gtk4::ListItem>() {
+                list_item.set_child(Some(&post_row));
+            }
+        });
+
+        let win = self.clone();
+        factory.connect_bind(move |_, item| {
+            if let Some(list_item) = item.downcast_ref::<gtk4::ListItem>()
+                && let Some(post_object) = list_item.item().and_downcast::<PostObject>()
+                && let Some(post) = post_object.post()
+                && let Some(post_row) = list_item.child().and_downcast::<PostRow>()
+            {
+                post_row.bind(&post);
+                let post_for_like = post.clone();
+                let w = win.clone();
+                post_row.connect_like_clicked(move |row, was_liked, like_uri| {
+                    let mut post_with_state = post_for_like.clone();
+                    post_with_state.viewer_like = if was_liked { like_uri } else { None };
+                    let row_weak = row.downgrade();
+                    w.imp()
+                        .like_callback
+                        .borrow()
+                        .as_ref()
+                        .map(|cb| cb(post_with_state, row_weak));
+                });
+                let post_for_repost = post.clone();
+                let w = win.clone();
+                post_row.connect_repost_clicked(move |row, was_reposted, repost_uri| {
+                    let mut post_with_state = post_for_repost.clone();
+                    post_with_state.viewer_repost = if was_reposted { repost_uri } else { None };
+                    let row_weak = row.downgrade();
+                    w.imp()
+                        .repost_callback
+                        .borrow()
+                        .as_ref()
+                        .map(|cb| cb(post_with_state, row_weak));
+                });
+                let post_for_quote = post.clone();
+                let w = win.clone();
+                post_row.connect_quote_clicked(move || {
+                    w.imp()
+                        .quote_callback
+                        .borrow()
+                        .as_ref()
+                        .map(|cb| cb(post_for_quote.clone()));
+                });
+                let post_clone = post.clone();
+                let w = win.clone();
+                post_row.connect_reply_clicked(move || {
+                    w.imp()
+                        .reply_callback
+                        .borrow()
+                        .as_ref()
+                        .map(|cb| cb(post_clone.clone()));
+                });
+                // Navigation callbacks for posts in profile
+                let w = win.clone();
+                post_row.set_post_clicked_callback(move |p| {
+                    w.imp()
+                        .post_clicked_callback
+                        .borrow()
+                        .as_ref()
+                        .map(|cb| cb(p));
+                });
+            }
+        });
+
+        let selection = gtk4::NoSelection::new(Some(model.clone()));
+        let list_view = gtk4::ListView::new(Some(selection), Some(factory));
+        list_view.add_css_class("background");
+        overlay.set_child(Some(&list_view));
+
+        // Loading spinner
+        let spinner = gtk4::Spinner::new();
+        spinner.set_visible(false);
+        spinner.set_halign(gtk4::Align::Center);
+        spinner.set_valign(gtk4::Align::End);
+        spinner.set_margin_bottom(16);
+        overlay.add_overlay(&spinner);
+
+        scroll_content.append(&overlay);
+        scrolled.set_child(Some(&scroll_content));
+        profile_box.append(&scrolled);
+
+        // Store references
+        let imp = self.imp();
+        imp.profile_page_model.replace(Some(model));
+        imp.profile_page_spinner.replace(Some(spinner));
+        imp.profile_page_scrolled.replace(Some(scrolled.clone()));
+
+        // Infinite scroll
+        let adj = scrolled.vadjustment();
+        let win = self.clone();
+        adj.connect_value_changed(move |adj| {
+            let value = adj.value();
+            let upper = adj.upper();
+            let page_size = adj.page_size();
+            if value >= upper - page_size - 200.0 {
+                if let Some(cb) = win.imp().profile_load_more_callback.borrow().as_ref() {
+                    cb();
+                }
+            }
+        });
+
+        profile_box
+    }
+
+    /// Build the profile header section with banner, avatar, bio, and stats
+    fn build_profile_header_section(&self) -> gtk4::Box {
+        let header_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+
+        // Banner placeholder (will be updated when profile loads)
+        let banner_overlay = gtk4::Overlay::new();
+        banner_overlay.set_height_request(150);
+
+        let banner_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        banner_box.add_css_class("profile-banner-placeholder");
+        banner_overlay.set_child(Some(&banner_box));
+
+        // Avatar overlaid on banner (positioned at bottom)
+        let avatar = adw::Avatar::new(80, None, true);
+        avatar.set_halign(gtk4::Align::Start);
+        avatar.set_valign(gtk4::Align::End);
+        avatar.set_margin_start(16);
+        avatar.set_margin_bottom(-40); // Overlap into content below
+        banner_overlay.add_overlay(&avatar);
+
+        header_box.append(&banner_overlay);
+
+        // Info section with spacing for avatar overlap
+        let info_box = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+        info_box.set_margin_start(16);
+        info_box.set_margin_end(16);
+        info_box.set_margin_top(48); // Space for overlapping avatar
+        info_box.set_margin_bottom(16);
+
+        // Display name
+        let name_label = gtk4::Label::new(None);
+        name_label.add_css_class("title-1");
+        name_label.set_halign(gtk4::Align::Start);
+        info_box.append(&name_label);
+
+        // Handle
+        let handle_label = gtk4::Label::new(None);
+        handle_label.add_css_class("dim-label");
+        handle_label.set_halign(gtk4::Align::Start);
+        info_box.append(&handle_label);
+
+        // Bio/description
+        let bio_label = gtk4::Label::new(None);
+        bio_label.set_wrap(true);
+        bio_label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+        bio_label.set_halign(gtk4::Align::Start);
+        bio_label.set_xalign(0.0);
+        bio_label.set_visible(false); // Hidden until profile loads
+        info_box.append(&bio_label);
+
+        // Stats row
+        let stats_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 16);
+        stats_box.set_margin_top(8);
+
+        // Followers
+        let followers_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+        let followers_count = gtk4::Label::new(Some("0"));
+        followers_count.add_css_class("heading");
+        followers_box.append(&followers_count);
+        let followers_static = gtk4::Label::new(Some("followers"));
+        followers_static.add_css_class("dim-label");
+        followers_box.append(&followers_static);
+        stats_box.append(&followers_box);
+
+        // Following
+        let following_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+        let following_count = gtk4::Label::new(Some("0"));
+        following_count.add_css_class("heading");
+        following_box.append(&following_count);
+        let following_static = gtk4::Label::new(Some("following"));
+        following_static.add_css_class("dim-label");
+        following_box.append(&following_static);
+        stats_box.append(&following_box);
+
+        // Posts count
+        let posts_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+        let posts_count = gtk4::Label::new(Some("0"));
+        posts_count.add_css_class("heading");
+        posts_box.append(&posts_count);
+        let posts_static = gtk4::Label::new(Some("posts"));
+        posts_static.add_css_class("dim-label");
+        posts_box.append(&posts_static);
+        stats_box.append(&posts_box);
+
+        info_box.append(&stats_box);
+        header_box.append(&info_box);
+
+        // Store widget references
+        let imp = self.imp();
+        imp.profile_name_label.replace(Some(name_label));
+        imp.profile_handle_label.replace(Some(handle_label));
+        imp.profile_bio_label.replace(Some(bio_label));
+        imp.profile_avatar.replace(Some(avatar));
+        imp.profile_followers_label.replace(Some(followers_count));
+        imp.profile_following_label.replace(Some(following_count));
+        imp.profile_posts_label.replace(Some(posts_count));
+
+        header_box
+    }
+
+    /// Update the profile page header with profile data
+    pub fn update_profile_header(&self, profile: &Profile) {
+        let imp = self.imp();
+        imp.current_profile.replace(Some(profile.clone()));
+
+        let display_name = profile.display_name.as_deref().unwrap_or(&profile.handle);
+
+        // Update name
+        if let Some(label) = imp.profile_name_label.borrow().as_ref() {
+            label.set_text(display_name);
+        }
+
+        // Update handle
+        if let Some(label) = imp.profile_handle_label.borrow().as_ref() {
+            label.set_text(&format!("@{}", profile.handle));
+        }
+
+        // Update bio
+        if let Some(label) = imp.profile_bio_label.borrow().as_ref() {
+            if let Some(bio) = &profile.description {
+                label.set_text(bio);
+                label.set_visible(true);
+            } else {
+                label.set_visible(false);
+            }
+        }
+
+        // Update avatar
+        if let Some(avatar) = imp.profile_avatar.borrow().as_ref() {
+            avatar.set_text(Some(display_name));
+            if let Some(url) = &profile.avatar {
+                crate::ui::avatar_cache::load_avatar(avatar.clone(), url.clone());
+            }
+        }
+
+        // Update stats
+        if let Some(label) = imp.profile_followers_label.borrow().as_ref() {
+            let count = profile.followers_count.unwrap_or(0);
+            label.set_text(&Self::format_count(count));
+        }
+        if let Some(label) = imp.profile_following_label.borrow().as_ref() {
+            let count = profile.following_count.unwrap_or(0);
+            label.set_text(&Self::format_count(count));
+        }
+        if let Some(label) = imp.profile_posts_label.borrow().as_ref() {
+            let count = profile.posts_count.unwrap_or(0);
+            label.set_text(&Self::format_count(count));
+        }
+    }
+
+    /// Format a count as "1K", "1.2M", etc.
+    fn format_count(count: u32) -> String {
+        if count >= 1_000_000 {
+            format!("{:.1}M", count as f64 / 1_000_000.0)
+        } else if count >= 1_000 {
+            format!("{:.1}K", count as f64 / 1_000.0)
+        } else {
+            count.to_string()
+        }
+    }
+
+    /// Set posts for the own profile page
+    pub fn set_profile_posts(&self, posts: Vec<Post>) {
+        if let Some(model) = self.imp().profile_page_model.borrow().as_ref() {
+            model.remove_all();
+            for post in posts {
+                model.append(&PostObject::new(post));
+            }
+        }
+    }
+
+    /// Append more posts to the own profile page
+    pub fn append_profile_posts(&self, posts: Vec<Post>) {
+        if let Some(model) = self.imp().profile_page_model.borrow().as_ref() {
+            for post in posts {
+                model.append(&PostObject::new(post));
+            }
+        }
+    }
+
+    /// Set loading state for profile page
+    pub fn set_profile_loading(&self, loading: bool) {
+        if let Some(spinner) = self.imp().profile_page_spinner.borrow().as_ref() {
+            spinner.set_visible(loading);
+            spinner.set_spinning(loading);
+        }
+    }
+
+    /// Set callback for loading more profile posts
+    pub fn set_profile_load_more_callback<F: Fn() + 'static>(&self, callback: F) {
+        self.imp()
+            .profile_load_more_callback
+            .replace(Some(Box::new(callback)));
+    }
+
+    /// Show the profile page (top-level navigation, instant switch)
+    pub fn show_profile_page(&self) {
+        self.switch_to_page("profile");
+    }
 }
 
 /// A row widget for displaying a mention/notification
@@ -2428,10 +2829,7 @@ mod conversation_row {
             // Avatar
             if let Some(avatar) = imp.avatar.borrow().as_ref() {
                 if let Some(member) = other_member {
-                    let display_name = member
-                        .display_name
-                        .as_deref()
-                        .unwrap_or(&member.handle);
+                    let display_name = member.display_name.as_deref().unwrap_or(&member.handle);
                     avatar.set_text(Some(display_name));
                     if let Some(url) = &member.avatar {
                         avatar_cache::load_avatar(avatar.clone(), url.clone());
@@ -2444,10 +2842,7 @@ mod conversation_row {
             // Name
             if let Some(label) = imp.name_label.borrow().as_ref() {
                 if let Some(member) = other_member {
-                    let display_name = member
-                        .display_name
-                        .as_deref()
-                        .unwrap_or(&member.handle);
+                    let display_name = member.display_name.as_deref().unwrap_or(&member.handle);
                     label.set_text(display_name);
                 } else {
                     label.set_text("Unknown");

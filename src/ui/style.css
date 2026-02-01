@@ -245,3 +245,8 @@ popover.menu > contents {
     padding: 4px 0;
 }
 
+/* Profile page styling */
+.profile-banner-placeholder {
+    background: linear-gradient(135deg, alpha(@accent_bg_color, 0.3), alpha(@accent_bg_color, 0.1));
+}
+
