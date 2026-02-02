@@ -12,7 +12,7 @@ pub struct Session {
 }
 
 /// External link card embed (URLs with previews)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExternalEmbed {
     pub uri: String,
     pub title: String,
@@ -21,7 +21,7 @@ pub struct ExternalEmbed {
 }
 
 /// Video embed
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VideoEmbed {
     pub playlist: String,
     pub thumbnail: Option<String>,
@@ -30,7 +30,7 @@ pub struct VideoEmbed {
 }
 
 /// Quote post embed (embedded record view)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuoteEmbed {
     pub uri: String,
     pub cid: String,
@@ -42,7 +42,7 @@ pub struct QuoteEmbed {
 }
 
 /// All possible embed types for a post
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Embed {
     Images(Vec<ImageEmbed>),
     External(ExternalEmbed),
@@ -56,7 +56,7 @@ pub enum Embed {
 }
 
 /// Single image with metadata
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageEmbed {
     pub thumb: String,
     pub fullsize: String,
@@ -65,20 +65,20 @@ pub struct ImageEmbed {
 }
 
 /// Repost attribution (who reposted this into the feed)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepostReason {
     pub by: Profile,
     pub indexed_at: String,
 }
 
 /// Reply context (who this post is replying to)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplyContext {
     pub parent_author: Profile,
     pub root_author: Profile,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Post {
     pub uri: String,
     pub cid: String,
@@ -101,7 +101,7 @@ pub struct Post {
     pub reply_context: Option<ReplyContext>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Profile {
     pub did: String,
     pub handle: String,
@@ -163,7 +163,7 @@ pub struct SavedFeed {
 }
 
 /// Notification from the AT Protocol
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Notification {
     pub uri: String,
     pub cid: String,
@@ -197,7 +197,7 @@ impl SavedFeed {
 }
 
 /// A direct message conversation
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Conversation {
     /// Unique conversation ID
     pub id: String,
@@ -212,7 +212,7 @@ pub struct Conversation {
 }
 
 /// A chat message
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     /// Unique message ID
     pub id: String,

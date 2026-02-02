@@ -2,6 +2,7 @@
 
 mod app;
 mod atproto;
+mod cache;
 mod config;
 mod state;
 mod ui;

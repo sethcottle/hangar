@@ -26,6 +26,8 @@ thiserror = "2"
 secret-service = { version = "4", features = ["rt-tokio-crypto-rust"] }
 chrono = "0.4"
 once_cell = "1"
+rusqlite = { version = "0.33", features = ["bundled"] }
+dirs = "5"
 
 # No build dependencies needed currently
 # Blueprint compilation handled via build.rs if blueprint-compiler is available
