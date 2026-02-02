@@ -5,6 +5,12 @@ name: Release
 on:
   push:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g., 0.2.0, 1.0.0). Leave empty for nightly.'
+        required: false
+        type: string
 
 jobs:
   build-flatpak:
@@ -106,11 +112,22 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Get version from Cargo.toml
-        id: version
+      - name: Determine release type
+        id: release-type
         run: |
-          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          if [ -n "${{ inputs.version }}" ]; then
+            echo "is_nightly=false" >> $GITHUB_OUTPUT
+            echo "version=${{ inputs.version }}" >> $GITHUB_OUTPUT
+            echo "tag_name=v${{ inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+            DATE=$(date -u +%Y-%m-%d)
+            echo "is_nightly=true" >> $GITHUB_OUTPUT
+            echo "version=nightly" >> $GITHUB_OUTPUT
+            echo "tag_name=nightly" >> $GITHUB_OUTPUT
+            echo "date=$DATE" >> $GITHUB_OUTPUT
+            echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+          fi
 
       - name: Download Flatpak artifact
         uses: actions/download-artifact@v4
@@ -122,15 +139,29 @@ jobs:
         with:
           name: hangar-appimage
 
-      - name: Create or update release
+      - name: Delete existing nightly release
+        if: steps.release-type.outputs.is_nightly == 'true'
+        run: gh release delete nightly --yes || true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Delete existing nightly tag
+        if: steps.release-type.outputs.is_nightly == 'true'
+        run: git push --delete origin nightly || true
+
+      - name: Create nightly release
+        if: steps.release-type.outputs.is_nightly == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ steps.version.outputs.version }}
-          name: Hangar v${{ steps.version.outputs.version }}
+          tag_name: nightly
+          name: "Nightly ${{ steps.release-type.outputs.date }} (${{ steps.release-type.outputs.short_sha }})"
           body: |
-            ## Hangar v${{ steps.version.outputs.version }}
+            ## Nightly Build
 
-            **Technical Preview** — This is an early development release.
+            **Date:** ${{ steps.release-type.outputs.date }}
+            **Commit:** ${{ github.sha }}
+
+            This is an automated nightly build from the latest `main` branch. It may be unstable.
 
             ### Downloads
 
@@ -146,18 +177,50 @@ jobs:
           draft: false
           prerelease: true
 
+      - name: Create versioned release
+        if: steps.release-type.outputs.is_nightly == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.release-type.outputs.version }}
+          name: Hangar v${{ steps.release-type.outputs.version }}
+          body: |
+            ## Hangar v${{ steps.release-type.outputs.version }}
+
+            ### Downloads
+
+            - **Flatpak**: `hangar.flatpak` — Install with `flatpak install hangar.flatpak`
+            - **AppImage**: Make executable and run
+
+            ### Security Notice
+
+            This release uses app password authentication. Please use a dedicated [app password](https://bsky.app/settings/app-passwords) rather than your main account password.
+          files: |
+            hangar.flatpak
+            Hangar*.AppImage
+          draft: false
+          prerelease: false
+
       - name: Upload to DigitalOcean Spaces
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.DO_SPACES_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.DO_SPACES_SECRET }}
         run: |
-          # Upload Flatpak (AWS CLI is pre-installed on GitHub runners)
-          aws s3 cp hangar.flatpak s3://seth/hangar/releases/hangar.flatpak \
-            --endpoint-url https://nyc3.digitaloceanspaces.com \
-            --acl public-read
-
-          # Upload AppImage (find the actual filename)
           APPIMAGE=$(ls Hangar*.AppImage)
-          aws s3 cp "$APPIMAGE" s3://seth/hangar/releases/Hangar-x86_64.AppImage \
-            --endpoint-url https://nyc3.digitaloceanspaces.com \
-            --acl public-read
+
+          if [ "${{ steps.release-type.outputs.is_nightly }}" == "true" ]; then
+            # Nightly builds use -nightly suffix
+            aws s3 cp hangar.flatpak s3://seth/hangar/releases/hangar-nightly.flatpak \
+              --endpoint-url https://nyc3.digitaloceanspaces.com \
+              --acl public-read
+            aws s3 cp "$APPIMAGE" s3://seth/hangar/releases/Hangar-nightly-x86_64.AppImage \
+              --endpoint-url https://nyc3.digitaloceanspaces.com \
+              --acl public-read
+          else
+            # Versioned releases use standard names
+            aws s3 cp hangar.flatpak s3://seth/hangar/releases/hangar.flatpak \
+              --endpoint-url https://nyc3.digitaloceanspaces.com \
+              --acl public-read
+            aws s3 cp "$APPIMAGE" s3://seth/hangar/releases/Hangar-x86_64.AppImage \
+              --endpoint-url https://nyc3.digitaloceanspaces.com \
+              --acl public-read
+          fi
