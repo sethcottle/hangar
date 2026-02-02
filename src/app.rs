@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::thread;
 
 use crate::atproto::{Conversation, HangarClient, Notification, Post, Profile, SavedFeed, Session};
+use crate::cache::{CacheDb, FeedCache, FeedState, PostCache, ProfileCache};
 use crate::state::SessionManager;
 use crate::ui::post_row::PostRow;
 use crate::ui::{ComposeDialog, HangarWindow, LoginDialog, NavItem, QuoteContext, ReplyContext};
@@ -22,6 +23,7 @@ mod imp {
     #[derive(Default)]
     pub struct HangarApplication {
         pub client: RefCell<Option<Arc<HangarClient>>>,
+        pub cache: RefCell<Option<CacheDb>>,
         pub window: RefCell<Option<HangarWindow>>,
         pub timeline_cursor: RefCell<Option<String>>,
         pub loading_more: RefCell<bool>,
@@ -268,6 +270,20 @@ impl HangarApplication {
         glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
             match rx.try_recv() {
                 Ok(Ok(session)) => {
+                    // Initialize cache for this user
+                    match CacheDb::open(&session.did) {
+                        Ok(cache) => {
+                            // Clean up stale entries on startup
+                            if let Err(e) = cache.cleanup_stale() {
+                                eprintln!("Cache cleanup failed: {}", e);
+                            }
+                            app.imp().cache.replace(Some(cache));
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to open cache: {}", e);
+                        }
+                    }
+
                     if app.imp().window.borrow().as_ref().is_some() {
                         app.fetch_user_profile(&session.did);
                         app.fetch_saved_feeds();
@@ -334,6 +350,20 @@ impl HangarApplication {
                             dialog.close();
                         }
 
+                        // Initialize cache for this user
+                        match CacheDb::open(&session.did) {
+                            Ok(cache) => {
+                                // Clean up stale entries on startup
+                                if let Err(e) = cache.cleanup_stale() {
+                                    eprintln!("Cache cleanup failed: {}", e);
+                                }
+                                app.imp().cache.replace(Some(cache));
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to open cache: {}", e);
+                            }
+                        }
+
                         // Fetch user profile for sidebar avatar
                         app.fetch_user_profile(&session.did);
 
@@ -373,6 +403,22 @@ impl HangarApplication {
         // Store the user DID for later use
         self.imp().user_did.replace(Some(did.to_string()));
 
+        // Try cache first for instant display
+        if let Some(cache) = self.imp().cache.borrow().as_ref() {
+            let profile_cache = ProfileCache::new(cache);
+            if let Ok(cached_profile) = profile_cache.get(did) {
+                if let Some(window) = self.imp().window.borrow().as_ref() {
+                    let display_name = cached_profile
+                        .display_name
+                        .as_deref()
+                        .unwrap_or(&cached_profile.handle);
+                    window.set_user_avatar(display_name, cached_profile.avatar.as_deref());
+                    window.set_current_user_did(did);
+                    window.update_profile_header(&cached_profile);
+                }
+            }
+        }
+
         let (tx, rx) = std::sync::mpsc::channel::<Result<Profile, String>>();
 
         let client = self.client();
@@ -388,6 +434,12 @@ impl HangarApplication {
         glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
             match rx.try_recv() {
                 Ok(Ok(profile)) => {
+                    // Store in cache
+                    if let Some(cache) = app.imp().cache.borrow().as_ref() {
+                        let profile_cache = ProfileCache::new(cache);
+                        let _ = profile_cache.store_full(&profile);
+                    }
+
                     if let Some(window) = app.imp().window.borrow().as_ref() {
                         let display_name =
                             profile.display_name.as_deref().unwrap_or(&profile.handle);
@@ -413,6 +465,28 @@ impl HangarApplication {
     }
 
     fn fetch_timeline(&self) {
+        // Try cache first for instant display
+        if let Some(cache) = self.imp().cache.borrow().as_ref() {
+            let feed_cache = FeedCache::new(cache);
+            if let Ok(cached_posts) = feed_cache.get_page("home", 0, 50) {
+                if !cached_posts.is_empty() {
+                    // Restore feed state from cache
+                    if let Ok(state) = feed_cache.get_state("home") {
+                        self.imp()
+                            .timeline_cursor
+                            .replace(state.oldest_cursor.clone());
+                        self.imp()
+                            .newest_post_uri
+                            .replace(state.newest_post_uri.clone());
+                    }
+                    if let Some(window) = self.imp().window.borrow().as_ref() {
+                        window.set_posts(cached_posts);
+                    }
+                    // Continue to fetch fresh data in background
+                }
+            }
+        }
+
         let (tx, rx) = std::sync::mpsc::channel::<Result<(Vec<Post>, Option<String>), String>>();
 
         let client = self.client();
@@ -426,13 +500,33 @@ impl HangarApplication {
         glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
             match rx.try_recv() {
                 Ok(Ok((posts, next_cursor))) => {
-                    app.imp().timeline_cursor.replace(next_cursor);
+                    app.imp().timeline_cursor.replace(next_cursor.clone());
                     // Set anchor to the newest post
                     if let Some(first) = posts.first() {
                         app.imp().newest_post_uri.replace(Some(first.uri.clone()));
                     }
                     // Clear any pending new posts since we just refreshed
                     app.imp().pending_new_posts.replace(Vec::new());
+
+                    // Store in cache
+                    if let Some(cache) = app.imp().cache.borrow().as_ref() {
+                        let post_cache = PostCache::new(cache);
+                        let feed_cache = FeedCache::new(cache);
+                        // Clear old feed items and store new ones
+                        let _ = feed_cache.clear_feed("home");
+                        let _ = post_cache.store_batch(&posts);
+                        let _ = feed_cache.store_page("home", &posts, 0);
+                        // Update feed state
+                        let state = FeedState {
+                            oldest_cursor: next_cursor,
+                            has_more: true,
+                            newest_post_uri: posts.first().map(|p| p.uri.clone()),
+                            newest_sort_timestamp: posts.first().map(|p| p.indexed_at.clone()),
+                            last_refresh_at: Some(CacheDb::now()),
+                        };
+                        let _ = feed_cache.set_state("home", &state);
+                    }
+
                     if let Some(window) = app.imp().window.borrow().as_ref() {
                         window.hide_new_posts_banner();
                         window.set_posts(posts);
@@ -785,7 +879,36 @@ impl HangarApplication {
             match rx.try_recv() {
                 Ok(Ok((posts, next_cursor))) => {
                     app.imp().loading_more.replace(false);
-                    app.imp().timeline_cursor.replace(next_cursor);
+                    app.imp().timeline_cursor.replace(next_cursor.clone());
+
+                    // Store in cache (append to existing feed)
+                    if let Some(cache) = app.imp().cache.borrow().as_ref() {
+                        let current_feed = app.imp().current_feed.borrow();
+                        let feed_key = current_feed
+                            .as_ref()
+                            .map(|f| {
+                                if f.is_home() {
+                                    "home".to_string()
+                                } else {
+                                    f.uri.clone()
+                                }
+                            })
+                            .unwrap_or_else(|| "home".to_string());
+                        drop(current_feed);
+
+                        let post_cache = PostCache::new(cache);
+                        let feed_cache = FeedCache::new(cache);
+                        let start_pos = feed_cache.count(&feed_key).unwrap_or(0) as i64;
+                        let _ = post_cache.store_batch(&posts);
+                        let _ = feed_cache.store_page(&feed_key, &posts, start_pos);
+                        // Update cursor in feed state
+                        if let Ok(mut state) = feed_cache.get_state(&feed_key) {
+                            state.oldest_cursor = next_cursor;
+                            state.has_more = state.oldest_cursor.is_some();
+                            let _ = feed_cache.set_state(&feed_key, &state);
+                        }
+                    }
+
                     if let Some(window) = app.imp().window.borrow().as_ref() {
                         window.set_loading_more(false);
                         if !posts.is_empty() {
@@ -1020,6 +1143,16 @@ impl HangarApplication {
     /// Fetch posts for the current feed (home timeline or custom feed)
     fn fetch_current_feed(&self) {
         let current_feed = self.imp().current_feed.borrow().clone();
+        let feed_key = current_feed
+            .as_ref()
+            .map(|f| {
+                if f.is_home() {
+                    "home".to_string()
+                } else {
+                    f.uri.clone()
+                }
+            })
+            .unwrap_or_else(|| "home".to_string());
         let feed_uri = current_feed.as_ref().and_then(|f| {
             if f.is_home() {
                 None
@@ -1028,13 +1161,35 @@ impl HangarApplication {
             }
         });
 
+        // Try cache first for instant display
+        if let Some(cache) = self.imp().cache.borrow().as_ref() {
+            let feed_cache = FeedCache::new(cache);
+            if let Ok(cached_posts) = feed_cache.get_page(&feed_key, 0, 50) {
+                if !cached_posts.is_empty() {
+                    // Restore feed state from cache
+                    if let Ok(state) = feed_cache.get_state(&feed_key) {
+                        self.imp()
+                            .timeline_cursor
+                            .replace(state.oldest_cursor.clone());
+                        self.imp()
+                            .newest_post_uri
+                            .replace(state.newest_post_uri.clone());
+                    }
+                    if let Some(window) = self.imp().window.borrow().as_ref() {
+                        window.set_posts(cached_posts);
+                    }
+                }
+            }
+        }
+
         let (tx, rx) = std::sync::mpsc::channel::<Result<(Vec<Post>, Option<String>), String>>();
         let client = self.client();
+        let feed_uri_clone = feed_uri.clone();
 
         thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             let result = rt.block_on(async {
-                match feed_uri {
+                match feed_uri_clone {
                     Some(uri) => client.get_feed(&uri, None).await,
                     None => client.get_timeline(None).await,
                 }
@@ -1043,14 +1198,33 @@ impl HangarApplication {
         });
 
         let app = self.clone();
+        let feed_key_for_cache = feed_key.clone();
         glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
             match rx.try_recv() {
                 Ok(Ok((posts, next_cursor))) => {
-                    app.imp().timeline_cursor.replace(next_cursor);
+                    app.imp().timeline_cursor.replace(next_cursor.clone());
                     if let Some(first) = posts.first() {
                         app.imp().newest_post_uri.replace(Some(first.uri.clone()));
                     }
                     app.imp().pending_new_posts.replace(Vec::new());
+
+                    // Store in cache
+                    if let Some(cache) = app.imp().cache.borrow().as_ref() {
+                        let post_cache = PostCache::new(cache);
+                        let feed_cache = FeedCache::new(cache);
+                        let _ = feed_cache.clear_feed(&feed_key_for_cache);
+                        let _ = post_cache.store_batch(&posts);
+                        let _ = feed_cache.store_page(&feed_key_for_cache, &posts, 0);
+                        let state = FeedState {
+                            oldest_cursor: next_cursor,
+                            has_more: true,
+                            newest_post_uri: posts.first().map(|p| p.uri.clone()),
+                            newest_sort_timestamp: posts.first().map(|p| p.indexed_at.clone()),
+                            last_refresh_at: Some(CacheDb::now()),
+                        };
+                        let _ = feed_cache.set_state(&feed_key_for_cache, &state);
+                    }
+
                     if let Some(window) = app.imp().window.borrow().as_ref() {
                         window.hide_new_posts_banner();
                         window.set_posts(posts);
