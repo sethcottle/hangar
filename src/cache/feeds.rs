@@ -191,6 +191,18 @@ impl<'a> FeedCache<'a> {
         Ok(count as usize)
     }
 
+    /// Check if the feed was refreshed recently
+    #[allow(dead_code)]
+    pub fn is_fresh(&self, feed_key: &str, max_age_secs: i64) -> bool {
+        if let Ok(state) = self.get_state(feed_key)
+            && let Some(last_refresh) = state.last_refresh_at
+        {
+            let now = CacheDb::now();
+            return (now - last_refresh) < max_age_secs;
+        }
+        false
+    }
+
     /// Convert a database row to a Post
     fn row_to_post(row: &rusqlite::Row) -> Result<Post, rusqlite::Error> {
         let embed_json: Option<String> = row.get(9)?;

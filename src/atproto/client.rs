@@ -567,6 +567,64 @@ impl HangarClient {
         })
     }
 
+    /// Fetch multiple profiles in a single batch request (up to 25 at a time)
+    #[allow(clippy::await_holding_lock)]
+    pub async fn get_profiles(&self, actors: &[String]) -> Result<Vec<Profile>, ClientError> {
+        if actors.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let agent_guard = self.agent.read().unwrap();
+        let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
+
+        // ATProto limits to 25 profiles per request
+        let actors: Vec<_> = actors
+            .iter()
+            .take(25)
+            .map(|a| {
+                a.parse()
+                    .map_err(|e| ClientError::InvalidResponse(format!("invalid actor: {e}")))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let params = atrium_api::app::bsky::actor::get_profiles::ParametersData { actors };
+
+        let output = agent
+            .api
+            .app
+            .bsky
+            .actor
+            .get_profiles(params.into())
+            .await
+            .map_err(|e| ClientError::Network(e.to_string()))?;
+
+        let profiles = output
+            .data
+            .profiles
+            .into_iter()
+            .map(|p| {
+                let viewer_following = p.viewer.as_ref().and_then(|v| v.data.following.clone());
+                let viewer_followed_by = p.viewer.as_ref().and_then(|v| v.data.followed_by.clone());
+
+                Profile {
+                    did: p.did.to_string(),
+                    handle: p.handle.to_string(),
+                    display_name: p.display_name.clone(),
+                    avatar: p.avatar.clone(),
+                    banner: p.banner.clone(),
+                    description: p.description.clone(),
+                    followers_count: p.followers_count.map(|c| c as u32),
+                    following_count: p.follows_count.map(|c| c as u32),
+                    posts_count: p.posts_count.map(|c| c as u32),
+                    viewer_following,
+                    viewer_followed_by,
+                }
+            })
+            .collect();
+
+        Ok(profiles)
+    }
+
     /// Like a post and return the URI of the created like record
     #[allow(clippy::await_holding_lock)]
     pub async fn like(&self, uri: &str, cid: &str) -> Result<String, ClientError> {

@@ -6,15 +6,22 @@ use gtk4::subclass::prelude::*;
 use gtk4::{gio, glib};
 use libadwaita as adw;
 use libadwaita::prelude::*;
+use once_cell::sync::Lazy;
 use std::cell::RefCell;
 use std::sync::Arc;
 use std::thread;
+use tokio::sync::Semaphore;
 
 use crate::atproto::{Conversation, HangarClient, Notification, Post, Profile, SavedFeed, Session};
 use crate::cache::{CacheDb, FeedCache, FeedState, PostCache, ProfileCache};
+use crate::runtime;
 use crate::state::SessionManager;
+use crate::ui::avatar_cache;
 use crate::ui::post_row::PostRow;
 use crate::ui::{ComposeDialog, HangarWindow, LoginDialog, NavItem, QuoteContext, ReplyContext};
+
+/// Limit concurrent API requests to prevent overwhelming the server during rapid scrolling
+static API_SEMAPHORE: Lazy<Arc<Semaphore>> = Lazy::new(|| Arc::new(Semaphore::new(4)));
 
 mod imp {
     use super::*;
@@ -56,6 +63,8 @@ mod imp {
         pub search_query: RefCell<Option<String>>,
         pub search_cursor: RefCell<Option<String>>,
         pub search_loading_more: RefCell<bool>,
+        /// Whether new posts polling has been started
+        pub polling_started: RefCell<bool>,
     }
 
     #[glib::object_subclass]
@@ -254,8 +263,7 @@ impl HangarApplication {
         let client = self.client();
 
         thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            let result = rt.block_on(async {
+            let result = runtime::block_on(async {
                 let session = SessionManager::load().await.map_err(|e| e.to_string())?;
                 client
                     .resume_session(&session)
@@ -277,6 +285,10 @@ impl HangarApplication {
                             if let Err(e) = cache.cleanup_stale() {
                                 eprintln!("Cache cleanup failed: {}", e);
                             }
+                            // Initialize image cache with database reference
+                            avatar_cache::init(Arc::new(cache.clone()));
+                            // Run image cache cleanup in background
+                            avatar_cache::cleanup_cache();
                             app.imp().cache.replace(Some(cache));
                         }
                         Err(e) => {
@@ -324,8 +336,7 @@ impl HangarApplication {
 
             let client = app.client();
             thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                let result = rt.block_on(async {
+                let result = runtime::block_on(async {
                     let session = client
                         .login(&handle, &password)
                         .await
@@ -357,6 +368,9 @@ impl HangarApplication {
                                 if let Err(e) = cache.cleanup_stale() {
                                     eprintln!("Cache cleanup failed: {}", e);
                                 }
+                                // Initialize image cache with database reference
+                                avatar_cache::init(Arc::new(cache.clone()));
+                                avatar_cache::cleanup_cache();
                                 app.imp().cache.replace(Some(cache));
                             }
                             Err(e) => {
@@ -404,6 +418,7 @@ impl HangarApplication {
         self.imp().user_did.replace(Some(did.to_string()));
 
         // Try cache first for instant display
+        let mut skip_fetch = false;
         if let Some(cache) = self.imp().cache.borrow().as_ref() {
             let profile_cache = ProfileCache::new(cache);
             if let Ok(cached_profile) = profile_cache.get(did) {
@@ -416,7 +431,16 @@ impl HangarApplication {
                     window.set_current_user_did(did);
                     window.update_profile_header(&cached_profile);
                 }
+                // Skip network fetch if cache is fresh (< 5 minutes)
+                if profile_cache.has_fresh_full(did, 300).unwrap_or(false) {
+                    skip_fetch = true;
+                }
             }
+        }
+
+        // Don't fetch if we have fresh data
+        if skip_fetch {
+            return;
         }
 
         let (tx, rx) = std::sync::mpsc::channel::<Result<Profile, String>>();
@@ -425,8 +449,7 @@ impl HangarApplication {
         let did = did.to_string();
         let did_for_window = did.clone();
         thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            let result = rt.block_on(async { client.get_profile(&did).await });
+            let result = runtime::block_on(async { client.get_profile(&did).await });
             let _ = tx.send(result.map_err(|e| e.to_string()));
         });
 
@@ -491,8 +514,7 @@ impl HangarApplication {
 
         let client = self.client();
         thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            let result = rt.block_on(async { client.get_timeline(None).await });
+            let result = runtime::block_on(async { client.get_timeline(None).await });
             let _ = tx.send(result.map_err(|e| e.to_string()));
         });
 
@@ -557,8 +579,7 @@ impl HangarApplication {
         if let Some(like_uri) = &post.viewer_like {
             let like_uri = like_uri.clone();
             thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                let result = rt.block_on(async { client.unlike(&like_uri).await });
+                let result = runtime::block_on(async { client.unlike(&like_uri).await });
                 let _ = tx.send(result.map(|_| None).map_err(|e| e.to_string()));
             });
         } else {
@@ -566,8 +587,7 @@ impl HangarApplication {
             let uri = post.uri.clone();
             let cid = post.cid.clone();
             thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                let result = rt.block_on(async { client.like(&uri, &cid).await });
+                let result = runtime::block_on(async { client.like(&uri, &cid).await });
                 let _ = tx.send(result.map(Some).map_err(|e| e.to_string()));
             });
         }
@@ -616,8 +636,7 @@ impl HangarApplication {
             let text = text.to_string();
 
             thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                let result = rt.block_on(async { client.create_post(&text).await });
+                let result = runtime::block_on(async { client.create_post(&text).await });
                 let _ = tx.send(result.map_err(|e| e.to_string()));
             });
 
@@ -683,9 +702,9 @@ impl HangarApplication {
             let text = text.to_string();
 
             thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                let result = rt
-                    .block_on(async { client.create_reply(&text, &parent_uri, &parent_cid).await });
+                let result = runtime::block_on(async {
+                    client.create_reply(&text, &parent_uri, &parent_cid).await
+                });
                 let _ = tx.send(result.map_err(|e| e.to_string()));
             });
 
@@ -752,8 +771,7 @@ impl HangarApplication {
             let text = text.to_string();
 
             thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                let result = rt.block_on(async {
+                let result = runtime::block_on(async {
                     client
                         .create_quote_post(&text, &quoted_uri, &quoted_cid)
                         .await
@@ -801,8 +819,7 @@ impl HangarApplication {
         if let Some(repost_uri) = &post.viewer_repost {
             let repost_uri = repost_uri.clone();
             thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                let result = rt.block_on(async { client.delete_repost(&repost_uri).await });
+                let result = runtime::block_on(async { client.delete_repost(&repost_uri).await });
                 let _ = tx.send(result.map(|_| None).map_err(|e| e.to_string()));
             });
         } else {
@@ -810,8 +827,7 @@ impl HangarApplication {
             let uri = post.uri.clone();
             let cid = post.cid.clone();
             thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                let result = rt.block_on(async { client.repost(&uri, &cid).await });
+                let result = runtime::block_on(async { client.repost(&uri, &cid).await });
                 let _ = tx.send(result.map(Some).map_err(|e| e.to_string()));
             });
         }
@@ -863,9 +879,11 @@ impl HangarApplication {
 
         let (tx, rx) = std::sync::mpsc::channel::<Result<(Vec<Post>, Option<String>), String>>();
         let client = self.client();
+        let semaphore = API_SEMAPHORE.clone();
         thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            let result = rt.block_on(async {
+            let result = runtime::block_on(async {
+                // Acquire permit to limit concurrent API requests
+                let _permit = semaphore.acquire().await;
                 match feed_uri {
                     Some(uri) => client.get_feed(&uri, Some(&cursor)).await,
                     None => client.get_timeline(Some(&cursor)).await,
@@ -938,6 +956,12 @@ impl HangarApplication {
     }
 
     fn start_new_posts_polling(&self) {
+        // Only start polling once
+        if *self.imp().polling_started.borrow() {
+            return;
+        }
+        self.imp().polling_started.replace(true);
+
         let app = self.clone();
         // Poll every 30 seconds for new posts
         glib::timeout_add_seconds_local(30, move || {
@@ -947,7 +971,7 @@ impl HangarApplication {
     }
 
     fn check_for_new_posts(&self) {
-        // Don't check if we're already checking or if user is at top (they'll see new posts on refresh)
+        // Don't check if we're already checking
         if *self.imp().checking_new_posts.borrow() {
             return;
         }
@@ -974,8 +998,7 @@ impl HangarApplication {
         let client = self.client();
 
         thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            let result = rt.block_on(async {
+            let result = runtime::block_on(async {
                 match feed_uri {
                     Some(uri) => client.get_feed(&uri, None).await,
                     None => client.get_timeline(None).await,
@@ -996,39 +1019,24 @@ impl HangarApplication {
                         .take_while(|p| p.uri != anchor_uri)
                         .collect();
 
-                    if !new_posts.is_empty() {
-                        // Check if user is at top - if so, just prepend and update anchor
-                        let is_at_top = app
-                            .imp()
-                            .window
-                            .borrow()
-                            .as_ref()
-                            .map(|w| w.is_at_top())
-                            .unwrap_or(true);
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        // Always refresh timestamps on poll
+                        window.refresh_timestamps();
 
-                        if is_at_top {
-                            // User is at top, show new posts immediately
-                            if let Some(first) = new_posts.first() {
-                                app.imp().newest_post_uri.replace(Some(first.uri.clone()));
-                            }
-                            if let Some(window) = app.imp().window.borrow().as_ref() {
-                                window.prepend_posts(new_posts);
-                            }
-                        } else {
-                            // User is scrolled away, accumulate and show banner
-                            let mut pending = app.imp().pending_new_posts.borrow_mut();
-                            for post in new_posts.into_iter().rev() {
-                                // Check if we already have this post
-                                if !pending.iter().any(|p| p.uri == post.uri) {
-                                    pending.insert(0, post);
-                                }
-                            }
-                            let count = pending.len();
-                            drop(pending);
+                        if !new_posts.is_empty() {
+                            let count = new_posts.len();
 
-                            if let Some(window) = app.imp().window.borrow().as_ref() {
-                                window.show_new_posts_banner(count);
+                            // Update anchor to newest post
+                            if let Some(newest) = new_posts.first() {
+                                app.imp().newest_post_uri.replace(Some(newest.uri.clone()));
                             }
+
+                            // Insert new posts at the top of the timeline
+                            // User can scroll up to see them
+                            window.insert_posts_at_top(new_posts);
+
+                            // Show banner to let user know there are new posts above
+                            window.show_new_posts_banner(count);
                         }
                     }
                     glib::ControlFlow::Break
@@ -1048,23 +1056,9 @@ impl HangarApplication {
     }
 
     fn show_new_posts(&self) {
-        let pending = self.imp().pending_new_posts.borrow().clone();
-        if pending.is_empty() {
-            return;
-        }
-
-        // Update anchor to the newest post
-        if let Some(first) = pending.first() {
-            self.imp().newest_post_uri.replace(Some(first.uri.clone()));
-        }
-
-        // Clear pending
-        self.imp().pending_new_posts.replace(Vec::new());
-
-        // Prepend posts and scroll to top
+        // Posts are already in the model - just scroll to top to see them
         if let Some(window) = self.imp().window.borrow().as_ref() {
             window.hide_new_posts_banner();
-            window.prepend_posts(pending);
             window.scroll_to_top();
         }
     }
@@ -1075,8 +1069,7 @@ impl HangarApplication {
         let client = self.client();
 
         thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            let result = rt.block_on(async { client.get_saved_feeds().await });
+            let result = runtime::block_on(async { client.get_saved_feeds().await });
             let _ = tx.send(result.map_err(|e| e.to_string()));
         });
 
@@ -1187,8 +1180,7 @@ impl HangarApplication {
         let feed_uri_clone = feed_uri.clone();
 
         thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            let result = rt.block_on(async {
+            let result = runtime::block_on(async {
                 match feed_uri_clone {
                     Some(uri) => client.get_feed(&uri, None).await,
                     None => client.get_timeline(None).await,
@@ -1253,8 +1245,7 @@ impl HangarApplication {
         let main_post = post.clone();
 
         thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            let result = rt.block_on(async { client.get_thread(&post_uri).await });
+            let result = runtime::block_on(async { client.get_thread(&post_uri).await });
             let _ = tx.send(result.map_err(|e| e.to_string()));
         });
 
@@ -1288,8 +1279,7 @@ impl HangarApplication {
         let profile_clone = profile.clone();
 
         thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            let result = rt.block_on(async { client.get_author_feed(&actor, None).await });
+            let result = runtime::block_on(async { client.get_author_feed(&actor, None).await });
             let _ = tx.send(result.map_err(|e| e.to_string()));
         });
 
@@ -1364,8 +1354,7 @@ impl HangarApplication {
         let client = self.client();
 
         thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            let result = rt.block_on(async { client.get_notifications(None, true).await });
+            let result = runtime::block_on(async { client.get_notifications(None, true).await });
             let _ = tx.send(result.map_err(|e| e.to_string()));
         });
 
@@ -1410,10 +1399,13 @@ impl HangarApplication {
         let (tx, rx) =
             std::sync::mpsc::channel::<Result<(Vec<Notification>, Option<String>), String>>();
         let client = self.client();
+        let semaphore = API_SEMAPHORE.clone();
 
         thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            let result = rt.block_on(async { client.get_notifications(Some(&cursor), true).await });
+            let result = runtime::block_on(async {
+                let _permit = semaphore.acquire().await;
+                client.get_notifications(Some(&cursor), true).await
+            });
             let _ = tx.send(result.map_err(|e| e.to_string()));
         });
 
@@ -1471,9 +1463,8 @@ impl HangarApplication {
         let client = self.client();
 
         thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
             // Pass false for mentions_only to get all notifications
-            let result = rt.block_on(async { client.get_notifications(None, false).await });
+            let result = runtime::block_on(async { client.get_notifications(None, false).await });
             let _ = tx.send(result.map_err(|e| e.to_string()));
         });
 
@@ -1518,12 +1509,14 @@ impl HangarApplication {
         let (tx, rx) =
             std::sync::mpsc::channel::<Result<(Vec<Notification>, Option<String>), String>>();
         let client = self.client();
+        let semaphore = API_SEMAPHORE.clone();
 
         thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
             // Pass false for mentions_only to get all notifications
-            let result =
-                rt.block_on(async { client.get_notifications(Some(&cursor), false).await });
+            let result = runtime::block_on(async {
+                let _permit = semaphore.acquire().await;
+                client.get_notifications(Some(&cursor), false).await
+            });
             let _ = tx.send(result.map_err(|e| e.to_string()));
         });
 
@@ -1581,8 +1574,7 @@ impl HangarApplication {
         let client = self.client();
 
         thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            let result = rt.block_on(async { client.get_conversations(None).await });
+            let result = runtime::block_on(async { client.get_conversations(None).await });
             let _ = tx.send(result.map_err(|e| e.to_string()));
         });
 
@@ -1629,8 +1621,7 @@ impl HangarApplication {
         let client = self.client();
 
         thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            let result = rt.block_on(async { client.get_conversations(Some(&cursor)).await });
+            let result = runtime::block_on(async { client.get_conversations(Some(&cursor)).await });
             let _ = tx.send(result.map_err(|e| e.to_string()));
         });
 
@@ -1705,8 +1696,7 @@ impl HangarApplication {
         let client = self.client();
 
         thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            let result = rt.block_on(async { client.get_author_feed(&user_did, None).await });
+            let result = runtime::block_on(async { client.get_author_feed(&user_did, None).await });
             let _ = tx.send(result.map_err(|e| e.to_string()));
         });
 
@@ -1756,9 +1746,8 @@ impl HangarApplication {
         let client = self.client();
 
         thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
             let result =
-                rt.block_on(async { client.get_author_feed(&user_did, Some(&cursor)).await });
+                runtime::block_on(async { client.get_author_feed(&user_did, Some(&cursor)).await });
             let _ = tx.send(result.map_err(|e| e.to_string()));
         });
 
@@ -1823,8 +1812,7 @@ impl HangarApplication {
         let client = self.client();
 
         thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            let result = rt.block_on(async { client.get_actor_likes(&user_did, None).await });
+            let result = runtime::block_on(async { client.get_actor_likes(&user_did, None).await });
             let _ = tx.send(result.map_err(|e| e.to_string()));
         });
 
@@ -1874,9 +1862,8 @@ impl HangarApplication {
         let client = self.client();
 
         thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
             let result =
-                rt.block_on(async { client.get_actor_likes(&user_did, Some(&cursor)).await });
+                runtime::block_on(async { client.get_actor_likes(&user_did, Some(&cursor)).await });
             let _ = tx.send(result.map_err(|e| e.to_string()));
         });
 
@@ -1945,8 +1932,7 @@ impl HangarApplication {
         let query = query.to_string();
 
         thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            let result = rt.block_on(async { client.search_posts(&query, None).await });
+            let result = runtime::block_on(async { client.search_posts(&query, None).await });
             let _ = tx.send(result.map_err(|e| e.to_string()));
         });
 
@@ -2001,10 +1987,13 @@ impl HangarApplication {
 
         let (tx, rx) = std::sync::mpsc::channel::<Result<(Vec<Post>, Option<String>), String>>();
         let client = self.client();
+        let semaphore = API_SEMAPHORE.clone();
 
         thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            let result = rt.block_on(async { client.search_posts(&query, Some(&cursor)).await });
+            let result = runtime::block_on(async {
+                let _permit = semaphore.acquire().await;
+                client.search_posts(&query, Some(&cursor)).await
+            });
             let _ = tx.send(result.map_err(|e| e.to_string()));
         });
 

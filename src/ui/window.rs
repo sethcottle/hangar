@@ -150,6 +150,7 @@ mod imp {
         // NavigationView for Mentions section (for thread/profile drill-down)
         pub mentions_nav_view: RefCell<Option<adw::NavigationView>>,
         pub timeline_model: RefCell<Option<gio::ListStore>>,
+        pub timeline_list_view: RefCell<Option<gtk4::ListView>>,
         pub load_more_callback: RefCell<Option<Box<dyn Fn() + 'static>>>,
         pub refresh_callback: RefCell<Option<Box<dyn Fn() + 'static>>>,
         pub like_callback: RefCell<Option<Box<dyn Fn(Post, glib::WeakRef<PostRow>) + 'static>>>,
@@ -614,9 +615,32 @@ impl HangarWindow {
 
         let imp = self.imp();
         imp.timeline_model.replace(Some(model));
+        imp.timeline_list_view.replace(Some(list_view.clone()));
         imp.loading_spinner.replace(Some(spinner));
         imp.new_posts_banner.replace(Some(new_posts_btn));
         imp.scrolled_window.replace(Some(scrolled.clone()));
+
+        // Start timestamp refresh timer (every 60 seconds)
+        glib::timeout_add_seconds_local(
+            60,
+            glib::clone!(
+                #[weak]
+                list_view,
+                #[upgrade_or]
+                glib::ControlFlow::Break,
+                move || {
+                    // Iterate over visible children and refresh their timestamps
+                    let mut child = list_view.first_child();
+                    while let Some(widget) = child {
+                        if let Some(post_row) = widget.downcast_ref::<PostRow>() {
+                            post_row.refresh_timestamp();
+                        }
+                        child = widget.next_sibling();
+                    }
+                    glib::ControlFlow::Continue
+                }
+            ),
+        );
 
         let adj = scrolled.vadjustment();
         adj.connect_value_changed(glib::clone!(
@@ -626,7 +650,16 @@ impl HangarWindow {
                 let value = adj.value();
                 let upper = adj.upper();
                 let page_size = adj.page_size();
-                if value >= upper - page_size - 200.0
+
+                // Auto-hide "new posts" banner when user scrolls to top
+                if value < 50.0 {
+                    win.hide_new_posts_banner();
+                }
+
+                // Prefetch when user is at 70% scroll (30% remaining content)
+                // This gives more time for content to load before user reaches the end
+                let scroll_threshold = (upper - page_size) * 0.7;
+                if value >= scroll_threshold
                     && let Some(cb) = win.imp().load_more_callback.borrow().as_ref()
                 {
                     cb();
@@ -747,6 +780,12 @@ impl HangarWindow {
         if let Some(scrolled) = self.imp().scrolled_window.borrow().as_ref() {
             let adj = scrolled.vadjustment();
             adj.set_value(0.0);
+
+            // Schedule another scroll after GTK processes
+            let scrolled_clone = scrolled.clone();
+            glib::idle_add_local_once(move || {
+                scrolled_clone.vadjustment().set_value(0.0);
+            });
         }
     }
 
@@ -761,10 +800,95 @@ impl HangarWindow {
 
     pub fn prepend_posts(&self, posts: Vec<Post>) {
         if let Some(model) = self.imp().timeline_model.borrow().as_ref() {
-            // Insert at the beginning
-            for (i, post) in posts.into_iter().enumerate() {
+            // Collect existing posts first
+            let existing_count = model.n_items();
+            let mut all_posts: Vec<Post> = posts;
+            for i in 0..existing_count {
+                if let Some(obj) = model.item(i) {
+                    if let Ok(post_obj) = obj.downcast::<PostObject>() {
+                        if let Some(post) = post_obj.post() {
+                            all_posts.push(post);
+                        }
+                    }
+                }
+            }
+
+            // Clear and rebuild - this resets the ListView state properly
+            model.remove_all();
+            for post in all_posts {
                 let post_object = PostObject::new(post);
-                model.insert(i as u32, &post_object);
+                model.append(&post_object);
+            }
+        }
+    }
+
+    /// Insert new posts at the top of the timeline without disrupting the current view.
+    /// Rebuilds the model with new posts prepended, then restores scroll position.
+    pub fn insert_posts_at_top(&self, posts: Vec<Post>) {
+        let Some(model) = self.imp().timeline_model.borrow().as_ref().cloned() else {
+            return;
+        };
+        if self.imp().timeline_list_view.borrow().is_none() {
+            return;
+        }
+        let Some(scrolled) = self.imp().scrolled_window.borrow().as_ref().cloned() else {
+            return;
+        };
+
+        let new_count = posts.len();
+        if new_count == 0 {
+            return;
+        }
+
+        // Capture scroll state BEFORE modifying the model
+        let adj = scrolled.vadjustment();
+        let current_scroll = adj.value();
+        let old_upper = adj.upper();
+
+        // Collect all existing posts
+        let existing_count = model.n_items();
+        let mut all_posts: Vec<Post> = posts;
+        for i in 0..existing_count {
+            if let Some(obj) = model.item(i) {
+                if let Ok(post_obj) = obj.downcast::<PostObject>() {
+                    if let Some(post) = post_obj.post() {
+                        all_posts.push(post);
+                    }
+                }
+            }
+        }
+
+        // Clear and rebuild model
+        model.remove_all();
+        for post in all_posts {
+            let post_object = PostObject::new(post);
+            model.append(&post_object);
+        }
+
+        // Restore scroll position after GTK recalculates layout.
+        // The new content adds height at the top, so we add that difference
+        // to the current scroll to keep viewing the same content.
+        glib::idle_add_local_once(move || {
+            let new_upper = adj.upper();
+            let height_added = new_upper - old_upper;
+
+            if height_added > 0.0 {
+                // Add the height of new posts to maintain position
+                let new_scroll = current_scroll + height_added;
+                adj.set_value(new_scroll);
+            }
+        });
+    }
+
+    /// Refresh all visible post timestamps
+    pub fn refresh_timestamps(&self) {
+        if let Some(list_view) = self.imp().timeline_list_view.borrow().as_ref() {
+            let mut child = list_view.first_child();
+            while let Some(widget) = child {
+                if let Some(post_row) = widget.downcast_ref::<PostRow>() {
+                    post_row.refresh_timestamp();
+                }
+                child = widget.next_sibling();
             }
         }
     }

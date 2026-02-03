@@ -50,7 +50,6 @@
 /* Post embed images */
 .post-embed-image {
     border-radius: 12px;
-    overflow: hidden;
     border: none;
     background: transparent;
 }
@@ -162,7 +161,6 @@ popover.menu > contents {
 /* Video embed */
 .video-embed {
     border-radius: 12px;
-    overflow: hidden;
 }
 
 .video-embed .osd.circular {
@@ -192,7 +190,6 @@ popover.menu > contents {
 /* Image grid layouts */
 .post-embed .image-grid {
     border-radius: 12px;
-    overflow: hidden;
 }
 
 /* Caption class for smaller text */

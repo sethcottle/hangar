@@ -45,6 +45,8 @@ mod imp {
         pub is_reposted: RefCell<bool>,
         pub viewer_like_uri: RefCell<Option<String>>,
         pub viewer_repost_uri: RefCell<Option<String>>,
+        // Store indexed_at for timestamp refresh
+        pub indexed_at: RefCell<String>,
         // Navigation callbacks
         pub post_clicked_callback: RefCell<Option<Box<dyn Fn(Post) + 'static>>>,
         pub profile_clicked_callback: RefCell<Option<Box<dyn Fn(Profile) + 'static>>>,
@@ -113,7 +115,7 @@ impl PostRow {
         avatar_btn.add_css_class("flat");
         avatar_btn.add_css_class("circular");
         avatar_btn.set_cursor_from_name(Some("pointer"));
-        let avatar = adw::Avatar::new(40, None, true);
+        let avatar = adw::Avatar::new(48, None, true);
         avatar_btn.set_child(Some(&avatar));
         header.append(&avatar_btn);
 
@@ -558,6 +560,8 @@ impl PostRow {
         if let Some(label) = imp.timestamp_label.borrow().as_ref() {
             label.set_text(&Self::format_timestamp(&post.indexed_at));
         }
+        // Store indexed_at for timestamp refresh
+        imp.indexed_at.replace(post.indexed_at.clone());
 
         if let Some(label) = imp.content_label.borrow().as_ref() {
             label.set_text(&post.text);
@@ -964,6 +968,17 @@ impl PostRow {
             format!("{}d", duration.num_days())
         } else {
             post_time.format("%b %d").to_string()
+        }
+    }
+
+    /// Refresh the timestamp display (for periodic updates)
+    pub fn refresh_timestamp(&self) {
+        let imp = self.imp();
+        let indexed_at = imp.indexed_at.borrow();
+        if !indexed_at.is_empty() {
+            if let Some(label) = imp.timestamp_label.borrow().as_ref() {
+                label.set_text(&Self::format_timestamp(&indexed_at));
+            }
         }
     }
 }

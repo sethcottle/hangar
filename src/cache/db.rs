@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 /// Handle to the cache database for a specific user
+#[derive(Clone)]
 pub struct CacheDb {
     conn: Arc<Mutex<Connection>>,
     #[allow(dead_code)]

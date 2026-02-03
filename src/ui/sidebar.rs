@@ -113,7 +113,7 @@ impl Sidebar {
         avatar_box.set_margin_bottom(8);
         avatar_box.set_halign(gtk4::Align::Center);
 
-        let avatar = adw::Avatar::new(40, None, true);
+        let avatar = adw::Avatar::new(48, None, true);
         avatar.set_tooltip_text(Some("Account"));
         avatar_box.append(&avatar);
 
