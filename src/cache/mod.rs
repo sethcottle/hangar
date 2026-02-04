@@ -2,14 +2,12 @@
 
 mod db;
 mod feeds;
-mod images;
 mod posts;
 mod profiles;
 mod schema;
 
 pub use db::CacheDb;
 pub use feeds::{FeedCache, FeedState};
-pub use images::{CacheStats, ImageCache};
 pub use posts::PostCache;
 pub use profiles::ProfileCache;
 

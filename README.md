@@ -15,7 +15,7 @@ Hangar is a desktop Bluesky client designed specifically for Linux and the GNOME
 ### Goals
 
 - **Purpose-built**: Built for Linux, feels at home in GNOME, with each feature being meticulously crafted
-- **Performance**: Instant startup, smooth scrolling, efficient memory usage
+- **Performance**: Instant startup, smooth scrolling, efficient memory usage, optimized networking
 - **Full Bluesky support**: Timeline, feeds, posts, interactions, notifications, and DMs
 
 ## Current Status
@@ -27,7 +27,7 @@ This is a **technical preview**. The app is functional but incomplete. Developme
 - **Authentication**: Login with handle + app password, session persistence via libsecret
 - **Timeline**: Home feed with infinite scroll, cursor-based pagination, pull-to-refresh
 - **Custom Feeds**: Feed selector with Following, Discover, and pinned feeds
-- **New Posts Banner**: Background polling with "N new posts" indicator
+- **Live Updates**: Background polling with seamless new post insertion, "N new posts" banner
 - **Rich Embeds**: Images (smart grid layouts), external links, quote posts, video thumbnails
 - **Interactions**: Like, repost, quote, reply with visual state feedback
 - **Compose**: Text posts, replies, quote posts
@@ -46,7 +46,6 @@ This is a **technical preview**. The app is functional but incomplete. Developme
 - Follow/unfollow
 - Viewing followers/following
 - Profile editing
-- Offline support / SQLite cache
 - OAuth authentication
 - Bookmarks (requires OAuth)
 - Lots of polish
@@ -167,7 +166,7 @@ src/
     ├── post_row.rs      # Post widget
     ├── compose_dialog.rs
     ├── login_dialog.rs
-    └── avatar_cache.rs  # Image loading/caching
+    └── avatar_cache.rs  # Image loading with LRU + disk caching
 ```
 
 ## Contributing

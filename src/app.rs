@@ -263,6 +263,8 @@ impl HangarApplication {
         let client = self.client();
 
         thread::spawn(move || {
+            // Use the shared runtime for network operations so the HTTP client
+            // context is consistent across all API calls
             let result = runtime::block_on(async {
                 let session = SessionManager::load().await.map_err(|e| e.to_string())?;
                 client
@@ -281,10 +283,13 @@ impl HangarApplication {
                     // Initialize cache for this user
                     match CacheDb::open(&session.did) {
                         Ok(cache) => {
-                            // Clean up stale entries on startup
-                            if let Err(e) = cache.cleanup_stale() {
-                                eprintln!("Cache cleanup failed: {}", e);
-                            }
+                            // Clean up stale entries in background to not block UI
+                            let cache_for_cleanup = cache.clone();
+                            std::thread::spawn(move || {
+                                if let Err(e) = cache_for_cleanup.cleanup_stale() {
+                                    eprintln!("Cache cleanup failed: {}", e);
+                                }
+                            });
                             // Initialize image cache with database reference
                             avatar_cache::init(Arc::new(cache.clone()));
                             // Run image cache cleanup in background
@@ -336,14 +341,21 @@ impl HangarApplication {
 
             let client = app.client();
             thread::spawn(move || {
+                // Use the shared runtime for network operations so the HTTP client
+                // context is consistent across all API calls
                 let result = runtime::block_on(async {
                     let session = client
                         .login(&handle, &password)
                         .await
                         .map_err(|e| e.to_string())?;
-                    if let Err(e) = SessionManager::store(&session).await {
-                        eprintln!("Failed to persist session: {}", e);
-                    }
+                    // Store session in a separate task to not block login
+                    // SecretService can be slow, so we fire and forget
+                    let session_for_store = session.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = SessionManager::store(&session_for_store).await {
+                            eprintln!("Failed to persist session: {}", e);
+                        }
+                    });
                     Ok(session)
                 });
                 let _ = tx.send(result);
@@ -364,10 +376,13 @@ impl HangarApplication {
                         // Initialize cache for this user
                         match CacheDb::open(&session.did) {
                             Ok(cache) => {
-                                // Clean up stale entries on startup
-                                if let Err(e) = cache.cleanup_stale() {
-                                    eprintln!("Cache cleanup failed: {}", e);
-                                }
+                                // Clean up stale entries in background to not block UI
+                                let cache_for_cleanup = cache.clone();
+                                std::thread::spawn(move || {
+                                    if let Err(e) = cache_for_cleanup.cleanup_stale() {
+                                        eprintln!("Cache cleanup failed: {}", e);
+                                    }
+                                });
                                 // Initialize image cache with database reference
                                 avatar_cache::init(Arc::new(cache.clone()));
                                 avatar_cache::cleanup_cache();

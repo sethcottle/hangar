@@ -28,6 +28,7 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
 
 /// Spawn a future on the shared runtime without blocking.
 /// Returns a JoinHandle that can be used to await the result.
+#[allow(dead_code)]
 pub fn spawn<F>(future: F) -> tokio::task::JoinHandle<F::Output>
 where
     F: Future + Send + 'static,
