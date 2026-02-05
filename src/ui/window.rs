@@ -1164,105 +1164,110 @@ impl HangarWindow {
             .cloned()
             .unwrap_or_else(|| main_post.clone());
 
-        // Create scrollable content
+        // Create scrollable content - use a simple Box instead of multiple ListViews
+        // to avoid height calculation issues with nested scrolling
         let scroll_content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        scroll_content.add_css_class("background");
 
-        // Helper to create a post list section
-        let create_post_list = |win: &Self, posts_to_show: Vec<Post>| -> gtk4::ListView {
-            let model = gio::ListStore::new::<PostObject>();
-            let factory = gtk4::SignalListItemFactory::new();
+        // Helper to create a PostRow with all callbacks wired up
+        let create_post_row = |win: &Self, post: Post| -> PostRow {
+            let post_row = PostRow::new();
+            post_row.bind(&post);
 
-            factory.connect_setup(|_, item| {
-                let post_row = PostRow::new();
-                if let Some(list_item) = item.downcast_ref::<gtk4::ListItem>() {
-                    list_item.set_child(Some(&post_row));
+            // Like callback
+            let post_for_like = post.clone();
+            let w = win.clone();
+            post_row.connect_like_clicked(move |row, was_liked, like_uri| {
+                let mut post_with_state = post_for_like.clone();
+                post_with_state.viewer_like = if was_liked { like_uri } else { None };
+                let row_weak = row.downgrade();
+                w.imp()
+                    .like_callback
+                    .borrow()
+                    .as_ref()
+                    .map(|cb| cb(post_with_state, row_weak));
+            });
+
+            // Repost callback
+            let post_for_repost = post.clone();
+            let w = win.clone();
+            post_row.connect_repost_clicked(move |row, was_reposted, repost_uri| {
+                let mut post_with_state = post_for_repost.clone();
+                post_with_state.viewer_repost = if was_reposted { repost_uri } else { None };
+                let row_weak = row.downgrade();
+                w.imp()
+                    .repost_callback
+                    .borrow()
+                    .as_ref()
+                    .map(|cb| cb(post_with_state, row_weak));
+            });
+
+            // Quote callback
+            let post_for_quote = post.clone();
+            let w = win.clone();
+            post_row.connect_quote_clicked(move || {
+                w.imp()
+                    .quote_callback
+                    .borrow()
+                    .as_ref()
+                    .map(|cb| cb(post_for_quote.clone()));
+            });
+
+            // Reply callback
+            let post_clone = post.clone();
+            let w = win.clone();
+            post_row.connect_reply_clicked(move || {
+                w.imp()
+                    .reply_callback
+                    .borrow()
+                    .as_ref()
+                    .map(|cb| cb(post_clone.clone()));
+            });
+
+            // Navigation callbacks - these were missing!
+            let w = win.clone();
+            post_row.set_post_clicked_callback(move |p| {
+                if let Some(cb) = w.imp().post_clicked_callback.borrow().as_ref() {
+                    cb(p);
                 }
             });
 
             let w = win.clone();
-            factory.connect_bind(move |_, item| {
-                if let Some(list_item) = item.downcast_ref::<gtk4::ListItem>()
-                    && let Some(post_object) = list_item.item().and_downcast::<PostObject>()
-                    && let Some(post) = post_object.post()
-                    && let Some(post_row) = list_item.child().and_downcast::<PostRow>()
-                {
-                    post_row.bind(&post);
-                    let post_for_like = post.clone();
-                    let win = w.clone();
-                    post_row.connect_like_clicked(move |row, was_liked, like_uri| {
-                        let mut post_with_state = post_for_like.clone();
-                        post_with_state.viewer_like = if was_liked { like_uri } else { None };
-                        let row_weak = row.downgrade();
-                        win.imp()
-                            .like_callback
-                            .borrow()
-                            .as_ref()
-                            .map(|cb| cb(post_with_state, row_weak));
-                    });
-                    let post_for_repost = post.clone();
-                    let win = w.clone();
-                    post_row.connect_repost_clicked(move |row, was_reposted, repost_uri| {
-                        let mut post_with_state = post_for_repost.clone();
-                        post_with_state.viewer_repost =
-                            if was_reposted { repost_uri } else { None };
-                        let row_weak = row.downgrade();
-                        win.imp()
-                            .repost_callback
-                            .borrow()
-                            .as_ref()
-                            .map(|cb| cb(post_with_state, row_weak));
-                    });
-                    let post_for_quote = post.clone();
-                    let win = w.clone();
-                    post_row.connect_quote_clicked(move || {
-                        win.imp()
-                            .quote_callback
-                            .borrow()
-                            .as_ref()
-                            .map(|cb| cb(post_for_quote.clone()));
-                    });
-                    let post_clone = post.clone();
-                    let win = w.clone();
-                    post_row.connect_reply_clicked(move || {
-                        win.imp()
-                            .reply_callback
-                            .borrow()
-                            .as_ref()
-                            .map(|cb| cb(post_clone.clone()));
-                    });
+            post_row.set_profile_clicked_callback(move |profile| {
+                if let Some(cb) = w.imp().profile_clicked_callback.borrow().as_ref() {
+                    cb(profile);
                 }
             });
 
-            for post in posts_to_show {
-                model.append(&PostObject::new(post));
-            }
+            let w = win.clone();
+            post_row.set_mention_clicked_callback(move |handle| {
+                if let Some(cb) = w.imp().mention_clicked_callback.borrow().as_ref() {
+                    cb(handle);
+                }
+            });
 
-            let selection = gtk4::NoSelection::new(Some(model));
-            let list_view = gtk4::ListView::new(Some(selection), Some(factory));
-            list_view.add_css_class("background");
-            list_view
+            post_row
         };
 
         // Add parent posts (if any)
-        if !parent_posts.is_empty() {
-            let parent_list = create_post_list(self, parent_posts);
-            scroll_content.append(&parent_list);
+        for post in parent_posts {
+            let post_row = create_post_row(self, post);
+            scroll_content.append(&post_row);
         }
 
         // Add the main post
-        let main_list = create_post_list(self, vec![the_main_post.clone()]);
-        scroll_content.append(&main_list);
+        let main_row = create_post_row(self, the_main_post.clone());
+        scroll_content.append(&main_row);
 
         // Add "Posted {date}" separator
-        let posted_separator = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+        let posted_separator = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
         posted_separator.add_css_class("thread-separator");
-        posted_separator.set_margin_top(8);
-        posted_separator.set_margin_bottom(8);
 
         // Format the date: "Posted Sat, Jan 31, 2026 at 12:50 PM"
         let posted_text = Self::format_full_timestamp(&the_main_post.indexed_at);
         let posted_label = gtk4::Label::new(Some(&posted_text));
         posted_label.add_css_class("dim-label");
+        posted_label.set_hexpand(true);
         posted_label.set_halign(gtk4::Align::Center);
         posted_separator.append(&posted_label);
 
@@ -1270,29 +1275,49 @@ impl HangarWindow {
 
         // Add "Replies" section if there are replies
         if !reply_posts.is_empty() {
+            let replies_header = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+            replies_header.set_margin_start(16);
+            replies_header.set_margin_end(16);
+            replies_header.set_margin_top(16);
+            replies_header.set_margin_bottom(8);
+
             let replies_label = gtk4::Label::new(Some("Replies"));
             replies_label.add_css_class("title-4");
             replies_label.set_halign(gtk4::Align::Start);
-            replies_label.set_margin_start(16);
-            replies_label.set_margin_top(8);
-            replies_label.set_margin_bottom(8);
-            scroll_content.append(&replies_label);
+            replies_header.append(&replies_label);
 
-            let replies_list = create_post_list(self, reply_posts);
-            scroll_content.append(&replies_list);
+            scroll_content.append(&replies_header);
+
+            for post in reply_posts {
+                let post_row = create_post_row(self, post);
+                scroll_content.append(&post_row);
+            }
         }
+
+        // Add bottom padding to ensure last post isn't clipped
+        let bottom_spacer = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        bottom_spacer.set_height_request(24);
+        scroll_content.append(&bottom_spacer);
+
+        // Wrap in AdwClamp for proper content width (matching timeline)
+        let clamp = adw::Clamp::new();
+        clamp.set_maximum_size(800);
+        clamp.set_tightening_threshold(600);
+        clamp.set_child(Some(&scroll_content));
 
         let scrolled = gtk4::ScrolledWindow::new();
         scrolled.set_vexpand(true);
-        scrolled.set_child(Some(&scroll_content));
+        // Disable horizontal scrolling - content should wrap/clip within the clamp
+        scrolled.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
+        scrolled.set_child(Some(&clamp));
         content_box.append(&scrolled);
 
+        // Don't set a tag - each thread is unique and we want to allow multiple in the stack
         let page = adw::NavigationPage::new(&content_box, "Thread");
-        page.set_tag(Some("thread"));
         page
     }
 
-    /// Format a timestamp as "Posted Sat, Jan 31, 2026 at 12:50 PM"
+    /// Format a timestamp as "Posted Sat, Jan 31, 2026 at 12:50 PM" in local timezone
     fn format_full_timestamp(indexed_at: &str) -> String {
         if indexed_at.is_empty() {
             return "Posted".to_string();
@@ -1302,10 +1327,13 @@ impl HangarWindow {
             return "Posted".to_string();
         };
 
+        // Convert to local timezone
+        let local_time: chrono::DateTime<chrono::Local> = post_time.into();
+
         // Format: "Posted Sat, Jan 31, 2026 at 12:50 PM"
         format!(
             "Posted {}",
-            post_time
+            local_time
                 .format("%a, %b %d, %Y at %l:%M %p")
                 .to_string()
                 .trim()

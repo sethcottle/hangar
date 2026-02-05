@@ -251,10 +251,11 @@ impl PostRow {
 
         // Post content
         let content = gtk4::Label::new(None);
-        content.set_halign(gtk4::Align::Start);
+        content.set_halign(gtk4::Align::Fill);
         content.set_hexpand(true);
         content.set_wrap(true);
         content.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+        content.set_natural_wrap_mode(gtk4::NaturalWrapMode::Word);
         content.set_selectable(false); // Disable selection to allow click-through
         content.set_xalign(0.0);
         content.set_use_markup(true); // Enable markup for clickable links
