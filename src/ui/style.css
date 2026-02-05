@@ -48,7 +48,7 @@
 
 /* Post row styling - cleaner look without heavy card background */
 .post-row {
-    padding: 12px 16px 12px 12px;
+    padding: 8px 16px 8px 12px;
     border-bottom: 1px solid alpha(@borders, 0.5);
 }
 
@@ -177,6 +177,19 @@ window.background entry {
 /* New posts banner */
 .new-posts-banner {
     box-shadow: 0 2px 8px alpha(black, 0.3);
+    padding: 6px 14px;
+    min-height: 0;
+}
+
+.new-posts-banner .banner-icon {
+    color: white;
+    -gtk-icon-size: 14px;
+}
+
+.new-posts-banner .banner-label {
+    color: white;
+    font-weight: 600;
+    font-size: 0.9em;
 }
 
 /* Feed selector popover */

@@ -60,6 +60,7 @@ mod imp {
         // Navigation callbacks
         pub post_clicked_callback: RefCell<Option<Box<dyn Fn(Post) + 'static>>>,
         pub profile_clicked_callback: RefCell<Option<Box<dyn Fn(Profile) + 'static>>>,
+        pub mention_clicked_callback: RefCell<Option<Box<dyn Fn(String) + 'static>>>,
     }
 
     #[glib::object_subclass]
@@ -98,8 +99,8 @@ impl PostRow {
     fn setup_ui(&self) {
         self.set_margin_start(12);
         self.set_margin_end(16);
-        self.set_margin_top(12);
-        self.set_margin_bottom(12);
+        self.set_margin_top(8);
+        self.set_margin_bottom(8);
         self.add_css_class("post-row");
 
         // Main horizontal layout: avatar on left, content on right
@@ -257,6 +258,29 @@ impl PostRow {
         content.set_selectable(false); // Disable selection to allow click-through
         content.set_xalign(0.0);
         content.set_use_markup(true); // Enable markup for clickable links
+
+        // Handle link clicks (URLs, @mentions, #hashtags)
+        let post_row_for_links = self.clone();
+        content.connect_activate_link(move |_, uri| {
+            if uri.starts_with("bsky-mention://") {
+                // Handle @mention click - navigate to profile
+                let handle = uri.strip_prefix("bsky-mention://").unwrap_or("");
+                let imp = post_row_for_links.imp();
+                if let Some(cb) = imp.mention_clicked_callback.borrow().as_ref() {
+                    cb(handle.to_string());
+                }
+                glib::Propagation::Stop // We handled it
+            } else if uri.starts_with("bsky-tag://") {
+                // Handle hashtag click - could open search in future
+                let _tag = uri.strip_prefix("bsky-tag://").unwrap_or("");
+                // TODO: Implement hashtag search navigation
+                glib::Propagation::Stop
+            } else {
+                // Regular URL - open in browser
+                let _ = open::that(uri);
+                glib::Propagation::Stop
+            }
+        });
         content_area.append(&content);
 
         // Unified embed container (images, videos, external cards, quotes)
@@ -667,6 +691,13 @@ impl PostRow {
     pub fn set_profile_clicked_callback<F: Fn(Profile) + 'static>(&self, f: F) {
         self.imp()
             .profile_clicked_callback
+            .replace(Some(Box::new(f)));
+    }
+
+    /// Set callback for when an @mention in post text is clicked (handle without @)
+    pub fn set_mention_clicked_callback<F: Fn(String) + 'static>(&self, f: F) {
+        self.imp()
+            .mention_clicked_callback
             .replace(Some(Box::new(f)));
     }
 
@@ -1252,19 +1283,24 @@ impl PostRow {
     }
 
     /// Format post text with clickable links, mentions, and hashtags using Pango markup
+    /// URLs become actual <a> tags, mentions use bsky-mention:// scheme, hashtags use bsky-tag:// scheme
     fn format_post_text(text: &str) -> String {
-        // Color for links (Bluesky blue)
-        const LINK_COLOR: &str = "#1d9bf0";
-
         // First escape the entire text for Pango markup
         let escaped = glib::markup_escape_text(text);
         let mut result = escaped.to_string();
 
-        // Pattern for URLs - match http/https URLs
-        let url_pattern =
-            regex::Regex::new(r"(https?://[^\s<>\[\]{}|\\^`\x00-\x1f\x7f]+)").unwrap();
+        // Pattern for URLs with protocol (http/https)
+        let url_with_protocol =
+            regex::Regex::new(r"https?://[^\s<>\[\]{}|\\^`\x00-\x1f\x7f]+").unwrap();
 
-        // Pattern for @mentions
+        // Pattern for bare domain URLs (domain.tld/path) - starts with word boundary
+        // Common TLDs that are likely to be URLs
+        let bare_url_pattern = regex::Regex::new(
+            r"\b([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+(?:com|org|net|io|co|app|dev|edu|gov|me|info|biz|social)[/a-zA-Z0-9._~:/?#@!$&'()*+,;=-]*",
+        )
+        .unwrap();
+
+        // Pattern for @mentions (e.g., @user.bsky.social)
         let mention_pattern = regex::Regex::new(
             r"@([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+[a-zA-Z]([a-zA-Z0-9-]*[a-zA-Z0-9])?",
         )
@@ -1273,27 +1309,43 @@ impl PostRow {
         // Pattern for hashtags
         let hashtag_pattern = regex::Regex::new(r"#[a-zA-Z][a-zA-Z0-9_]*").unwrap();
 
-        // Replace URLs with colored spans (using href for accessibility)
-        result = url_pattern
+        // Replace URLs with protocol first
+        result = url_with_protocol
             .replace_all(&result, |caps: &regex::Captures| {
                 let url = &caps[0];
-                format!("<span foreground=\"{}\"><u>{}</u></span>", LINK_COLOR, url)
+                format!("<a href=\"{}\">{}</a>", url, url)
             })
             .to_string();
 
-        // Replace @mentions with colored spans
+        // Replace bare domain URLs (only if not already inside an <a> tag)
+        // We check by looking for urls not preceded by href="
+        result = bare_url_pattern
+            .replace_all(&result, |caps: &regex::Captures| {
+                let url = &caps[0];
+                // Skip if this looks like it's already been linkified (contains href=)
+                if url.contains("href=") {
+                    url.to_string()
+                } else {
+                    format!("<a href=\"https://{}\">{}</a>", url, url)
+                }
+            })
+            .to_string();
+
+        // Replace @mentions with clickable links using custom scheme
         result = mention_pattern
             .replace_all(&result, |caps: &regex::Captures| {
                 let mention = &caps[0];
-                format!("<span foreground=\"{}\">{}</span>", LINK_COLOR, mention)
+                let handle = &mention[1..]; // Strip the @ prefix for the URI
+                format!("<a href=\"bsky-mention://{}\">{}</a>", handle, mention)
             })
             .to_string();
 
-        // Replace hashtags with colored spans
+        // Replace hashtags with clickable links using custom scheme
         result = hashtag_pattern
             .replace_all(&result, |caps: &regex::Captures| {
                 let hashtag = &caps[0];
-                format!("<span foreground=\"{}\">{}</span>", LINK_COLOR, hashtag)
+                let tag = &hashtag[1..]; // Strip the # prefix for the URI
+                format!("<a href=\"bsky-tag://{}\">{}</a>", tag, hashtag)
             })
             .to_string();
 

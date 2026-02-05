@@ -162,6 +162,7 @@ mod imp {
         pub new_posts_banner: RefCell<Option<gtk4::Button>>,
         pub new_posts_callback: RefCell<Option<Box<dyn Fn() + 'static>>>,
         pub scrolled_window: RefCell<Option<gtk4::ScrolledWindow>>,
+        pub saved_scroll_position: RefCell<f64>,
         pub feed_btn_label: RefCell<Option<gtk4::Label>>,
         pub feed_popover: RefCell<Option<gtk4::Popover>>,
         pub feed_list_box: RefCell<Option<gtk4::ListBox>>,
@@ -171,6 +172,7 @@ mod imp {
         // Navigation callbacks
         pub post_clicked_callback: RefCell<Option<Box<dyn Fn(Post) + 'static>>>,
         pub profile_clicked_callback: RefCell<Option<Box<dyn Fn(Profile) + 'static>>>,
+        pub mention_clicked_callback: RefCell<Option<Box<dyn Fn(String) + 'static>>>,
         pub nav_changed_callback:
             RefCell<Option<Box<dyn Fn(crate::ui::sidebar::NavItem) + 'static>>>,
         // Mentions page state
@@ -283,6 +285,25 @@ impl HangarWindow {
         let home_nav_view = adw::NavigationView::new();
         let timeline_page = self.build_timeline_page();
         home_nav_view.add(&timeline_page);
+        // Restore scroll position when a page is popped (user navigates back)
+        home_nav_view.connect_popped(glib::clone!(
+            #[weak(rename_to = window)]
+            self,
+            move |_, _| {
+                // Restore saved scroll position after a short delay to let GTK settle
+                glib::idle_add_local_once(glib::clone!(
+                    #[weak]
+                    window,
+                    move || {
+                        let imp = window.imp();
+                        let saved_pos = *imp.saved_scroll_position.borrow();
+                        if let Some(scrolled) = imp.scrolled_window.borrow().as_ref() {
+                            scrolled.vadjustment().set_value(saved_pos);
+                        }
+                    }
+                ));
+            }
+        ));
         main_stack.add_named(&home_nav_view, Some("home"));
 
         // Mentions section: NavigationView for thread/profile drill-down
@@ -564,6 +585,12 @@ impl HangarWindow {
                             cb(profile);
                         }
                     });
+                    let w = win.clone();
+                    post_row.set_mention_clicked_callback(move |handle| {
+                        if let Some(cb) = w.imp().mention_clicked_callback.borrow().as_ref() {
+                            cb(handle);
+                        }
+                    });
                 }
             }
         ));
@@ -583,8 +610,16 @@ impl HangarWindow {
         scrolled.set_child(Some(&clamp));
         overlay.set_child(Some(&scrolled));
 
-        // "N new posts" banner
-        let new_posts_btn = gtk4::Button::with_label("New posts");
+        // "N new posts" banner with icon
+        let new_posts_btn = gtk4::Button::new();
+        let banner_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+        let banner_icon = gtk4::Image::from_icon_name("go-up-symbolic");
+        banner_icon.add_css_class("banner-icon");
+        let banner_label = gtk4::Label::new(Some("New posts"));
+        banner_label.add_css_class("banner-label");
+        banner_box.append(&banner_icon);
+        banner_box.append(&banner_label);
+        new_posts_btn.set_child(Some(&banner_box));
         new_posts_btn.add_css_class("suggested-action");
         new_posts_btn.add_css_class("pill");
         new_posts_btn.add_css_class("new-posts-banner");
@@ -592,6 +627,7 @@ impl HangarWindow {
         new_posts_btn.set_valign(gtk4::Align::Start);
         new_posts_btn.set_margin_top(12);
         new_posts_btn.set_visible(false);
+        new_posts_btn.set_opacity(0.0);
         new_posts_btn.connect_clicked(glib::clone!(
             #[weak(rename_to = window)]
             self,
@@ -758,21 +794,44 @@ impl HangarWindow {
 
     pub fn show_new_posts_banner(&self, count: usize) {
         if let Some(banner) = self.imp().new_posts_banner.borrow().as_ref() {
-            let label = if count == 1 {
+            let label_text = if count == 1 {
                 "1 new post".to_string()
             } else if count > 99 {
                 "99+ new posts".to_string()
             } else {
                 format!("{} new posts", count)
             };
-            banner.set_label(&label);
+            // Find the label inside the button's box
+            if let Some(banner_box) = banner.child().and_then(|c| c.downcast::<gtk4::Box>().ok())
+            {
+                if let Some(label) = banner_box
+                    .last_child()
+                    .and_then(|c| c.downcast::<gtk4::Label>().ok())
+                {
+                    label.set_label(&label_text);
+                }
+            }
             banner.set_visible(true);
+            // Animate fade in
+            let target = adw::PropertyAnimationTarget::new(banner, "opacity");
+            let animation = adw::TimedAnimation::new(banner, 0.0, 1.0, 200, target);
+            animation.play();
         }
     }
 
     pub fn hide_new_posts_banner(&self) {
         if let Some(banner) = self.imp().new_posts_banner.borrow().as_ref() {
-            banner.set_visible(false);
+            // Animate fade out then hide
+            let target = adw::PropertyAnimationTarget::new(banner, "opacity");
+            let animation = adw::TimedAnimation::new(banner, 1.0, 0.0, 150, target);
+            animation.connect_done(glib::clone!(
+                #[weak]
+                banner,
+                move |_| {
+                    banner.set_visible(false);
+                }
+            ));
+            animation.play();
         }
     }
 
@@ -973,12 +1032,22 @@ impl HangarWindow {
             .replace(Some(Box::new(callback)));
     }
 
+    /// Set callback for when an @mention in post text is clicked (handle without @)
+    pub fn set_mention_clicked_callback<F: Fn(String) + 'static>(&self, callback: F) {
+        self.imp()
+            .mention_clicked_callback
+            .replace(Some(Box::new(callback)));
+    }
+
     /// Push a thread view page onto the current section's navigation stack
     pub fn push_thread_page(&self, post: &Post, thread_posts: Vec<Post>) {
         let nav_view = self.current_nav_view();
         let Some(nav_view) = nav_view else {
             return;
         };
+
+        // Save current scroll position before navigating
+        self.save_scroll_position();
 
         let page = self.build_thread_page(post, thread_posts);
         nav_view.push(&page);
@@ -991,8 +1060,20 @@ impl HangarWindow {
             return;
         };
 
+        // Save current scroll position before navigating
+        self.save_scroll_position();
+
         let page = self.build_profile_page(profile, posts);
         nav_view.push(&page);
+    }
+
+    /// Save the current scroll position for the active section
+    fn save_scroll_position(&self) {
+        let imp = self.imp();
+        if let Some(scrolled) = imp.scrolled_window.borrow().as_ref() {
+            let pos = scrolled.vadjustment().value();
+            imp.saved_scroll_position.replace(pos);
+        }
     }
 
     /// Pop to the root page of the current section (used for back navigation within a section)

@@ -182,6 +182,11 @@ mod imp {
             });
 
             let app_clone = app.clone();
+            window.set_mention_clicked_callback(move |handle| {
+                app_clone.open_profile_by_handle(handle);
+            });
+
+            let app_clone = app.clone();
             window.set_nav_changed_callback(move |item| {
                 app_clone.handle_nav_change(item);
             });
@@ -1280,6 +1285,37 @@ impl HangarApplication {
                 Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     eprintln!("Failed to fetch thread: connection lost");
+                    glib::ControlFlow::Break
+                }
+            }
+        });
+    }
+
+    /// Open the profile view for a user by their handle (e.g., from @mention click)
+    fn open_profile_by_handle(&self, handle: String) {
+        let (tx, rx) = std::sync::mpsc::channel::<Result<Profile, String>>();
+        let client = self.client();
+
+        thread::spawn(move || {
+            let result = runtime::block_on(async { client.get_profile(&handle).await });
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+
+        let app = self.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            match rx.try_recv() {
+                Ok(Ok(profile)) => {
+                    // Now open the profile view with the resolved profile
+                    app.open_profile_view(profile);
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(e)) => {
+                    eprintln!("Failed to fetch profile for handle: {}", e);
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    eprintln!("Failed to fetch profile: connection lost");
                     glib::ControlFlow::Break
                 }
             }
