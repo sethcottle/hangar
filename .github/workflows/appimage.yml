@@ -22,7 +22,8 @@ jobs:
             libadwaita-1-dev \
             libsecret-1-dev \
             librsvg2-dev \
-            libfuse2
+            libfuse2 \
+            adwaita-icon-theme
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -47,6 +48,10 @@ jobs:
           cp data/io.github.sethcottle.Hangar.desktop AppDir/usr/share/applications/
           cp assets/icons/io.github.sethcottle.Hangar.svg AppDir/usr/share/icons/hicolor/scalable/apps/
           cp data/io.github.sethcottle.Hangar.metainfo.xml AppDir/usr/share/metainfo/
+
+          # Bundle Adwaita icons (symbolic icons used by the app)
+          mkdir -p AppDir/usr/share/icons/Adwaita
+          cp -r /usr/share/icons/Adwaita/* AppDir/usr/share/icons/Adwaita/
 
       - name: Build AppImage
         run: |
