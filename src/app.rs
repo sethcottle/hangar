@@ -231,6 +231,26 @@ mod imp {
                 app_clone.execute_search(query);
             });
 
+            // Avatar menu callbacks: Settings & Sign Out
+            let app_clone = app.clone();
+            window.set_settings_clicked_callback(move || {
+                if let Some(window) = app_clone.imp().window.borrow().as_ref() {
+                    window.show_settings_page();
+                }
+            });
+
+            let app_clone = app.clone();
+            window.set_sign_out_clicked_callback(move || {
+                app_clone.sign_out();
+            });
+
+            // Apply saved settings on startup
+            let saved_settings = crate::state::AppSettings::load();
+            window.apply_font_size(saved_settings.font_size);
+            if saved_settings.reduce_motion {
+                window.apply_reduce_motion(true);
+            }
+
             window.present();
 
             app.try_restore_session();
@@ -322,6 +342,23 @@ impl HangarApplication {
                 Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
             }
         });
+    }
+
+    /// Sign out: clear session, close window, and restart fresh
+    fn sign_out(&self) {
+        // Clear the stored session
+        thread::spawn(move || {
+            let _ = runtime::block_on(SessionManager::clear());
+        });
+
+        // Close the current window — this drops all UI state
+        if let Some(window) = self.imp().window.take() {
+            window.close();
+        }
+
+        // Re-activate the app, which creates a fresh window and
+        // runs try_restore_session (which will fail → login dialog)
+        gio::prelude::ApplicationExt::activate(self.upcast_ref::<gio::Application>());
     }
 
     fn show_login_dialog(&self, window: &HangarWindow) {

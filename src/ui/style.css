@@ -100,9 +100,9 @@
     background-color: alpha(@window_fg_color, 0.08);
 }
 
-/* Link-styled label (blue text) */
+/* Link-styled label (uses accent color for high contrast compatibility) */
 .link-label {
-    color: #1d9bf0;
+    color: @accent_color;
 }
 
 /* Action bar styling */
@@ -310,11 +310,11 @@ popover.menu > contents {
 }
 
 .activity-badge.liked {
-    color: #f91880;
+    color: @error_color;
 }
 
 .activity-badge.reposted {
-    color: #00ba7c;
+    color: @success_color;
 }
 
 .activity-badge.followed {
@@ -334,8 +334,81 @@ popover.menu > contents {
     padding: 4px 0;
 }
 
+/* Settings sidebar navigation */
+.settings-sidebar {
+    background-color: @window_bg_color;
+}
+
+.settings-sidebar listbox.navigation-sidebar {
+    background: transparent;
+    padding: 6px;
+}
+
+.settings-sidebar listbox.navigation-sidebar row {
+    border-radius: 8px;
+    margin: 1px 0;
+}
+
+/* Settings preview post */
+.text-size-preview .preview-heading {
+    font-weight: 600;
+}
+
 /* Profile page styling */
 .profile-banner-placeholder {
     background: linear-gradient(135deg, alpha(@accent_bg_color, 0.3), alpha(@accent_bg_color, 0.1));
+}
+
+/* ============================================================
+   Accessibility Enhancements
+   ============================================================ */
+
+/* Reduced motion: respect user's system preference */
+@media (prefers-reduced-motion: reduce) {
+    * {
+        animation-duration: 0s !important;
+        transition-duration: 0s !important;
+    }
+}
+
+/* Links in post content should be underlined (WCAG 1.4.1 - color alone not sufficient) */
+.post-row label a {
+    text-decoration: underline;
+}
+
+/* Link-styled label: also add underline for accessibility */
+.link-label {
+    text-decoration: underline;
+}
+
+/* Liked state: add font-weight as non-color indicator (WCAG 1.4.1) */
+.flat.circular.liked image,
+button.flat.circular.liked image {
+    font-weight: 900;
+    -gtk-icon-style: filled;
+}
+
+/* Reposted state: add font-weight as non-color indicator */
+.flat.circular.reposted image,
+menubutton.flat.circular.reposted > button image {
+    font-weight: 900;
+    -gtk-icon-style: filled;
+}
+
+/* Ensure focus rings are always visible on interactive elements */
+.post-row .flat.circular:focus-visible {
+    outline: 2px solid @accent_color;
+    outline-offset: 2px;
+}
+
+.post-row .avatar-button:focus-visible {
+    outline: 2px solid @accent_color;
+    outline-offset: 2px;
+}
+
+/* Ensure minimum target size for action buttons (WCAG 2.5.5) */
+.post-row .flat.circular {
+    min-width: 36px;
+    min-height: 36px;
 }
 

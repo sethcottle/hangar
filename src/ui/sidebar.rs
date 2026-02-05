@@ -64,9 +64,12 @@ mod imp {
     #[derive(Default)]
     pub struct Sidebar {
         pub avatar: RefCell<Option<adw::Avatar>>,
+        pub avatar_menu_btn: RefCell<Option<gtk4::MenuButton>>,
         pub nav_list: RefCell<Option<gtk4::ListBox>>,
         pub selected_item: Cell<Option<NavItem>>,
         pub compose_btn: RefCell<Option<gtk4::Button>>,
+        pub settings_callback: RefCell<Option<Box<dyn Fn() + 'static>>>,
+        pub sign_out_callback: RefCell<Option<Box<dyn Fn() + 'static>>>,
     }
 
     #[glib::object_subclass]
@@ -74,6 +77,10 @@ mod imp {
         const NAME: &'static str = "HangarSidebar";
         type Type = super::Sidebar;
         type ParentType = gtk4::Box;
+
+        fn class_init(klass: &mut Self::Class) {
+            klass.set_accessible_role(gtk4::AccessibleRole::Navigation);
+        }
     }
 
     impl ObjectImpl for Sidebar {
@@ -107,24 +114,98 @@ impl Sidebar {
         self.set_width_request(88);
         self.add_css_class("sidebar-rail");
 
-        // Avatar at top
+        // Accessible label for the navigation landmark
+        self.update_property(&[gtk4::accessible::Property::Label("Main navigation")]);
+
+        // Avatar at top — clickable MenuButton with popover for Settings & Sign Out
         let avatar_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         avatar_box.set_margin_top(12);
         avatar_box.set_margin_bottom(8);
         avatar_box.set_halign(gtk4::Align::Center);
 
         let avatar = adw::Avatar::new(48, None, true);
-        avatar.set_tooltip_text(Some("Account"));
-        avatar_box.append(&avatar);
 
+        // Build popover menu
+        let popover_box = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+        popover_box.set_margin_top(8);
+        popover_box.set_margin_bottom(8);
+        popover_box.set_margin_start(8);
+        popover_box.set_margin_end(8);
+
+        // Settings item
+        let settings_item = gtk4::Button::new();
+        let settings_content = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        settings_content.append(&gtk4::Image::from_icon_name("emblem-system-symbolic"));
+        settings_content.append(&gtk4::Label::new(Some("Settings")));
+        settings_item.set_child(Some(&settings_content));
+        settings_item.add_css_class("flat");
+        popover_box.append(&settings_item);
+
+        // Separator
+        let sep = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+        sep.set_margin_top(4);
+        sep.set_margin_bottom(4);
+        popover_box.append(&sep);
+
+        // Sign Out item
+        let sign_out_item = gtk4::Button::new();
+        let sign_out_content = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        sign_out_content.append(&gtk4::Image::from_icon_name("system-log-out-symbolic"));
+        sign_out_content.append(&gtk4::Label::new(Some("Sign Out")));
+        sign_out_item.set_child(Some(&sign_out_content));
+        sign_out_item.add_css_class("flat");
+        popover_box.append(&sign_out_item);
+
+        let popover = gtk4::Popover::new();
+        popover.set_child(Some(&popover_box));
+        popover.add_css_class("menu");
+        popover.set_has_arrow(false);
+
+        // MenuButton wrapping the avatar
+        let avatar_menu_btn = gtk4::MenuButton::new();
+        avatar_menu_btn.set_child(Some(&avatar));
+        avatar_menu_btn.set_popover(Some(&popover));
+        avatar_menu_btn.add_css_class("flat");
+        avatar_menu_btn.add_css_class("circular");
+        avatar_menu_btn.set_tooltip_text(Some("Account"));
+        avatar_menu_btn.update_property(&[gtk4::accessible::Property::Label("Account menu")]);
+
+        // Wire up settings click
+        let sidebar_weak = self.downgrade();
+        let popover_ref = popover.clone();
+        settings_item.connect_clicked(move |_| {
+            popover_ref.popdown();
+            if let Some(sidebar) = sidebar_weak.upgrade() {
+                if let Some(cb) = sidebar.imp().settings_callback.borrow().as_ref() {
+                    cb();
+                }
+            }
+        });
+
+        // Wire up sign out click
+        let sidebar_weak = self.downgrade();
+        let popover_ref = popover.clone();
+        sign_out_item.connect_clicked(move |_| {
+            popover_ref.popdown();
+            if let Some(sidebar) = sidebar_weak.upgrade() {
+                if let Some(cb) = sidebar.imp().sign_out_callback.borrow().as_ref() {
+                    cb();
+                }
+            }
+        });
+
+        avatar_box.append(&avatar_menu_btn);
         self.append(&avatar_box);
 
-        self.imp().avatar.replace(Some(avatar));
+        let imp_ref = self.imp();
+        imp_ref.avatar.replace(Some(avatar));
+        imp_ref.avatar_menu_btn.replace(Some(avatar_menu_btn));
 
         // Navigation list
         let nav_list = gtk4::ListBox::new();
         nav_list.set_selection_mode(gtk4::SelectionMode::Single);
         nav_list.add_css_class("navigation-sidebar");
+        nav_list.update_property(&[gtk4::accessible::Property::Label("Navigation menu")]);
 
         for item in NavItem::all() {
             let row = self.create_nav_row(*item);
@@ -159,6 +240,7 @@ impl Sidebar {
         compose_btn.add_css_class("suggested-action");
         compose_btn.add_css_class("circular");
         compose_btn.set_tooltip_text(Some("New Post"));
+        compose_btn.update_property(&[gtk4::accessible::Property::Label("Compose new post")]);
         compose_btn.set_halign(gtk4::Align::Center);
         compose_btn.set_width_request(48);
         compose_btn.set_height_request(48);
@@ -171,6 +253,7 @@ impl Sidebar {
     fn create_nav_row(&self, item: NavItem) -> gtk4::ListBoxRow {
         let row = gtk4::ListBoxRow::new();
         row.set_selectable(true);
+        row.update_property(&[gtk4::accessible::Property::Label(item.label())]);
 
         // Vertical stack: icon on top, label below
         let content = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
@@ -235,6 +318,18 @@ impl Sidebar {
                 }
             });
         }
+    }
+
+    pub fn connect_settings_clicked<F: Fn() + 'static>(&self, callback: F) {
+        self.imp()
+            .settings_callback
+            .replace(Some(Box::new(callback)));
+    }
+
+    pub fn connect_sign_out_clicked<F: Fn() + 'static>(&self, callback: F) {
+        self.imp()
+            .sign_out_callback
+            .replace(Some(Box::new(callback)));
     }
 
     pub fn select_nav_item(&self, item: NavItem) {

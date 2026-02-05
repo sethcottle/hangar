@@ -70,6 +70,13 @@ mod imp {
         const NAME: &'static str = "HangarPostRow";
         type Type = super::PostRow;
         type ParentType = gtk4::Box;
+
+        fn class_init(klass: &mut Self::Class) {
+            // Use Group role (available since GTK 4.0) with RoleDescription "post"
+            // to provide screen readers with meaningful context.
+            // Article role requires v4_14 feature flag.
+            klass.set_accessible_role(gtk4::AccessibleRole::Group);
+        }
     }
 
     impl ObjectImpl for PostRow {
@@ -121,6 +128,8 @@ impl PostRow {
         avatar_btn.add_css_class("circular");
         avatar_btn.add_css_class("avatar-button");
         avatar_btn.set_cursor_from_name(Some("pointer"));
+        avatar_btn.set_tooltip_text(Some("View profile"));
+        avatar_btn.update_property(&[gtk4::accessible::Property::Label("View profile")]);
         let avatar = adw::Avatar::new(42, None, true);
         avatar_btn.set_child(Some(&avatar));
         avatar_column.append(&avatar_btn);
@@ -302,6 +311,8 @@ impl PostRow {
 
         let (reply_btn, reply_count, reply_btn_ref) =
             Self::create_action_button("mail-reply-sender-symbolic");
+        reply_btn_ref.set_tooltip_text(Some("Reply"));
+        reply_btn_ref.update_property(&[gtk4::accessible::Property::Label("Reply")]);
         actions.append(&reply_btn);
 
         // Repost menu button with popover
@@ -313,10 +324,14 @@ impl PostRow {
             repost_item_label,
             quote_item,
         ) = Self::create_repost_menu_button();
+        repost_menu_btn.set_tooltip_text(Some("Repost"));
+        repost_menu_btn.update_property(&[gtk4::accessible::Property::Label("Repost options")]);
         actions.append(&repost_btn_box);
 
         let (like_btn, like_count, like_btn_ref) =
             Self::create_action_button("emote-love-symbolic");
+        like_btn_ref.set_tooltip_text(Some("Like"));
+        like_btn_ref.update_property(&[gtk4::accessible::Property::Label("Like")]);
         actions.append(&like_btn);
 
         let spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
@@ -326,6 +341,8 @@ impl PostRow {
         // Post overflow menu button
         let (menu_btn, view_post_item, copy_link_item, open_link_item) =
             Self::create_post_menu_button();
+        menu_btn.set_tooltip_text(Some("More options"));
+        menu_btn.update_property(&[gtk4::accessible::Property::Label("More options")]);
         actions.append(&menu_btn);
 
         content_column.append(&actions);
@@ -567,20 +584,28 @@ impl PostRow {
                 imp.is_liked.replace(false);
                 // Clear the like URI since we're unliking
                 imp.viewer_like_uri.replace(None);
-                // Decrement count
+                // Decrement count and update accessible label
                 if let Some(label) = imp.like_count_label.borrow().as_ref() {
                     if let Ok(count) = label.text().parse::<i32>() {
-                        label.set_text(&Self::format_count(Some((count - 1).max(0) as u32)));
+                        let new_count = (count - 1).max(0) as u32;
+                        label.set_text(&Self::format_count(Some(new_count)));
+                        btn.update_property(&[gtk4::accessible::Property::Label(
+                            &format!("Like. {} likes", new_count),
+                        )]);
                     }
                 }
             } else {
                 btn.add_css_class("liked");
                 imp.is_liked.replace(true);
                 // Note: we don't have the new like URI yet, but that's OK for visual state
-                // Increment count
+                // Increment count and update accessible label
                 if let Some(label) = imp.like_count_label.borrow().as_ref() {
                     if let Ok(count) = label.text().parse::<i32>() {
-                        label.set_text(&Self::format_count(Some((count + 1) as u32)));
+                        let new_count = (count + 1) as u32;
+                        label.set_text(&Self::format_count(Some(new_count)));
+                        btn.update_property(&[gtk4::accessible::Property::Label(
+                            &format!("Unlike. {} likes", new_count),
+                        )]);
                     }
                 }
             }
@@ -626,10 +651,14 @@ impl PostRow {
                 btn.remove_css_class("reposted");
                 imp.is_reposted.replace(false);
                 imp.viewer_repost_uri.replace(None);
-                // Decrement count
+                // Decrement count and update accessible label
                 if let Some(label) = imp.repost_count_label.borrow().as_ref() {
                     if let Ok(count) = label.text().parse::<i32>() {
-                        label.set_text(&Self::format_count(Some((count - 1).max(0) as u32)));
+                        let new_count = (count - 1).max(0) as u32;
+                        label.set_text(&Self::format_count(Some(new_count)));
+                        btn.update_property(&[gtk4::accessible::Property::Label(
+                            &format!("Repost. {} reposts", new_count),
+                        )]);
                     }
                 }
                 // Update menu item label
@@ -639,10 +668,14 @@ impl PostRow {
             } else {
                 btn.add_css_class("reposted");
                 imp.is_reposted.replace(true);
-                // Increment count
+                // Increment count and update accessible label
                 if let Some(label) = imp.repost_count_label.borrow().as_ref() {
                     if let Ok(count) = label.text().parse::<i32>() {
-                        label.set_text(&Self::format_count(Some((count + 1) as u32)));
+                        let new_count = (count + 1) as u32;
+                        label.set_text(&Self::format_count(Some(new_count)));
+                        btn.update_property(&[gtk4::accessible::Property::Label(
+                            &format!("Undo repost. {} reposts", new_count),
+                        )]);
                     }
                 }
                 // Update menu item label
@@ -850,17 +883,46 @@ impl PostRow {
         if let Some(btn) = imp.like_btn.borrow().as_ref() {
             if post.viewer_like.is_some() {
                 btn.add_css_class("liked");
+                let like_label = format!(
+                    "Unlike. {} likes",
+                    post.like_count.unwrap_or(0)
+                );
+                btn.update_property(&[gtk4::accessible::Property::Label(&like_label)]);
             } else {
                 btn.remove_css_class("liked");
+                let like_label = format!(
+                    "Like. {} likes",
+                    post.like_count.unwrap_or(0)
+                );
+                btn.update_property(&[gtk4::accessible::Property::Label(&like_label)]);
             }
+        }
+
+        // Update reply button accessible label with count
+        if let Some(btn) = imp.reply_btn.borrow().as_ref() {
+            let reply_label = format!(
+                "Reply. {} replies",
+                post.reply_count.unwrap_or(0)
+            );
+            btn.update_property(&[gtk4::accessible::Property::Label(&reply_label)]);
         }
 
         // Update repost button state and menu label
         if let Some(btn) = imp.repost_btn.borrow().as_ref() {
             if post.viewer_repost.is_some() {
                 btn.add_css_class("reposted");
+                let repost_label = format!(
+                    "Undo repost. {} reposts",
+                    post.repost_count.unwrap_or(0)
+                );
+                btn.update_property(&[gtk4::accessible::Property::Label(&repost_label)]);
             } else {
                 btn.remove_css_class("reposted");
+                let repost_label = format!(
+                    "Repost. {} reposts",
+                    post.repost_count.unwrap_or(0)
+                );
+                btn.update_property(&[gtk4::accessible::Property::Label(&repost_label)]);
             }
         }
         // Update repost menu item label
@@ -869,6 +931,36 @@ impl PostRow {
                 label.set_text("Undo Repost");
             } else {
                 label.set_text("Repost");
+            }
+        }
+
+        // Set composite accessible label on the PostRow for screen readers
+        let text_preview = if post.text.len() > 200 {
+            &post.text[..200]
+        } else {
+            &post.text
+        };
+        let article_label = format!(
+            "Post by {} (@{}), {}: {}",
+            display_name,
+            post.author.handle,
+            Self::format_timestamp(&post.indexed_at),
+            text_preview
+        );
+        self.update_property(&[
+            gtk4::accessible::Property::Label(&article_label),
+            gtk4::accessible::Property::RoleDescription("post"),
+        ]);
+
+        // Update avatar button accessible label with display name
+        // (avatar_btn is inside avatar_column but we need the parent button)
+        // We set it via the avatar's parent which is the button
+        if let Some(avatar_widget) = imp.avatar.borrow().as_ref() {
+            if let Some(parent_btn) = avatar_widget.parent() {
+                let profile_label = format!("View profile of {}", display_name);
+                parent_btn.update_property(&[
+                    gtk4::accessible::Property::Label(&profile_label),
+                ]);
             }
         }
 

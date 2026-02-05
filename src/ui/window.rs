@@ -227,6 +227,13 @@ mod imp {
         pub search_callback: RefCell<Option<Box<dyn Fn(String) + 'static>>>,
         // Toast overlay for notifications
         pub toast_overlay: RefCell<Option<adw::ToastOverlay>>,
+        // Settings page
+        pub font_size_css_provider: RefCell<Option<gtk4::CssProvider>>,
+        pub font_size_changed_callback:
+            RefCell<Option<Box<dyn Fn(crate::state::FontSize) + 'static>>>,
+        pub reduce_motion_css_provider: RefCell<Option<gtk4::CssProvider>>,
+        // Track which page was visible before settings (for back button)
+        pub previous_page: RefCell<Option<String>>,
     }
 
     #[glib::object_subclass]
@@ -341,6 +348,10 @@ impl HangarWindow {
         let search_page = self.build_search_page();
         search_nav_view.add(&search_page);
         main_stack.add_named(&search_nav_view, Some("search"));
+
+        // Settings section
+        let settings_page = self.build_settings_page();
+        main_stack.add_named(&settings_page, Some("settings"));
 
         main_box.append(&main_stack);
 
@@ -804,26 +815,40 @@ impl HangarWindow {
                 }
             }
             banner.set_visible(true);
-            // Animate fade in
-            let target = adw::PropertyAnimationTarget::new(banner, "opacity");
-            let animation = adw::TimedAnimation::new(banner, 0.0, 1.0, 200, target);
-            animation.play();
+            // Animate fade in (skip if animations disabled)
+            let animations_enabled = gtk4::Settings::default()
+                .map(|s| s.is_gtk_enable_animations())
+                .unwrap_or(true);
+            if animations_enabled {
+                let target = adw::PropertyAnimationTarget::new(banner, "opacity");
+                let animation = adw::TimedAnimation::new(banner, 0.0, 1.0, 200, target);
+                animation.play();
+            } else {
+                banner.set_opacity(1.0);
+            }
         }
     }
 
     pub fn hide_new_posts_banner(&self) {
         if let Some(banner) = self.imp().new_posts_banner.borrow().as_ref() {
-            // Animate fade out then hide
-            let target = adw::PropertyAnimationTarget::new(banner, "opacity");
-            let animation = adw::TimedAnimation::new(banner, 1.0, 0.0, 150, target);
-            animation.connect_done(glib::clone!(
-                #[weak]
-                banner,
-                move |_| {
-                    banner.set_visible(false);
-                }
-            ));
-            animation.play();
+            // Animate fade out then hide (skip animation if disabled)
+            let animations_enabled = gtk4::Settings::default()
+                .map(|s| s.is_gtk_enable_animations())
+                .unwrap_or(true);
+            if animations_enabled {
+                let target = adw::PropertyAnimationTarget::new(banner, "opacity");
+                let animation = adw::TimedAnimation::new(banner, 1.0, 0.0, 150, target);
+                animation.connect_done(glib::clone!(
+                    #[weak]
+                    banner,
+                    move |_| {
+                        banner.set_visible(false);
+                    }
+                ));
+                animation.play();
+            } else {
+                banner.set_visible(false);
+            }
         }
     }
 
@@ -2006,6 +2031,20 @@ impl HangarWindow {
         self.imp().sidebar.borrow().clone()
     }
 
+    /// Set callback for when Settings is clicked in the avatar popover
+    pub fn set_settings_clicked_callback<F: Fn() + 'static>(&self, f: F) {
+        if let Some(sidebar) = self.imp().sidebar.borrow().as_ref() {
+            sidebar.connect_settings_clicked(f);
+        }
+    }
+
+    /// Set callback for when Sign Out is clicked in the avatar popover
+    pub fn set_sign_out_clicked_callback<F: Fn() + 'static>(&self, f: F) {
+        if let Some(sidebar) = self.imp().sidebar.borrow().as_ref() {
+            sidebar.connect_sign_out_clicked(f);
+        }
+    }
+
     /// Build the own profile page (for Profile tab in sidebar)
     fn build_own_profile_page(&self) -> adw::NavigationPage {
         let content_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
@@ -2829,6 +2868,527 @@ impl HangarWindow {
             });
             overlay.add_toast(toast);
         }
+    }
+
+    // ======== Settings Page ========
+
+    fn build_settings_page(&self) -> gtk4::Box {
+        use crate::state::AppSettings;
+
+        let outer_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        outer_box.set_hexpand(true);
+        outer_box.set_vexpand(true);
+
+        // Header bar with back button and "Settings" title
+        let header = adw::HeaderBar::new();
+        header.set_show_start_title_buttons(false);
+        header.set_show_end_title_buttons(false);
+        let title = gtk4::Label::new(Some("Settings"));
+        title.add_css_class("title");
+        header.set_title_widget(Some(&title));
+
+        // Back button
+        let back_btn = gtk4::Button::from_icon_name("go-previous-symbolic");
+        back_btn.add_css_class("flat");
+        back_btn.set_tooltip_text(Some("Back"));
+        back_btn.update_property(&[gtk4::accessible::Property::Label("Back to previous page")]);
+        let window_weak = self.downgrade();
+        back_btn.connect_clicked(move |_| {
+            if let Some(window) = window_weak.upgrade() {
+                window.leave_settings();
+            }
+        });
+        header.pack_start(&back_btn);
+
+        let window_controls = gtk4::WindowControls::new(gtk4::PackType::End);
+        header.pack_end(&window_controls);
+        outer_box.append(&header);
+
+        // Split layout: sidebar list on the left, content stack on the right
+        let split_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        split_box.set_vexpand(true);
+
+        // ---- Settings sidebar ----
+        let sidebar_scrolled = gtk4::ScrolledWindow::new();
+        sidebar_scrolled.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
+        sidebar_scrolled.set_vexpand(true);
+        // Fixed width for the settings sidebar
+        sidebar_scrolled.set_size_request(200, -1);
+
+        let sidebar_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        sidebar_box.add_css_class("settings-sidebar");
+
+        let sidebar_list = gtk4::ListBox::new();
+        sidebar_list.set_selection_mode(gtk4::SelectionMode::Single);
+        sidebar_list.add_css_class("navigation-sidebar");
+        sidebar_list.update_property(&[
+            gtk4::accessible::Property::Label("Settings categories"),
+        ]);
+
+        // Category entries: (id, label, icon)
+        let categories: &[(&str, &str, &str)] = &[
+            ("display", "Display", "preferences-desktop-font-symbolic"),
+            ("accessibility", "Accessibility", "preferences-desktop-accessibility-symbolic"),
+        ];
+
+        for &(id, label, icon_name) in categories {
+            let row = gtk4::ListBoxRow::new();
+            row.set_widget_name(id);
+            let row_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
+            row_box.set_margin_top(8);
+            row_box.set_margin_bottom(8);
+            row_box.set_margin_start(12);
+            row_box.set_margin_end(12);
+            let icon = gtk4::Image::from_icon_name(icon_name);
+            icon.set_pixel_size(18);
+            row_box.append(&icon);
+            let lbl = gtk4::Label::new(Some(label));
+            lbl.set_halign(gtk4::Align::Start);
+            row_box.append(&lbl);
+            row.set_child(Some(&row_box));
+            row.update_property(&[gtk4::accessible::Property::Label(label)]);
+            sidebar_list.append(&row);
+        }
+
+        sidebar_box.append(&sidebar_list);
+        sidebar_scrolled.set_child(Some(&sidebar_box));
+
+        // Separator between sidebar and content
+        let separator = gtk4::Separator::new(gtk4::Orientation::Vertical);
+
+        // ---- Content stack ----
+        let content_stack = gtk4::Stack::new();
+        content_stack.set_transition_type(gtk4::StackTransitionType::Crossfade);
+        content_stack.set_transition_duration(150);
+        content_stack.set_hexpand(true);
+        content_stack.set_vexpand(true);
+
+        // Load current settings once
+        let current_settings = AppSettings::load();
+
+        // Display page (in a ScrolledWindow)
+        let display_scrolled = gtk4::ScrolledWindow::new();
+        display_scrolled.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
+        let display_page = self.build_settings_display_tab(&current_settings);
+        display_scrolled.set_child(Some(&display_page));
+        content_stack.add_named(&display_scrolled, Some("display"));
+
+        // Accessibility page (in a ScrolledWindow)
+        let a11y_scrolled = gtk4::ScrolledWindow::new();
+        a11y_scrolled.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
+        let a11y_page = self.build_settings_accessibility_tab(&current_settings);
+        a11y_scrolled.set_child(Some(&a11y_page));
+        content_stack.add_named(&a11y_scrolled, Some("accessibility"));
+
+        // Wire sidebar selection to content stack
+        let stack_ref = content_stack.clone();
+        sidebar_list.connect_row_selected(move |_, row| {
+            if let Some(row) = row {
+                let name = row.widget_name();
+                stack_ref.set_visible_child_name(&name);
+            }
+        });
+
+        // Select first row by default
+        if let Some(first_row) = sidebar_list.row_at_index(0) {
+            sidebar_list.select_row(Some(&first_row));
+        }
+
+        split_box.append(&sidebar_scrolled);
+        split_box.append(&separator);
+        split_box.append(&content_stack);
+        outer_box.append(&split_box);
+
+        outer_box
+    }
+
+    /// Build the Display tab contents for the settings page
+    fn build_settings_display_tab(&self, current_settings: &crate::state::AppSettings) -> gtk4::Box {
+        use crate::state::FontSize;
+
+        let page_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        page_box.set_vexpand(true);
+
+        // Settings content with clamp for proper width
+        let clamp = adw::Clamp::new();
+        clamp.set_maximum_size(600);
+        clamp.set_margin_top(16);
+        clamp.set_margin_bottom(16);
+        clamp.set_margin_start(16);
+        clamp.set_margin_end(16);
+
+        let settings_box = gtk4::Box::new(gtk4::Orientation::Vertical, 24);
+
+        // ---- Display section ----
+        let display_group = adw::PreferencesGroup::new();
+        display_group.set_title("Post Text Size");
+
+        // Text Size label row
+        let size_label_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        size_label_row.set_margin_top(8);
+        let size_title = gtk4::Label::new(Some("Size:"));
+        size_title.set_halign(gtk4::Align::Start);
+        size_title.add_css_class("heading");
+        size_label_row.append(&size_title);
+        let size_spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        size_spacer.set_hexpand(true);
+        size_label_row.append(&size_spacer);
+        let size_value_label = gtk4::Label::new(Some("Default"));
+        size_value_label.add_css_class("dim-label");
+        size_label_row.append(&size_value_label);
+
+        // Slider
+        let scale = gtk4::Scale::with_range(
+            gtk4::Orientation::Horizontal,
+            FontSize::MIN,
+            FontSize::MAX,
+            FontSize::STEP,
+        );
+        scale.set_draw_value(false);
+        scale.set_hexpand(true);
+        scale.set_margin_top(4);
+        scale.set_margin_bottom(4);
+
+        // Add marks at each step
+        for &step in FontSize::STEPS {
+            scale.add_mark(step, gtk4::PositionType::Bottom, None);
+        }
+
+        // Load current font size
+        scale.set_value(current_settings.font_size.scale_factor());
+        size_value_label.set_text(current_settings.font_size.label());
+
+        // ---- Preview post ----
+        let preview_frame = gtk4::Frame::new(None);
+        preview_frame.set_margin_top(16);
+        preview_frame.add_css_class("card");
+
+        let preview_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
+        preview_box.set_margin_top(12);
+        preview_box.set_margin_bottom(12);
+        preview_box.set_margin_start(12);
+        preview_box.set_margin_end(12);
+        preview_box.add_css_class("text-size-preview");
+
+        // Preview avatar
+        let preview_avatar = adw::Avatar::new(42, Some("Hangar"), true);
+        let avatar_col = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        avatar_col.set_valign(gtk4::Align::Start);
+        avatar_col.append(&preview_avatar);
+        preview_box.append(&avatar_col);
+
+        // Preview content
+        let preview_content = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+        preview_content.set_hexpand(true);
+
+        // Preview header
+        let preview_header = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        let preview_name = gtk4::Label::new(Some("Hangar for Bluesky"));
+        preview_name.set_halign(gtk4::Align::Start);
+        preview_name.add_css_class("preview-heading");
+        preview_header.append(&preview_name);
+        let preview_handle = gtk4::Label::new(Some("  @hangar.app"));
+        preview_handle.add_css_class("dim-label");
+        preview_handle.add_css_class("preview-caption");
+        preview_header.append(&preview_handle);
+        let preview_dot = gtk4::Label::new(Some("  \u{00b7}  "));
+        preview_dot.add_css_class("dim-label");
+        preview_dot.add_css_class("preview-caption");
+        preview_header.append(&preview_dot);
+        let preview_time = gtk4::Label::new(Some("2m"));
+        preview_time.add_css_class("dim-label");
+        preview_time.add_css_class("preview-caption");
+        preview_header.append(&preview_time);
+        preview_content.append(&preview_header);
+
+        // Preview body text
+        let preview_body = gtk4::Label::new(Some(
+            "This is a preview of how posts will look at this text size. Adjust the slider above to find your preferred reading size.",
+        ));
+        preview_body.set_halign(gtk4::Align::Fill);
+        preview_body.set_hexpand(true);
+        preview_body.set_wrap(true);
+        preview_body.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+        preview_body.set_xalign(0.0);
+        preview_body.add_css_class("preview-body");
+        preview_content.append(&preview_body);
+
+        // Preview action bar
+        let preview_actions = gtk4::Box::new(gtk4::Orientation::Horizontal, 16);
+        preview_actions.set_margin_top(8);
+        let reply_icon = gtk4::Image::from_icon_name("mail-reply-sender-symbolic");
+        reply_icon.add_css_class("dim-label");
+        reply_icon.set_pixel_size(16);
+        preview_actions.append(&reply_icon);
+        let repost_icon = gtk4::Image::from_icon_name("media-playlist-repeat-symbolic");
+        repost_icon.add_css_class("dim-label");
+        repost_icon.set_pixel_size(16);
+        preview_actions.append(&repost_icon);
+        let like_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+        let like_icon = gtk4::Image::from_icon_name("emote-love-symbolic");
+        like_icon.add_css_class("dim-label");
+        like_icon.set_pixel_size(16);
+        like_box.append(&like_icon);
+        let like_count = gtk4::Label::new(Some("42"));
+        like_count.add_css_class("dim-label");
+        like_count.add_css_class("preview-caption");
+        like_box.append(&like_count);
+        preview_actions.append(&like_box);
+        preview_content.append(&preview_actions);
+
+        preview_box.append(&preview_content);
+        preview_frame.set_child(Some(&preview_box));
+
+        // Assemble the display group using a custom layout box
+        let display_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        display_box.append(&size_label_row);
+        display_box.append(&scale);
+        display_box.append(&preview_frame);
+        display_group.add(&display_box);
+        settings_box.append(&display_group);
+
+        // Handle slider value changes
+        let window_weak = self.downgrade();
+        let label_ref = size_value_label.clone();
+        scale.connect_value_changed(move |s| {
+            let value = s.value();
+            let snapped = (value / FontSize::STEP).round() * FontSize::STEP;
+            let font_size = FontSize(snapped);
+
+            label_ref.set_text(font_size.label());
+
+            let mut settings = crate::state::AppSettings::load();
+            settings.font_size = font_size;
+            if let Err(e) = settings.save() {
+                eprintln!("Failed to save settings: {e}");
+            }
+
+            if let Some(window) = window_weak.upgrade() {
+                window.apply_font_size(font_size);
+                if let Some(cb) = window.imp().font_size_changed_callback.borrow().as_ref() {
+                    cb(font_size);
+                }
+            }
+        });
+
+        clamp.set_child(Some(&settings_box));
+        page_box.append(&clamp);
+        page_box
+    }
+
+    /// Build the Accessibility tab contents for the settings page
+    fn build_settings_accessibility_tab(&self, current_settings: &crate::state::AppSettings) -> gtk4::Box {
+        let page_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        page_box.set_vexpand(true);
+
+        let clamp = adw::Clamp::new();
+        clamp.set_maximum_size(600);
+        clamp.set_margin_top(16);
+        clamp.set_margin_bottom(16);
+        clamp.set_margin_start(16);
+        clamp.set_margin_end(16);
+
+        let settings_box = gtk4::Box::new(gtk4::Orientation::Vertical, 24);
+
+        // ---- Motion section ----
+        let motion_group = adw::PreferencesGroup::new();
+        motion_group.set_title("Motion");
+        motion_group.set_description(Some(
+            "System reduced-motion preference is always respected. This toggle forces reduced motion regardless of system setting.",
+        ));
+
+        // Reduce Motion toggle using ActionRow
+        let reduce_motion_row = adw::ActionRow::builder()
+            .title("Reduce Motion")
+            .subtitle("Disable animations and transitions")
+            .build();
+
+        let reduce_motion_switch = gtk4::Switch::new();
+        reduce_motion_switch.set_valign(gtk4::Align::Center);
+        reduce_motion_switch.set_active(current_settings.reduce_motion);
+        reduce_motion_switch.set_tooltip_text(Some("Toggle reduced motion"));
+        reduce_motion_switch.update_property(&[
+            gtk4::accessible::Property::Label("Reduce motion"),
+        ]);
+
+        let window_weak = self.downgrade();
+        reduce_motion_switch.connect_state_set(move |_switch, state| {
+            let mut settings = crate::state::AppSettings::load();
+            settings.reduce_motion = state;
+            if let Err(e) = settings.save() {
+                eprintln!("Failed to save settings: {e}");
+            }
+
+            if let Some(window) = window_weak.upgrade() {
+                window.apply_reduce_motion(state);
+            }
+            glib::Propagation::Proceed
+        });
+
+        reduce_motion_row.add_suffix(&reduce_motion_switch);
+        reduce_motion_row.set_activatable_widget(Some(&reduce_motion_switch));
+        motion_group.add(&reduce_motion_row);
+        settings_box.append(&motion_group);
+
+        clamp.set_child(Some(&settings_box));
+        page_box.append(&clamp);
+        page_box
+    }
+
+    /// Show the settings page (top-level navigation, instant switch)
+    pub fn show_settings_page(&self) {
+        // Remember current page so back button can return to it
+        if let Some(stack) = self.imp().main_stack.borrow().as_ref() {
+            if let Some(name) = stack.visible_child_name() {
+                self.imp().previous_page.replace(Some(name.to_string()));
+            }
+        }
+
+        // Deselect sidebar nav since settings isn't a nav item
+        if let Some(sidebar) = self.imp().sidebar.borrow().as_ref() {
+            if let Some(nav_list) = sidebar.imp().nav_list.borrow().as_ref() {
+                nav_list.unselect_all();
+            }
+        }
+
+        self.switch_to_page("settings");
+    }
+
+    /// Leave settings and return to the previous page
+    fn leave_settings(&self) {
+        let imp = self.imp();
+        let previous = imp.previous_page.borrow().clone().unwrap_or("home".to_string());
+
+        // Restore sidebar selection
+        if let Some(sidebar) = imp.sidebar.borrow().as_ref() {
+            let nav_item = match previous.as_str() {
+                "home" => Some(crate::ui::sidebar::NavItem::Home),
+                "mentions" => Some(crate::ui::sidebar::NavItem::Mentions),
+                "activity" => Some(crate::ui::sidebar::NavItem::Activity),
+                "chat" => Some(crate::ui::sidebar::NavItem::Chat),
+                "profile" => Some(crate::ui::sidebar::NavItem::Profile),
+                "likes" => Some(crate::ui::sidebar::NavItem::Likes),
+                "search" => Some(crate::ui::sidebar::NavItem::Search),
+                _ => Some(crate::ui::sidebar::NavItem::Home),
+            };
+            if let Some(item) = nav_item {
+                sidebar.select_nav_item(item);
+            }
+        }
+
+        self.switch_to_page(&previous);
+    }
+
+    /// Apply a font size setting by updating the dynamic CSS provider
+    pub fn apply_font_size(&self, font_size: crate::state::FontSize) {
+        let imp = self.imp();
+
+        // Create CSS provider if it doesn't exist yet
+        let provider = {
+            let existing = imp.font_size_css_provider.borrow();
+            if let Some(p) = existing.as_ref() {
+                p.clone()
+            } else {
+                drop(existing);
+                let p = gtk4::CssProvider::new();
+                // Add to the default display so it applies globally
+                gtk4::style_context_add_provider_for_display(
+                    &gtk4::gdk::Display::default().expect("Could not get default display"),
+                    &p,
+                    gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
+                );
+                imp.font_size_css_provider.replace(Some(p.clone()));
+                p
+            }
+        };
+
+        let scale = font_size.scale_factor();
+
+        // Scale text labels only — NOT the container itself, which would cause
+        // horizontal overflow from fixed-width child widgets (action buttons, etc.)
+        let css = format!(
+            r#"
+.post-row label {{
+    font-size: {body}em;
+}}
+.post-row .heading {{
+    font-size: {heading}em;
+    font-weight: 600;
+}}
+.post-row .caption,
+.post-row .dim-label,
+.post-row .action-count {{
+    font-size: {caption}em;
+}}
+.activity-row label {{
+    font-size: {body}em;
+}}
+.conversation-row label {{
+    font-size: {body}em;
+}}
+.text-size-preview label {{
+    font-size: {body}em;
+}}
+.text-size-preview .preview-heading {{
+    font-size: {heading}em;
+    font-weight: 600;
+}}
+.text-size-preview .preview-caption {{
+    font-size: {caption}em;
+}}
+.text-size-preview .preview-body {{
+    font-size: {body}em;
+}}
+"#,
+            heading = 1.0 * scale,
+            caption = 0.95 * scale,
+            body = 1.0 * scale,
+        );
+
+        provider.load_from_data(&css);
+    }
+
+    /// Apply reduced motion setting by disabling GTK animations globally
+    pub fn apply_reduce_motion(&self, enabled: bool) {
+        // Disable GTK-level animations (NavigationView slides, stack transitions, etc.)
+        if let Some(settings) = gtk4::Settings::default() {
+            settings.set_gtk_enable_animations(!enabled);
+        }
+
+        // Also inject CSS to catch any CSS-driven animations/transitions
+        let imp = self.imp();
+        let provider = {
+            let existing = imp.reduce_motion_css_provider.borrow();
+            if let Some(p) = existing.as_ref() {
+                p.clone()
+            } else {
+                drop(existing);
+                let p = gtk4::CssProvider::new();
+                gtk4::style_context_add_provider_for_display(
+                    &gtk4::gdk::Display::default().expect("Could not get default display"),
+                    &p,
+                    gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION + 2,
+                );
+                imp.reduce_motion_css_provider.replace(Some(p.clone()));
+                p
+            }
+        };
+
+        if enabled {
+            provider.load_from_data(
+                "* { animation-duration: 0s !important; transition-duration: 0s !important; }",
+            );
+        } else {
+            // Clear the CSS — system prefers-reduced-motion still works via style.css
+            provider.load_from_data("");
+        }
+    }
+
+    /// Set callback for when font size changes
+    pub fn set_font_size_changed_callback<F: Fn(crate::state::FontSize) + 'static>(&self, f: F) {
+        self.imp()
+            .font_size_changed_callback
+            .replace(Some(Box::new(f)));
     }
 }
 
