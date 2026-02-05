@@ -52,16 +52,21 @@ impl LoginDialog {
     }
 
     fn setup_ui(&self) {
-        self.set_title("Sign In to Bluesky");
+        self.set_title("Hangar");
         self.set_content_width(400);
         // Let dialog auto-size height based on content
 
         // Main content box
-        let content = gtk4::Box::new(gtk4::Orientation::Vertical, 24);
+        let content = gtk4::Box::new(gtk4::Orientation::Vertical, 16);
         content.set_margin_start(24);
         content.set_margin_end(24);
         content.set_margin_top(24);
         content.set_margin_bottom(24);
+
+        // App title
+        let title = gtk4::Label::new(Some("Sign In to Bluesky"));
+        title.add_css_class("title-1");
+        content.append(&title);
 
         // Description
         let desc = gtk4::Label::new(Some(
@@ -88,9 +93,19 @@ impl LoginDialog {
 
         content.append(&prefs_group);
 
+        // App password help link
+        let app_password_link = gtk4::Button::with_label("Create an App Password →");
+        app_password_link.add_css_class("flat");
+        app_password_link.add_css_class("link");
+        app_password_link.set_halign(gtk4::Align::Center);
+        app_password_link.connect_clicked(|_| {
+            let _ = open::that("https://bsky.app/settings/app-passwords");
+        });
+        content.append(&app_password_link);
+
         // Error label (hidden by default)
         let error_label = gtk4::Label::new(None);
-        error_label.set_halign(gtk4::Align::Start);
+        error_label.set_halign(gtk4::Align::Center);
         error_label.add_css_class("error");
         error_label.set_visible(false);
         error_label.set_wrap(true);
@@ -98,7 +113,7 @@ impl LoginDialog {
 
         // Button box with spinner
         let button_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
-        button_box.set_halign(gtk4::Align::End);
+        button_box.set_halign(gtk4::Align::Center);
         button_box.set_margin_top(12);
 
         let spinner = gtk4::Spinner::new();
@@ -121,6 +136,18 @@ impl LoginDialog {
         button_box.append(&login_button);
 
         content.append(&button_box);
+
+        // Privacy link
+        let privacy_link = gtk4::Button::with_label("Privacy & Security");
+        privacy_link.add_css_class("flat");
+        privacy_link.add_css_class("link");
+        privacy_link.add_css_class("dim-label");
+        privacy_link.set_halign(gtk4::Align::Center);
+        privacy_link.set_margin_top(8);
+        privacy_link.connect_clicked(|_| {
+            let _ = open::that("https://hangar.blue/privacy/");
+        });
+        content.append(&privacy_link);
 
         // Connect entry changes to enable/disable login button
         let login_btn_weak = login_button.downgrade();

@@ -104,8 +104,10 @@ impl PostRow {
         self.add_css_class("post-row");
 
         // Main horizontal layout: avatar on left, content on right
+        // This entire area is clickable to open the thread
         let main_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
         main_box.set_hexpand(true);
+        main_box.set_cursor_from_name(Some("pointer"));
 
         // Left column: Avatar (fixed width, aligned to top)
         let avatar_column = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
@@ -245,9 +247,8 @@ impl PostRow {
         reply_indicator_box.set_visible(false);
         content_column.append(&reply_indicator_box);
 
-        // Content area (clickable to open thread)
+        // Content area
         let content_area = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-        content_area.set_cursor_from_name(Some("pointer"));
 
         // Post content
         let content = gtk4::Label::new(None);
@@ -291,19 +292,6 @@ impl PostRow {
         embed_container.set_visible(false);
         content_area.append(&embed_container);
 
-        // Add click gesture to content area
-        let gesture = gtk4::GestureClick::new();
-        let post_row = self.clone();
-        gesture.connect_released(move |_, _, _, _| {
-            let imp = post_row.imp();
-            if let Some(post) = imp.post.borrow().as_ref() {
-                if let Some(cb) = imp.post_clicked_callback.borrow().as_ref() {
-                    cb(post.clone());
-                }
-            }
-        });
-        content_area.add_controller(gesture);
-
         content_column.append(&content_area);
 
         // Action bar
@@ -341,6 +329,20 @@ impl PostRow {
         content_column.append(&actions);
 
         main_box.append(&content_column);
+
+        // Add click gesture to main_box for opening thread
+        let gesture = gtk4::GestureClick::new();
+        let post_row = self.clone();
+        gesture.connect_released(move |_, _, _, _| {
+            let imp = post_row.imp();
+            if let Some(post) = imp.post.borrow().as_ref() {
+                if let Some(cb) = imp.post_clicked_callback.borrow().as_ref() {
+                    cb(post.clone());
+                }
+            }
+        });
+        main_box.add_controller(gesture);
+
         self.append(&main_box);
 
         // Store references
