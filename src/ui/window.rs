@@ -258,7 +258,7 @@ impl HangarWindow {
     pub fn new(app: &adw::Application) -> Self {
         glib::Object::builder()
             .property("application", app)
-            .property("default-width", 1000)
+            .property("default-width", 520)
             .property("default-height", 700)
             .property("title", "Hangar")
             .build()

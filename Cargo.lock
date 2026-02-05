@@ -1111,6 +1111,7 @@ dependencies = [
  "libadwaita",
  "once_cell",
  "open",
+ "regex",
  "reqwest",
  "rusqlite",
  "secret-service",

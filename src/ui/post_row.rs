@@ -36,10 +36,20 @@ mod imp {
         pub repost_item: RefCell<Option<gtk4::Button>>,
         pub repost_item_label: RefCell<Option<gtk4::Label>>,
         pub quote_item: RefCell<Option<gtk4::Button>>,
-        // New fields for rich embeds and context
+        // Rich embeds and context
         pub repost_row: RefCell<Option<gtk4::Box>>,
-        pub reply_indicator: RefCell<Option<gtk4::Label>>,
+        pub repost_avatar: RefCell<Option<adw::Avatar>>,
+        pub repost_label: RefCell<Option<gtk4::Label>>,
+        pub repost_attribution_btn: RefCell<Option<gtk4::Button>>,
+        pub reply_indicator: RefCell<Option<gtk4::Button>>,
+        pub reply_handle_label: RefCell<Option<gtk4::Label>>,
+        pub reply_indicator_box: RefCell<Option<gtk4::Box>>,
         pub embed_container: RefCell<Option<gtk4::Box>>,
+        pub verified_badge: RefCell<Option<gtk4::Image>>,
+        pub post_menu_btn: RefCell<Option<gtk4::MenuButton>>,
+        pub view_post_item: RefCell<Option<gtk4::Button>>,
+        pub copy_link_item: RefCell<Option<gtk4::Button>>,
+        pub open_link_item: RefCell<Option<gtk4::Button>>,
         // Track current like/repost state (may differ from original post after user actions)
         pub is_liked: RefCell<bool>,
         pub is_reposted: RefCell<bool>,
@@ -86,38 +96,29 @@ impl PostRow {
     }
 
     fn setup_ui(&self) {
-        self.set_margin_start(16);
+        self.set_margin_start(12);
         self.set_margin_end(16);
         self.set_margin_top(12);
         self.set_margin_bottom(12);
         self.add_css_class("post-row");
 
-        // Repost attribution row (above header, shows "Reposted by X")
-        let repost_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
-        repost_row.set_margin_bottom(8);
-        repost_row.add_css_class("repost-attribution");
-        let repost_icon = gtk4::Image::from_icon_name("media-playlist-repeat-symbolic");
-        repost_icon.add_css_class("dim-label");
-        repost_icon.set_pixel_size(14);
-        repost_row.append(&repost_icon);
-        let repost_label = gtk4::Label::new(None);
-        repost_label.add_css_class("dim-label");
-        repost_label.add_css_class("caption");
-        repost_row.append(&repost_label);
-        repost_row.set_visible(false);
-        self.append(&repost_row);
+        // Main horizontal layout: avatar on left, content on right
+        let main_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
+        main_box.set_hexpand(true);
 
-        // Header row: avatar + name + handle + time
-        let header = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
+        // Left column: Avatar (fixed width, aligned to top)
+        let avatar_column = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        avatar_column.set_valign(gtk4::Align::Start);
 
         // Wrap avatar in a button-like container for clickability
         let avatar_btn = gtk4::Button::new();
         avatar_btn.add_css_class("flat");
         avatar_btn.add_css_class("circular");
+        avatar_btn.add_css_class("avatar-button");
         avatar_btn.set_cursor_from_name(Some("pointer"));
-        let avatar = adw::Avatar::new(48, None, true);
+        let avatar = adw::Avatar::new(42, None, true);
         avatar_btn.set_child(Some(&avatar));
-        header.append(&avatar_btn);
+        avatar_column.append(&avatar_btn);
 
         // Connect avatar click to profile navigation
         let post_row = self.clone();
@@ -130,39 +131,118 @@ impl PostRow {
             }
         });
 
-        let name_box = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
-        name_box.set_hexpand(true);
+        main_box.append(&avatar_column);
 
-        // Top row: display name + reply indicator
-        let name_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+        // Right column: all content (repost attribution, header, text, embeds, actions)
+        let content_column = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+        content_column.set_hexpand(true);
+
+        // Repost attribution row (above header, shows "Reposted by X") - clickable to go to reposter's profile
+        let repost_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+        repost_row.set_margin_bottom(2);
+        repost_row.add_css_class("repost-attribution");
+        let repost_icon = gtk4::Image::from_icon_name("media-playlist-repeat-symbolic");
+        repost_icon.add_css_class("dim-label");
+        repost_icon.set_pixel_size(12);
+        repost_row.append(&repost_icon);
+
+        // Clickable button containing avatar + name
+        let repost_btn = gtk4::Button::new();
+        repost_btn.add_css_class("flat");
+        repost_btn.add_css_class("repost-btn");
+        repost_btn.set_cursor_from_name(Some("pointer"));
+
+        let repost_btn_content = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+        let repost_avatar = adw::Avatar::new(16, None, true);
+        repost_avatar.add_css_class("repost-avatar");
+        repost_btn_content.append(&repost_avatar);
+        let repost_label = gtk4::Label::new(None);
+        repost_label.add_css_class("dim-label");
+        repost_label.add_css_class("caption");
+        repost_btn_content.append(&repost_label);
+        repost_btn.set_child(Some(&repost_btn_content));
+        repost_row.append(&repost_btn);
+
+        repost_row.set_visible(false);
+        content_column.append(&repost_row);
+
+        // Header row: display name + verified badge + handle + · + timestamp (all on one line)
+        let header = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        header.set_hexpand(true);
+
         let display_name = gtk4::Label::new(None);
         display_name.set_halign(gtk4::Align::Start);
         display_name.add_css_class("heading");
         display_name.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-        name_row.append(&display_name);
+        header.append(&display_name);
 
-        // Reply indicator (shows "replying to @handle")
-        let reply_indicator = gtk4::Label::new(None);
-        reply_indicator.add_css_class("dim-label");
-        reply_indicator.add_css_class("caption");
-        reply_indicator.set_visible(false);
-        name_row.append(&reply_indicator);
+        // Verified badge (checkmark)
+        let verified_badge = gtk4::Image::from_icon_name("emblem-ok-symbolic");
+        verified_badge.add_css_class("verified-badge");
+        verified_badge.set_pixel_size(14);
+        verified_badge.set_margin_start(4);
+        verified_badge.set_visible(false);
+        header.append(&verified_badge);
 
-        name_box.append(&name_row);
-
+        // Handle (with spacing)
         let handle = gtk4::Label::new(None);
         handle.set_halign(gtk4::Align::Start);
         handle.add_css_class("dim-label");
         handle.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-        name_box.append(&handle);
+        handle.set_margin_start(6);
+        header.append(&handle);
 
-        header.append(&name_box);
+        // Separator dot
+        let dot = gtk4::Label::new(Some("·"));
+        dot.add_css_class("dim-label");
+        dot.set_margin_start(6);
+        dot.set_margin_end(6);
+        header.append(&dot);
 
+        // Timestamp
         let timestamp = gtk4::Label::new(None);
         timestamp.add_css_class("dim-label");
         header.append(&timestamp);
 
-        self.append(&header);
+        // Spacer to push timestamp/menu to the right if needed
+        let header_spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        header_spacer.set_hexpand(true);
+        header.append(&header_spacer);
+
+        content_column.append(&header);
+
+        // Reply indicator (shows "Replying to @handle") - below header, above content - clickable
+        let reply_indicator_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        reply_indicator_box.set_margin_top(2);
+        reply_indicator_box.set_margin_bottom(4);
+        reply_indicator_box.set_valign(gtk4::Align::Center);
+
+        let reply_icon = gtk4::Image::from_icon_name("mail-reply-sender-symbolic");
+        reply_icon.add_css_class("dim-label");
+        reply_icon.set_pixel_size(12);
+        reply_icon.set_margin_end(6);
+        reply_indicator_box.append(&reply_icon);
+
+        let reply_text = gtk4::Label::new(Some("Replying to"));
+        reply_text.add_css_class("dim-label");
+        reply_text.add_css_class("caption");
+        reply_text.set_valign(gtk4::Align::Center);
+        reply_indicator_box.append(&reply_text);
+
+        // Clickable handle button (minimal padding, tight to text)
+        let reply_indicator = gtk4::Button::new();
+        reply_indicator.add_css_class("flat");
+        reply_indicator.add_css_class("reply-handle-btn");
+        reply_indicator.set_cursor_from_name(Some("pointer"));
+        reply_indicator.set_valign(gtk4::Align::Center);
+        let reply_handle_label = gtk4::Label::new(None);
+        reply_handle_label.add_css_class("caption");
+        reply_handle_label.add_css_class("link-label");
+        reply_indicator.set_child(Some(&reply_handle_label));
+        reply_indicator_box.append(&reply_indicator);
+
+        reply_indicator_box.set_visible(false);
+        content_column.append(&reply_indicator_box);
 
         // Content area (clickable to open thread)
         let content_area = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
@@ -171,10 +251,12 @@ impl PostRow {
         // Post content
         let content = gtk4::Label::new(None);
         content.set_halign(gtk4::Align::Start);
+        content.set_hexpand(true);
         content.set_wrap(true);
         content.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
         content.set_selectable(false); // Disable selection to allow click-through
         content.set_xalign(0.0);
+        content.set_use_markup(true); // Enable markup for clickable links
         content_area.append(&content);
 
         // Unified embed container (images, videos, external cards, quotes)
@@ -197,10 +279,10 @@ impl PostRow {
         });
         content_area.add_controller(gesture);
 
-        self.append(&content_area);
+        content_column.append(&content_area);
 
         // Action bar
-        let actions = gtk4::Box::new(gtk4::Orientation::Horizontal, 24);
+        let actions = gtk4::Box::new(gtk4::Orientation::Horizontal, 16);
         actions.set_margin_top(8);
 
         let (reply_btn, reply_count, reply_btn_ref) =
@@ -226,12 +308,15 @@ impl PostRow {
         spacer.set_hexpand(true);
         actions.append(&spacer);
 
-        let menu_btn = gtk4::Button::from_icon_name("view-more-symbolic");
-        menu_btn.add_css_class("flat");
-        menu_btn.add_css_class("circular");
+        // Post overflow menu button
+        let (menu_btn, view_post_item, copy_link_item, open_link_item) =
+            Self::create_post_menu_button();
         actions.append(&menu_btn);
 
-        self.append(&actions);
+        content_column.append(&actions);
+
+        main_box.append(&content_column);
+        self.append(&main_box);
 
         // Store references
         let imp = self.imp();
@@ -250,20 +335,32 @@ impl PostRow {
         imp.quote_item.replace(Some(quote_item));
         imp.reply_btn.replace(Some(reply_btn_ref));
         imp.repost_row.replace(Some(repost_row));
+        imp.repost_avatar.replace(Some(repost_avatar));
+        imp.repost_label.replace(Some(repost_label));
+        imp.repost_attribution_btn.replace(Some(repost_btn));
         imp.reply_indicator.replace(Some(reply_indicator));
+        imp.reply_handle_label.replace(Some(reply_handle_label));
+        imp.reply_indicator_box.replace(Some(reply_indicator_box));
         imp.embed_container.replace(Some(embed_container));
+        imp.verified_badge.replace(Some(verified_badge));
+        imp.post_menu_btn.replace(Some(menu_btn));
+        imp.view_post_item.replace(Some(view_post_item));
+        imp.copy_link_item.replace(Some(copy_link_item));
+        imp.open_link_item.replace(Some(open_link_item));
     }
 
     fn create_action_button(icon_name: &str) -> (gtk4::Box, gtk4::Label, gtk4::Button) {
         let btn_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+        btn_box.set_valign(gtk4::Align::Center);
 
         let btn = gtk4::Button::from_icon_name(icon_name);
         btn.add_css_class("flat");
         btn.add_css_class("circular");
         btn_box.append(&btn);
 
-        let count_label = gtk4::Label::new(Some("0"));
+        let count_label = gtk4::Label::new(Some(""));
         count_label.add_css_class("dim-label");
+        count_label.add_css_class("caption");
         btn_box.append(&count_label);
 
         (btn_box, count_label, btn)
@@ -279,6 +376,7 @@ impl PostRow {
         gtk4::Button,
     ) {
         let btn_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+        btn_box.set_valign(gtk4::Align::Center);
 
         // Create popover content
         let popover_box = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
@@ -319,8 +417,9 @@ impl PostRow {
 
         btn_box.append(&menu_btn);
 
-        let count_label = gtk4::Label::new(Some("0"));
+        let count_label = gtk4::Label::new(Some(""));
         count_label.add_css_class("dim-label");
+        count_label.add_css_class("caption");
         btn_box.append(&count_label);
 
         (
@@ -331,6 +430,77 @@ impl PostRow {
             repost_item_label,
             quote_item,
         )
+    }
+
+    /// Create a post overflow menu button with View Post, Bookmark, Report, etc.
+    /// Returns: (menu_btn, view_item, copy_link_item, open_link_item)
+    fn create_post_menu_button() -> (gtk4::MenuButton, gtk4::Button, gtk4::Button, gtk4::Button) {
+        let popover_box = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+        popover_box.set_margin_top(6);
+        popover_box.set_margin_bottom(6);
+        popover_box.set_margin_start(6);
+        popover_box.set_margin_end(6);
+
+        // View Post and Replies
+        let view_item = gtk4::Button::new();
+        let view_content = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        view_content.append(&gtk4::Image::from_icon_name("view-reveal-symbolic"));
+        view_content.append(&gtk4::Label::new(Some("View Post and Replies")));
+        view_item.set_child(Some(&view_content));
+        view_item.add_css_class("flat");
+        popover_box.append(&view_item);
+
+        // Separator
+        let sep = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+        sep.set_margin_top(4);
+        sep.set_margin_bottom(4);
+        popover_box.append(&sep);
+
+        // Open Link to Post
+        let open_link_item = gtk4::Button::new();
+        let open_link_content = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        open_link_content.append(&gtk4::Image::from_icon_name("web-browser-symbolic"));
+        open_link_content.append(&gtk4::Label::new(Some("Open Link to Post")));
+        open_link_item.set_child(Some(&open_link_content));
+        open_link_item.add_css_class("flat");
+        popover_box.append(&open_link_item);
+
+        // Copy Link to Post
+        let copy_link_item = gtk4::Button::new();
+        let copy_link_content = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        copy_link_content.append(&gtk4::Image::from_icon_name("edit-copy-symbolic"));
+        copy_link_content.append(&gtk4::Label::new(Some("Copy Link to Post")));
+        copy_link_item.set_child(Some(&copy_link_content));
+        copy_link_item.add_css_class("flat");
+        popover_box.append(&copy_link_item);
+
+        // Separator
+        let sep2 = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+        sep2.set_margin_top(4);
+        sep2.set_margin_bottom(4);
+        popover_box.append(&sep2);
+
+        // Report Post
+        let report_item = gtk4::Button::new();
+        let report_content = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        report_content.append(&gtk4::Image::from_icon_name("dialog-warning-symbolic"));
+        report_content.append(&gtk4::Label::new(Some("Report Post...")));
+        report_item.set_child(Some(&report_content));
+        report_item.add_css_class("flat");
+        popover_box.append(&report_item);
+
+        let popover = gtk4::Popover::new();
+        popover.set_child(Some(&popover_box));
+        popover.add_css_class("menu");
+        popover.set_has_arrow(false);
+
+        let menu_btn = gtk4::MenuButton::new();
+        menu_btn.set_icon_name("view-more-symbolic");
+        menu_btn.add_css_class("flat");
+        menu_btn.add_css_class("circular");
+        menu_btn.set_popover(Some(&popover));
+
+        (menu_btn, view_item, copy_link_item, open_link_item)
     }
 
     pub fn connect_like_clicked<F: Fn(&PostRow, bool, Option<String>) + 'static>(&self, f: F) {
@@ -504,7 +674,7 @@ impl PostRow {
         let imp = self.imp();
         imp.post.replace(Some(post.clone()));
 
-        // Show/hide repost attribution
+        // Show/hide repost attribution with avatar - clickable to go to reposter's profile
         if let Some(repost_row) = imp.repost_row.borrow().as_ref() {
             if let Some(reason) = &post.repost_reason {
                 let name = reason
@@ -512,11 +682,27 @@ impl PostRow {
                     .display_name
                     .as_deref()
                     .unwrap_or(&reason.by.handle);
-                // Find the label inside the repost row
-                if let Some(label) = repost_row.last_child() {
-                    if let Ok(label) = label.downcast::<gtk4::Label>() {
-                        label.set_text(&format!("Reposted by {}", name));
+                // Update the repost label
+                if let Some(label) = imp.repost_label.borrow().as_ref() {
+                    label.set_text(name);
+                }
+                // Load the reposter's avatar
+                if let Some(repost_avatar) = imp.repost_avatar.borrow().as_ref() {
+                    repost_avatar.set_text(Some(name));
+                    if let Some(avatar_url) = &reason.by.avatar {
+                        avatar_cache::load_avatar(repost_avatar.clone(), avatar_url.clone());
                     }
+                }
+                // Wire up click to navigate to reposter's profile
+                if let Some(btn) = imp.repost_attribution_btn.borrow().as_ref() {
+                    let post_row = self.clone();
+                    let reposter_profile = reason.by.clone();
+                    btn.connect_clicked(move |_| {
+                        let inner_imp = post_row.imp();
+                        if let Some(cb) = inner_imp.profile_clicked_callback.borrow().as_ref() {
+                            cb(reposter_profile.clone());
+                        }
+                    });
                 }
                 repost_row.set_visible(true);
             } else {
@@ -524,14 +710,27 @@ impl PostRow {
             }
         }
 
-        // Show/hide reply indicator
-        if let Some(reply_indicator) = imp.reply_indicator.borrow().as_ref() {
+        // Show/hide reply indicator - clickable to go to parent author's profile
+        if let Some(reply_indicator_box) = imp.reply_indicator_box.borrow().as_ref() {
             if let Some(context) = &post.reply_context {
-                // Always show @handle for clarity
-                reply_indicator.set_text(&format!("↩ @{}", context.parent_author.handle));
-                reply_indicator.set_visible(true);
+                // Update the handle label
+                if let Some(label) = imp.reply_handle_label.borrow().as_ref() {
+                    label.set_text(&format!("@{}", context.parent_author.handle));
+                }
+                // Wire up click to navigate to parent author's profile
+                if let Some(btn) = imp.reply_indicator.borrow().as_ref() {
+                    let post_row = self.clone();
+                    let parent_profile = context.parent_author.clone();
+                    btn.connect_clicked(move |_| {
+                        let inner_imp = post_row.imp();
+                        if let Some(cb) = inner_imp.profile_clicked_callback.borrow().as_ref() {
+                            cb(parent_profile.clone());
+                        }
+                    });
+                }
+                reply_indicator_box.set_visible(true);
             } else {
-                reply_indicator.set_visible(false);
+                reply_indicator_box.set_visible(false);
             }
         }
 
@@ -563,8 +762,10 @@ impl PostRow {
         // Store indexed_at for timestamp refresh
         imp.indexed_at.replace(post.indexed_at.clone());
 
+        // Set content with rich text formatting (links, mentions, hashtags)
         if let Some(label) = imp.content_label.borrow().as_ref() {
-            label.set_text(&post.text);
+            let markup = Self::format_post_text(&post.text);
+            label.set_markup(&markup);
         }
 
         // Render embed content
@@ -625,6 +826,64 @@ impl PostRow {
                 label.set_text("Repost");
             }
         }
+
+        // Wire up post menu actions
+        let post_url = Self::get_post_url(&post.author.handle, &post.uri);
+        let popover = imp
+            .post_menu_btn
+            .borrow()
+            .as_ref()
+            .and_then(|m| m.popover());
+
+        // View Post action - uses existing post_clicked_callback
+        if let Some(view_item) = imp.view_post_item.borrow().as_ref() {
+            let post_row = self.clone();
+            let popover_clone = popover.clone();
+            view_item.connect_clicked(move |_| {
+                if let Some(p) = &popover_clone {
+                    p.popdown();
+                }
+                let inner_imp = post_row.imp();
+                if let Some(post) = inner_imp.post.borrow().as_ref() {
+                    if let Some(cb) = inner_imp.post_clicked_callback.borrow().as_ref() {
+                        cb(post.clone());
+                    }
+                }
+            });
+        }
+
+        // Copy Link action
+        if let Some(copy_item) = imp.copy_link_item.borrow().as_ref() {
+            let url = post_url.clone();
+            let popover_clone = popover.clone();
+            copy_item.connect_clicked(move |btn| {
+                if let Some(p) = &popover_clone {
+                    p.popdown();
+                }
+                // Copy to clipboard
+                let display = btn.display();
+                display.clipboard().set_text(&url);
+            });
+        }
+
+        // Open Link action
+        if let Some(open_item) = imp.open_link_item.borrow().as_ref() {
+            let url = post_url;
+            let popover_clone = popover;
+            open_item.connect_clicked(move |_| {
+                if let Some(p) = &popover_clone {
+                    p.popdown();
+                }
+                let _ = open::that(&url);
+            });
+        }
+    }
+
+    /// Generate a Bluesky web URL for a post
+    fn get_post_url(handle: &str, uri: &str) -> String {
+        // Extract the rkey from the AT URI (e.g., at://did:plc:xxx/app.bsky.feed.post/rkey)
+        let rkey = uri.rsplit('/').next().unwrap_or("");
+        format!("https://bsky.app/profile/{}/post/{}", handle, rkey)
     }
 
     /// Check if the post is currently liked (tracks local state after user actions)
@@ -788,20 +1047,30 @@ impl PostRow {
         frame
     }
 
-    /// Render an external link card
+    /// Render an external link card (clickable to open URL)
     fn render_external_card(&self, container: &gtk4::Box, ext: &crate::atproto::ExternalEmbed) {
+        // Wrap card in a button for clickability
+        let card_btn = gtk4::Button::new();
+        card_btn.add_css_class("flat");
+        card_btn.add_css_class("external-card-button");
+        card_btn.set_cursor_from_name(Some("pointer"));
+
         let card = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
         card.add_css_class("external-card");
 
-        // Thumbnail (if available)
+        // Thumbnail (if available) - smaller for compact layout
         if let Some(thumb_url) = &ext.thumb {
+            let thumb_frame = gtk4::Frame::new(None);
+            thumb_frame.set_overflow(gtk4::Overflow::Hidden);
+            thumb_frame.add_css_class("external-thumb");
+
             let thumb = gtk4::Picture::new();
             thumb.set_keep_aspect_ratio(true);
             thumb.set_can_shrink(true);
-            thumb.set_size_request(100, 100);
-            thumb.add_css_class("external-thumb");
+            thumb.set_size_request(72, 72); // Smaller thumbnail for compact window
             avatar_cache::load_image_into_picture(thumb.clone(), thumb_url.clone());
-            card.append(&thumb);
+            thumb_frame.set_child(Some(&thumb));
+            card.append(&thumb_frame);
         }
 
         // Text content
@@ -813,7 +1082,9 @@ impl PostRow {
         title.set_halign(gtk4::Align::Start);
         title.add_css_class("external-title");
         title.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-        title.set_max_width_chars(50);
+        title.set_wrap(true);
+        title.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+        title.set_lines(2);
         text_box.append(&title);
 
         if !ext.description.is_empty() {
@@ -822,36 +1093,53 @@ impl PostRow {
             desc.add_css_class("dim-label");
             desc.add_css_class("caption");
             desc.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+            desc.set_wrap(true);
+            desc.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
             desc.set_lines(2);
-            desc.set_max_width_chars(60);
             text_box.append(&desc);
         }
 
-        // Extract domain from URI
+        // Extract domain from URI and show with web browser icon
         if let Ok(url) = url::Url::parse(&ext.uri) {
             if let Some(domain) = url.host_str() {
+                let domain_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+                let link_icon = gtk4::Image::from_icon_name("web-browser-symbolic");
+                link_icon.add_css_class("dim-label");
+                link_icon.set_pixel_size(12);
+                domain_row.append(&link_icon);
                 let domain_label = gtk4::Label::new(Some(domain));
                 domain_label.set_halign(gtk4::Align::Start);
                 domain_label.add_css_class("dim-label");
                 domain_label.add_css_class("caption");
-                text_box.append(&domain_label);
+                domain_row.append(&domain_label);
+                text_box.append(&domain_row);
             }
         }
 
         card.append(&text_box);
-        container.append(&card);
+        card_btn.set_child(Some(&card));
+
+        // Open link in browser when clicked
+        let url = ext.uri.clone();
+        card_btn.connect_clicked(move |_| {
+            let _ = open::that(&url);
+        });
+
+        container.append(&card_btn);
     }
 
     /// Render a video embed
     fn render_video(&self, container: &gtk4::Box, video: &crate::atproto::VideoEmbed) {
         let overlay = gtk4::Overlay::new();
         overlay.add_css_class("video-embed");
+        overlay.set_hexpand(true);
 
-        // Thumbnail
+        // Thumbnail - responsive width, constrained height
         let thumb = gtk4::Picture::new();
+        thumb.set_hexpand(true);
         thumb.set_keep_aspect_ratio(true);
         thumb.set_can_shrink(true);
-        thumb.set_size_request(400, 225);
+        thumb.set_size_request(-1, 200); // Only constrain height, let width be flexible
         thumb.add_css_class("post-embed-image");
 
         if let Some(thumb_url) = &video.thumbnail {
@@ -877,15 +1165,21 @@ impl PostRow {
         container.append(&overlay);
     }
 
-    /// Render a quote post card
+    /// Render a quote post card (clickable to open quoted post)
     fn render_quote(&self, container: &gtk4::Box, quote: &crate::atproto::QuoteEmbed) {
+        // Wrap card in a button for clickability
+        let card_btn = gtk4::Button::new();
+        card_btn.add_css_class("flat");
+        card_btn.add_css_class("quote-card-button");
+        card_btn.set_cursor_from_name(Some("pointer"));
+
         let card = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
         card.add_css_class("quote-card");
 
-        // Author row
-        let author_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        // Author row with display name + handle + timestamp on same line
+        let author_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
 
-        let avatar = adw::Avatar::new(24, None, true);
+        let avatar = adw::Avatar::new(20, None, true);
         let author_name = quote
             .author
             .display_name
@@ -907,11 +1201,14 @@ impl PostRow {
         handle_label.add_css_class("caption");
         author_row.append(&handle_label);
 
+        let dot = gtk4::Label::new(Some("·"));
+        dot.add_css_class("dim-label");
+        dot.add_css_class("caption");
+        author_row.append(&dot);
+
         let time_label = gtk4::Label::new(Some(&Self::format_timestamp(&quote.indexed_at)));
         time_label.add_css_class("dim-label");
         time_label.add_css_class("caption");
-        time_label.set_hexpand(true);
-        time_label.set_halign(gtk4::Align::End);
         author_row.append(&time_label);
 
         card.append(&author_row);
@@ -934,16 +1231,73 @@ impl PostRow {
             card.append(&nested_container);
         }
 
-        container.append(&card);
+        card_btn.set_child(Some(&card));
+
+        // Open quoted post in browser when clicked
+        let url = Self::get_post_url(&quote.author.handle, &quote.uri);
+        card_btn.connect_clicked(move |_| {
+            let _ = open::that(&url);
+        });
+
+        container.append(&card_btn);
     }
 
     fn format_count(count: Option<u32>) -> String {
         match count {
             Some(c) if c >= 1_000_000 => format!("{:.1}M", c as f64 / 1_000_000.0),
             Some(c) if c >= 1_000 => format!("{:.1}K", c as f64 / 1_000.0),
-            Some(c) => c.to_string(),
-            None => "0".to_string(),
+            Some(c) if c > 0 => c.to_string(),
+            _ => String::new(), // Don't show "0", just leave empty
         }
+    }
+
+    /// Format post text with clickable links, mentions, and hashtags using Pango markup
+    fn format_post_text(text: &str) -> String {
+        // Color for links (Bluesky blue)
+        const LINK_COLOR: &str = "#1d9bf0";
+
+        // First escape the entire text for Pango markup
+        let escaped = glib::markup_escape_text(text);
+        let mut result = escaped.to_string();
+
+        // Pattern for URLs - match http/https URLs
+        let url_pattern =
+            regex::Regex::new(r"(https?://[^\s<>\[\]{}|\\^`\x00-\x1f\x7f]+)").unwrap();
+
+        // Pattern for @mentions
+        let mention_pattern = regex::Regex::new(
+            r"@([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+[a-zA-Z]([a-zA-Z0-9-]*[a-zA-Z0-9])?",
+        )
+        .unwrap();
+
+        // Pattern for hashtags
+        let hashtag_pattern = regex::Regex::new(r"#[a-zA-Z][a-zA-Z0-9_]*").unwrap();
+
+        // Replace URLs with colored spans (using href for accessibility)
+        result = url_pattern
+            .replace_all(&result, |caps: &regex::Captures| {
+                let url = &caps[0];
+                format!("<span foreground=\"{}\"><u>{}</u></span>", LINK_COLOR, url)
+            })
+            .to_string();
+
+        // Replace @mentions with colored spans
+        result = mention_pattern
+            .replace_all(&result, |caps: &regex::Captures| {
+                let mention = &caps[0];
+                format!("<span foreground=\"{}\">{}</span>", LINK_COLOR, mention)
+            })
+            .to_string();
+
+        // Replace hashtags with colored spans
+        result = hashtag_pattern
+            .replace_all(&result, |caps: &regex::Captures| {
+                let hashtag = &caps[0];
+                format!("<span foreground=\"{}\">{}</span>", LINK_COLOR, hashtag)
+            })
+            .to_string();
+
+        result
     }
 
     fn format_timestamp(indexed_at: &str) -> String {

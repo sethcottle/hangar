@@ -21,6 +21,15 @@
     background-color: alpha(@accent_bg_color, 0.15);
 }
 
+/* Selected nav item icon and label use accent color */
+.sidebar-rail listbox row:selected image {
+    color: @accent_color;
+}
+
+.sidebar-rail listbox row:selected label {
+    color: @accent_color;
+}
+
 .sidebar-rail listbox row:hover:not(:selected) {
     background-color: alpha(@window_fg_color, 0.05);
 }
@@ -39,12 +48,66 @@
 
 /* Post row styling - cleaner look without heavy card background */
 .post-row {
-    padding: 16px;
+    padding: 12px 16px 12px 12px;
     border-bottom: 1px solid alpha(@borders, 0.5);
 }
 
 .post-row .heading {
     font-weight: 600;
+    font-size: 0.95em;
+}
+
+/* Avatar button styling */
+.post-row .avatar-button {
+    padding: 0;
+    min-width: 42px;
+    min-height: 42px;
+}
+
+.post-row .avatar-button:hover {
+    background-color: alpha(@window_fg_color, 0.05);
+}
+
+/* Verified badge */
+.post-row .verified-badge {
+    color: @accent_color;
+}
+
+/* Repost attribution styling - small text above the post */
+.post-row .repost-attribution {
+    margin-bottom: 2px;
+}
+
+.post-row .repost-avatar {
+    min-width: 16px;
+    min-height: 16px;
+}
+
+/* Clickable repost/reply buttons */
+.post-row .repost-btn {
+    padding: 0 4px;
+    min-height: 20px;
+}
+
+.post-row .reply-handle-btn {
+    padding: 0 2px;
+    margin-left: 4px;
+    min-height: 18px;
+}
+
+.post-row .repost-btn:hover,
+.post-row .reply-handle-btn:hover {
+    background-color: alpha(@window_fg_color, 0.08);
+}
+
+/* Link-styled label (blue text) */
+.link-label {
+    color: #1d9bf0;
+}
+
+/* Action bar styling */
+.post-row .action-count {
+    font-size: 0.85em;
 }
 
 /* Post embed images */
@@ -58,11 +121,15 @@
     border-radius: 12px;
 }
 
-/* Action buttons */
-.flat.circular {
-    min-width: 32px;
-    min-height: 32px;
+/* Action buttons in posts */
+.post-row .flat.circular {
+    min-width: 28px;
+    min-height: 28px;
     padding: 4px;
+}
+
+.post-row .flat.circular image {
+    -gtk-icon-size: 16px;
 }
 
 /* Legacy card class for backwards compatibility */
@@ -125,21 +192,20 @@ popover.menu > contents {
 }
 
 /* Repost attribution */
-.post-row .repost-attribution {
-    margin-bottom: 4px;
-}
-
 .post-row .repost-attribution image {
     opacity: 0.7;
 }
 
-/* Reply indicator */
-.post-row .reply-indicator {
-    font-size: 0.85em;
-    opacity: 0.7;
+/* External link card */
+.external-card-button {
+    padding: 0;
+    border-radius: 12px;
 }
 
-/* External link card */
+.external-card-button:hover .external-card {
+    background-color: alpha(@card_bg_color, 0.8);
+}
+
 .external-card {
     background-color: alpha(@card_bg_color, 0.6);
     border: 1px solid alpha(@borders, 0.5);
@@ -149,8 +215,10 @@ popover.menu > contents {
 
 .external-card .external-thumb {
     border-radius: 8px;
-    min-width: 100px;
-    min-height: 100px;
+    min-width: 72px;
+    min-height: 72px;
+    border: none;
+    background: transparent;
 }
 
 .external-card .external-title {
@@ -174,8 +242,17 @@ popover.menu > contents {
 }
 
 /* Quote post card */
+.quote-card-button {
+    padding: 0;
+    border-radius: 12px;
+}
+
+.quote-card-button:hover .quote-card {
+    background-color: alpha(@card_bg_color, 0.6);
+}
+
 .quote-card {
-    background-color: alpha(@window_bg_color, 0.4);
+    background-color: alpha(@card_bg_color, 0.4);
     border: 1px solid alpha(@borders, 0.5);
     border-radius: 12px;
     padding: 12px;
