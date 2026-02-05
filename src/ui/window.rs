@@ -260,8 +260,8 @@ impl HangarWindow {
     pub fn new(app: &adw::Application) -> Self {
         glib::Object::builder()
             .property("application", app)
-            .property("default-width", 520)
-            .property("default-height", 700)
+            .property("default-width", 580)
+            .property("default-height", 750)
             .property("title", "Hangar")
             .build()
     }
@@ -1167,7 +1167,8 @@ impl HangarWindow {
         scroll_content.add_css_class("background");
 
         // Helper to create a PostRow with all callbacks wired up
-        let create_post_row = |win: &Self, post: Post| -> PostRow {
+        // `clickable` controls whether clicking the post opens its thread
+        let create_post_row = |win: &Self, post: Post, clickable: bool| -> PostRow {
             let post_row = PostRow::new();
             post_row.bind(&post);
 
@@ -1221,13 +1222,15 @@ impl HangarWindow {
                     .map(|cb| cb(post_clone.clone()));
             });
 
-            // Navigation callbacks - these were missing!
-            let w = win.clone();
-            post_row.set_post_clicked_callback(move |p| {
-                if let Some(cb) = w.imp().post_clicked_callback.borrow().as_ref() {
-                    cb(p);
-                }
-            });
+            // Post click callback (only if clickable - main post in thread shouldn't re-open)
+            if clickable {
+                let w = win.clone();
+                post_row.set_post_clicked_callback(move |p| {
+                    if let Some(cb) = w.imp().post_clicked_callback.borrow().as_ref() {
+                        cb(p);
+                    }
+                });
+            }
 
             let w = win.clone();
             post_row.set_profile_clicked_callback(move |profile| {
@@ -1246,14 +1249,15 @@ impl HangarWindow {
             post_row
         };
 
-        // Add parent posts (if any)
+        // Add parent posts (if any) - these are clickable to navigate to them
         for post in parent_posts {
-            let post_row = create_post_row(self, post);
+            let post_row = create_post_row(self, post, true);
             scroll_content.append(&post_row);
         }
 
-        // Add the main post
-        let main_row = create_post_row(self, the_main_post.clone());
+        // Add the main post - NOT clickable since we're already viewing it
+        let main_row = create_post_row(self, the_main_post.clone(), false);
+        main_row.set_not_clickable();
         scroll_content.append(&main_row);
 
         // Add "Posted {date}" separator
@@ -1286,7 +1290,7 @@ impl HangarWindow {
             scroll_content.append(&replies_header);
 
             for post in reply_posts {
-                let post_row = create_post_row(self, post);
+                let post_row = create_post_row(self, post, true);
                 scroll_content.append(&post_row);
             }
         }

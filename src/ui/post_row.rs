@@ -61,6 +61,8 @@ mod imp {
         pub post_clicked_callback: RefCell<Option<Box<dyn Fn(Post) + 'static>>>,
         pub profile_clicked_callback: RefCell<Option<Box<dyn Fn(Profile) + 'static>>>,
         pub mention_clicked_callback: RefCell<Option<Box<dyn Fn(String) + 'static>>>,
+        // Main box for cursor control
+        pub main_box: RefCell<Option<gtk4::Box>>,
     }
 
     #[glib::object_subclass]
@@ -374,6 +376,7 @@ impl PostRow {
         imp.view_post_item.replace(Some(view_post_item));
         imp.copy_link_item.replace(Some(copy_link_item));
         imp.open_link_item.replace(Some(open_link_item));
+        imp.main_box.replace(Some(main_box));
     }
 
     fn create_action_button(icon_name: &str) -> (gtk4::Box, gtk4::Label, gtk4::Button) {
@@ -702,6 +705,14 @@ impl PostRow {
         self.imp()
             .mention_clicked_callback
             .replace(Some(Box::new(f)));
+    }
+
+    /// Disable the clickable appearance (removes pointer cursor)
+    /// Used for the main post in thread view that shouldn't re-open
+    pub fn set_not_clickable(&self) {
+        if let Some(main_box) = self.imp().main_box.borrow().as_ref() {
+            main_box.set_cursor_from_name(None::<&str>);
+        }
     }
 
     pub fn bind(&self, post: &Post) {
@@ -1326,6 +1337,22 @@ impl PostRow {
             })
             .to_string();
 
+        // Replace @mentions BEFORE bare URLs (since handles like @user.bsky.social
+        // would otherwise be caught by the bare URL pattern matching .social TLD)
+        result = mention_pattern
+            .replace_all(&result, |caps: &regex::Captures| {
+                let mention = &caps[0];
+                let handle = &mention[1..]; // Strip the @ prefix for the URI
+                let placeholder = format!("\x00LINK{}\x00", link_count);
+                links.push(format!(
+                    "<a href=\"bsky-mention://{}\">{}</a>",
+                    handle, mention
+                ));
+                link_count += 1;
+                placeholder
+            })
+            .to_string();
+
         // Pattern for bare domain URLs (domain.tld/path) - only match if not already linkified
         // Common TLDs that are likely to be URLs
         let bare_url_pattern = regex::Regex::new(
@@ -1341,15 +1368,6 @@ impl PostRow {
                 links.push(format!("<a href=\"https://{}\">{}</a>", url, url));
                 link_count += 1;
                 placeholder
-            })
-            .to_string();
-
-        // Replace @mentions with clickable links using custom scheme
-        result = mention_pattern
-            .replace_all(&result, |caps: &regex::Captures| {
-                let mention = &caps[0];
-                let handle = &mention[1..]; // Strip the @ prefix for the URI
-                format!("<a href=\"bsky-mention://{}\">{}</a>", handle, mention)
             })
             .to_string();
 
