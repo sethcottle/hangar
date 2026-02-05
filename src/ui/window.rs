@@ -486,16 +486,9 @@ impl HangarWindow {
         ));
         header.pack_start(&refresh_btn);
 
-        let close_btn = gtk4::Button::from_icon_name("window-close-symbolic");
-        close_btn.set_tooltip_text(Some("Close"));
-        close_btn.connect_clicked(glib::clone!(
-            #[weak(rename_to = window)]
-            self,
-            move |_| {
-                window.close();
-            }
-        ));
-        header.pack_end(&close_btn);
+        // Add window controls (close, minimize, maximize) to the end
+        let window_controls = gtk4::WindowControls::new(gtk4::PackType::End);
+        header.pack_end(&window_controls);
 
         content_box.append(&header);
         content_box.append(&self.build_timeline());
@@ -802,8 +795,7 @@ impl HangarWindow {
                 format!("{} new posts", count)
             };
             // Find the label inside the button's box
-            if let Some(banner_box) = banner.child().and_then(|c| c.downcast::<gtk4::Box>().ok())
-            {
+            if let Some(banner_box) = banner.child().and_then(|c| c.downcast::<gtk4::Box>().ok()) {
                 if let Some(label) = banner_box
                     .last_child()
                     .and_then(|c| c.downcast::<gtk4::Label>().ok())
@@ -1132,13 +1124,17 @@ impl HangarWindow {
         content_box.set_hexpand(true);
 
         let header = adw::HeaderBar::new();
-        // Hide start buttons (NavigationView provides back button)
-        // Keep end buttons for window controls (close, minimize, etc.)
+        // Hide default title buttons - we'll add explicit window controls
         header.set_show_start_title_buttons(false);
+        header.set_show_end_title_buttons(false);
 
         let title = gtk4::Label::new(Some("Thread"));
         title.add_css_class("title");
         header.set_title_widget(Some(&title));
+
+        // Add window controls (close button) to the end
+        let window_controls = gtk4::WindowControls::new(gtk4::PackType::End);
+        header.pack_end(&window_controls);
 
         content_box.append(&header);
 
@@ -1355,6 +1351,10 @@ impl HangarWindow {
         title.add_css_class("title");
         header.set_title_widget(Some(&title));
 
+        // Add window controls (close button) to the end
+        let window_controls = gtk4::WindowControls::new(gtk4::PackType::End);
+        header.pack_end(&window_controls);
+
         content_box.append(&header);
 
         // Profile header section
@@ -1499,16 +1499,9 @@ impl HangarWindow {
         title.add_css_class("title");
         header.set_title_widget(Some(&title));
 
-        let close_btn = gtk4::Button::from_icon_name("window-close-symbolic");
-        close_btn.set_tooltip_text(Some("Close"));
-        close_btn.connect_clicked(glib::clone!(
-            #[weak(rename_to = window)]
-            self,
-            move |_| {
-                window.close();
-            }
-        ));
-        header.pack_end(&close_btn);
+        // Add window controls (close, minimize, maximize) to the end
+        let window_controls = gtk4::WindowControls::new(gtk4::PackType::End);
+        header.pack_end(&window_controls);
 
         content_box.append(&header);
         content_box.append(&self.build_mentions_list());
@@ -1675,16 +1668,9 @@ impl HangarWindow {
         title.add_css_class("title");
         header.set_title_widget(Some(&title));
 
-        let close_btn = gtk4::Button::from_icon_name("window-close-symbolic");
-        close_btn.set_tooltip_text(Some("Close"));
-        close_btn.connect_clicked(glib::clone!(
-            #[weak(rename_to = window)]
-            self,
-            move |_| {
-                window.close();
-            }
-        ));
-        header.pack_end(&close_btn);
+        // Add window controls (close, minimize, maximize) to the end
+        let window_controls = gtk4::WindowControls::new(gtk4::PackType::End);
+        header.pack_end(&window_controls);
 
         content_box.append(&header);
         content_box.append(&self.build_activity_list());
@@ -1846,16 +1832,9 @@ impl HangarWindow {
         title.add_css_class("title");
         header.set_title_widget(Some(&title));
 
-        let close_btn = gtk4::Button::from_icon_name("window-close-symbolic");
-        close_btn.set_tooltip_text(Some("Close"));
-        close_btn.connect_clicked(glib::clone!(
-            #[weak(rename_to = window)]
-            self,
-            move |_| {
-                window.close();
-            }
-        ));
-        header.pack_end(&close_btn);
+        // Add window controls (close, minimize, maximize) to the end
+        let window_controls = gtk4::WindowControls::new(gtk4::PackType::End);
+        header.pack_end(&window_controls);
 
         content_box.append(&header);
         content_box.append(&self.build_chat_list());
@@ -2036,16 +2015,9 @@ impl HangarWindow {
         title.add_css_class("title");
         header.set_title_widget(Some(&title));
 
-        let close_btn = gtk4::Button::from_icon_name("window-close-symbolic");
-        close_btn.set_tooltip_text(Some("Close"));
-        close_btn.connect_clicked(glib::clone!(
-            #[weak(rename_to = window)]
-            self,
-            move |_| {
-                window.close();
-            }
-        ));
-        header.pack_end(&close_btn);
+        // Add window controls (close, minimize, maximize) to the end
+        let window_controls = gtk4::WindowControls::new(gtk4::PackType::End);
+        header.pack_end(&window_controls);
 
         content_box.append(&header);
         content_box.append(&self.build_own_profile_content());
@@ -2412,16 +2384,9 @@ impl HangarWindow {
         title.add_css_class("title");
         header.set_title_widget(Some(&title));
 
-        let close_btn = gtk4::Button::from_icon_name("window-close-symbolic");
-        close_btn.set_tooltip_text(Some("Close"));
-        close_btn.connect_clicked(glib::clone!(
-            #[weak(rename_to = window)]
-            self,
-            move |_| {
-                window.close();
-            }
-        ));
-        header.pack_end(&close_btn);
+        // Add window controls (close, minimize, maximize) to the end
+        let window_controls = gtk4::WindowControls::new(gtk4::PackType::End);
+        header.pack_end(&window_controls);
 
         content_box.append(&header);
         content_box.append(&self.build_likes_list());
@@ -2612,16 +2577,9 @@ impl HangarWindow {
         title.add_css_class("title");
         header.set_title_widget(Some(&title));
 
-        let close_btn = gtk4::Button::from_icon_name("window-close-symbolic");
-        close_btn.set_tooltip_text(Some("Close"));
-        close_btn.connect_clicked(glib::clone!(
-            #[weak(rename_to = window)]
-            self,
-            move |_| {
-                window.close();
-            }
-        ));
-        header.pack_end(&close_btn);
+        // Add window controls (close, minimize, maximize) to the end
+        let window_controls = gtk4::WindowControls::new(gtk4::PackType::End);
+        header.pack_end(&window_controls);
 
         content_box.append(&header);
         content_box.append(&self.build_search_content());
