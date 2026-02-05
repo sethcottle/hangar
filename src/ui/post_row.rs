@@ -1120,7 +1120,9 @@ impl PostRow {
         text_box.append(&title);
 
         if !ext.description.is_empty() {
-            let desc = gtk4::Label::new(Some(&ext.description));
+            // Strip any HTML tags that might be in the description from Open Graph metadata
+            let clean_desc = Self::strip_html_tags(&ext.description);
+            let desc = gtk4::Label::new(Some(&clean_desc));
             desc.set_halign(gtk4::Align::Start);
             desc.add_css_class("dim-label");
             desc.add_css_class("caption");
@@ -1283,6 +1285,12 @@ impl PostRow {
         }
     }
 
+    /// Strip HTML tags from text (for cleaning up Open Graph descriptions)
+    fn strip_html_tags(text: &str) -> String {
+        let tag_pattern = regex::Regex::new(r"<[^>]*>").unwrap();
+        tag_pattern.replace_all(text, "").to_string()
+    }
+
     /// Format post text with clickable links, mentions, and hashtags using Pango markup
     /// URLs become actual <a> tags, mentions use bsky-mention:// scheme, hashtags use bsky-tag:// scheme
     fn format_post_text(text: &str) -> String {
@@ -1294,13 +1302,6 @@ impl PostRow {
         let url_with_protocol =
             regex::Regex::new(r"https?://[^\s<>\[\]{}|\\^`\x00-\x1f\x7f]+").unwrap();
 
-        // Pattern for bare domain URLs (domain.tld/path) - starts with word boundary
-        // Common TLDs that are likely to be URLs
-        let bare_url_pattern = regex::Regex::new(
-            r"\b([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+(?:com|org|net|io|co|app|dev|edu|gov|me|info|biz|social)[/a-zA-Z0-9._~:/?#@!$&'()*+,;=-]*",
-        )
-        .unwrap();
-
         // Pattern for @mentions (e.g., @user.bsky.social)
         let mention_pattern = regex::Regex::new(
             r"@([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+[a-zA-Z]([a-zA-Z0-9-]*[a-zA-Z0-9])?",
@@ -1310,25 +1311,34 @@ impl PostRow {
         // Pattern for hashtags
         let hashtag_pattern = regex::Regex::new(r"#[a-zA-Z][a-zA-Z0-9_]*").unwrap();
 
-        // Replace URLs with protocol first
+        // Replace URLs with protocol - use placeholder to avoid re-matching
+        let mut link_count = 0;
+        let mut links: Vec<String> = Vec::new();
         result = url_with_protocol
             .replace_all(&result, |caps: &regex::Captures| {
                 let url = &caps[0];
-                format!("<a href=\"{}\">{}</a>", url, url)
+                let placeholder = format!("\x00LINK{}\x00", link_count);
+                links.push(format!("<a href=\"{}\">{}</a>", url, url));
+                link_count += 1;
+                placeholder
             })
             .to_string();
 
-        // Replace bare domain URLs (only if not already inside an <a> tag)
-        // We check by looking for urls not preceded by href="
+        // Pattern for bare domain URLs (domain.tld/path) - only match if not already linkified
+        // Common TLDs that are likely to be URLs
+        let bare_url_pattern = regex::Regex::new(
+            r"\b([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+(?:com|org|net|io|co|app|dev|edu|gov|me|info|biz|social)[/a-zA-Z0-9._~:/?#@!$&'()*+,;=-]*",
+        )
+        .unwrap();
+
+        // Replace bare domain URLs
         result = bare_url_pattern
             .replace_all(&result, |caps: &regex::Captures| {
                 let url = &caps[0];
-                // Skip if this looks like it's already been linkified (contains href=)
-                if url.contains("href=") {
-                    url.to_string()
-                } else {
-                    format!("<a href=\"https://{}\">{}</a>", url, url)
-                }
+                let placeholder = format!("\x00LINK{}\x00", link_count);
+                links.push(format!("<a href=\"https://{}\">{}</a>", url, url));
+                link_count += 1;
+                placeholder
             })
             .to_string();
 
@@ -1349,6 +1359,12 @@ impl PostRow {
                 format!("<a href=\"bsky-tag://{}\">{}</a>", tag, hashtag)
             })
             .to_string();
+
+        // Restore all link placeholders
+        for (i, link) in links.iter().enumerate() {
+            let placeholder = format!("\x00LINK{}\x00", i);
+            result = result.replace(&placeholder, link);
+        }
 
         result
     }

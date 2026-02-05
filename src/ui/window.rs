@@ -1132,8 +1132,9 @@ impl HangarWindow {
         content_box.set_hexpand(true);
 
         let header = adw::HeaderBar::new();
+        // Hide start buttons (NavigationView provides back button)
+        // Keep end buttons for window controls (close, minimize, etc.)
         header.set_show_start_title_buttons(false);
-        header.set_show_end_title_buttons(false);
 
         let title = gtk4::Label::new(Some("Thread"));
         title.add_css_class("title");
