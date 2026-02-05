@@ -1339,8 +1339,7 @@ impl HangarWindow {
         content_box.append(&scrolled);
 
         // Don't set a tag - each thread is unique and we want to allow multiple in the stack
-        let page = adw::NavigationPage::new(&content_box, "Thread");
-        page
+        adw::NavigationPage::new(&content_box, "Thread")
     }
 
     /// Format a timestamp as "Posted Sat, Jan 31, 2026 at 12:50 PM" in local timezone
@@ -2921,14 +2920,16 @@ impl HangarWindow {
         let sidebar_list = gtk4::ListBox::new();
         sidebar_list.set_selection_mode(gtk4::SelectionMode::Single);
         sidebar_list.add_css_class("navigation-sidebar");
-        sidebar_list.update_property(&[
-            gtk4::accessible::Property::Label("Settings categories"),
-        ]);
+        sidebar_list.update_property(&[gtk4::accessible::Property::Label("Settings categories")]);
 
         // Category entries: (id, label, icon)
         let categories: &[(&str, &str, &str)] = &[
             ("display", "Display", "preferences-desktop-font-symbolic"),
-            ("accessibility", "Accessibility", "preferences-desktop-accessibility-symbolic"),
+            (
+                "accessibility",
+                "Accessibility",
+                "preferences-desktop-accessibility-symbolic",
+            ),
         ];
 
         for &(id, label, icon_name) in categories {
@@ -3003,7 +3004,10 @@ impl HangarWindow {
     }
 
     /// Build the Display tab contents for the settings page
-    fn build_settings_display_tab(&self, current_settings: &crate::state::AppSettings) -> gtk4::Box {
+    fn build_settings_display_tab(
+        &self,
+        current_settings: &crate::state::AppSettings,
+    ) -> gtk4::Box {
         use crate::state::FontSize;
 
         let page_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
@@ -3177,7 +3181,10 @@ impl HangarWindow {
     }
 
     /// Build the Accessibility tab contents for the settings page
-    fn build_settings_accessibility_tab(&self, current_settings: &crate::state::AppSettings) -> gtk4::Box {
+    fn build_settings_accessibility_tab(
+        &self,
+        current_settings: &crate::state::AppSettings,
+    ) -> gtk4::Box {
         let page_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         page_box.set_vexpand(true);
 
@@ -3207,9 +3214,7 @@ impl HangarWindow {
         reduce_motion_switch.set_valign(gtk4::Align::Center);
         reduce_motion_switch.set_active(current_settings.reduce_motion);
         reduce_motion_switch.set_tooltip_text(Some("Toggle reduced motion"));
-        reduce_motion_switch.update_property(&[
-            gtk4::accessible::Property::Label("Reduce motion"),
-        ]);
+        reduce_motion_switch.update_property(&[gtk4::accessible::Property::Label("Reduce motion")]);
 
         let window_weak = self.downgrade();
         reduce_motion_switch.connect_state_set(move |_switch, state| {
@@ -3257,7 +3262,11 @@ impl HangarWindow {
     /// Leave settings and return to the previous page
     fn leave_settings(&self) {
         let imp = self.imp();
-        let previous = imp.previous_page.borrow().clone().unwrap_or("home".to_string());
+        let previous = imp
+            .previous_page
+            .borrow()
+            .clone()
+            .unwrap_or("home".to_string());
 
         // Restore sidebar selection
         if let Some(sidebar) = imp.sidebar.borrow().as_ref() {

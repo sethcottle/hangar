@@ -589,9 +589,10 @@ impl PostRow {
                     if let Ok(count) = label.text().parse::<i32>() {
                         let new_count = (count - 1).max(0) as u32;
                         label.set_text(&Self::format_count(Some(new_count)));
-                        btn.update_property(&[gtk4::accessible::Property::Label(
-                            &format!("Like. {} likes", new_count),
-                        )]);
+                        btn.update_property(&[gtk4::accessible::Property::Label(&format!(
+                            "Like. {} likes",
+                            new_count
+                        ))]);
                     }
                 }
             } else {
@@ -603,9 +604,10 @@ impl PostRow {
                     if let Ok(count) = label.text().parse::<i32>() {
                         let new_count = (count + 1) as u32;
                         label.set_text(&Self::format_count(Some(new_count)));
-                        btn.update_property(&[gtk4::accessible::Property::Label(
-                            &format!("Unlike. {} likes", new_count),
-                        )]);
+                        btn.update_property(&[gtk4::accessible::Property::Label(&format!(
+                            "Unlike. {} likes",
+                            new_count
+                        ))]);
                     }
                 }
             }
@@ -656,9 +658,10 @@ impl PostRow {
                     if let Ok(count) = label.text().parse::<i32>() {
                         let new_count = (count - 1).max(0) as u32;
                         label.set_text(&Self::format_count(Some(new_count)));
-                        btn.update_property(&[gtk4::accessible::Property::Label(
-                            &format!("Repost. {} reposts", new_count),
-                        )]);
+                        btn.update_property(&[gtk4::accessible::Property::Label(&format!(
+                            "Repost. {} reposts",
+                            new_count
+                        ))]);
                     }
                 }
                 // Update menu item label
@@ -673,9 +676,10 @@ impl PostRow {
                     if let Ok(count) = label.text().parse::<i32>() {
                         let new_count = (count + 1) as u32;
                         label.set_text(&Self::format_count(Some(new_count)));
-                        btn.update_property(&[gtk4::accessible::Property::Label(
-                            &format!("Undo repost. {} reposts", new_count),
-                        )]);
+                        btn.update_property(&[gtk4::accessible::Property::Label(&format!(
+                            "Undo repost. {} reposts",
+                            new_count
+                        ))]);
                     }
                 }
                 // Update menu item label
@@ -883,27 +887,18 @@ impl PostRow {
         if let Some(btn) = imp.like_btn.borrow().as_ref() {
             if post.viewer_like.is_some() {
                 btn.add_css_class("liked");
-                let like_label = format!(
-                    "Unlike. {} likes",
-                    post.like_count.unwrap_or(0)
-                );
+                let like_label = format!("Unlike. {} likes", post.like_count.unwrap_or(0));
                 btn.update_property(&[gtk4::accessible::Property::Label(&like_label)]);
             } else {
                 btn.remove_css_class("liked");
-                let like_label = format!(
-                    "Like. {} likes",
-                    post.like_count.unwrap_or(0)
-                );
+                let like_label = format!("Like. {} likes", post.like_count.unwrap_or(0));
                 btn.update_property(&[gtk4::accessible::Property::Label(&like_label)]);
             }
         }
 
         // Update reply button accessible label with count
         if let Some(btn) = imp.reply_btn.borrow().as_ref() {
-            let reply_label = format!(
-                "Reply. {} replies",
-                post.reply_count.unwrap_or(0)
-            );
+            let reply_label = format!("Reply. {} replies", post.reply_count.unwrap_or(0));
             btn.update_property(&[gtk4::accessible::Property::Label(&reply_label)]);
         }
 
@@ -911,17 +906,12 @@ impl PostRow {
         if let Some(btn) = imp.repost_btn.borrow().as_ref() {
             if post.viewer_repost.is_some() {
                 btn.add_css_class("reposted");
-                let repost_label = format!(
-                    "Undo repost. {} reposts",
-                    post.repost_count.unwrap_or(0)
-                );
+                let repost_label =
+                    format!("Undo repost. {} reposts", post.repost_count.unwrap_or(0));
                 btn.update_property(&[gtk4::accessible::Property::Label(&repost_label)]);
             } else {
                 btn.remove_css_class("reposted");
-                let repost_label = format!(
-                    "Repost. {} reposts",
-                    post.repost_count.unwrap_or(0)
-                );
+                let repost_label = format!("Repost. {} reposts", post.repost_count.unwrap_or(0));
                 btn.update_property(&[gtk4::accessible::Property::Label(&repost_label)]);
             }
         }
@@ -958,9 +948,7 @@ impl PostRow {
         if let Some(avatar_widget) = imp.avatar.borrow().as_ref() {
             if let Some(parent_btn) = avatar_widget.parent() {
                 let profile_label = format!("View profile of {}", display_name);
-                parent_btn.update_property(&[
-                    gtk4::accessible::Property::Label(&profile_label),
-                ]);
+                parent_btn.update_property(&[gtk4::accessible::Property::Label(&profile_label)]);
             }
         }
 

@@ -55,21 +55,12 @@ impl Default for FontSize {
 impl Eq for FontSize {}
 
 /// Persistent application settings
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppSettings {
     pub font_size: FontSize,
     /// When true, disable animations/transitions regardless of system setting
     #[serde(default)]
     pub reduce_motion: bool,
-}
-
-impl Default for AppSettings {
-    fn default() -> Self {
-        Self {
-            font_size: FontSize::default(),
-            reduce_motion: false,
-        }
-    }
 }
 
 impl AppSettings {

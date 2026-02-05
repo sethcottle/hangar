@@ -158,9 +158,7 @@ impl ComposeDialog {
         text_view.set_right_margin(8);
         text_view.set_top_margin(8);
         text_view.set_bottom_margin(8);
-        text_view.update_property(&[
-            gtk4::accessible::Property::Label("Post content"),
-        ]);
+        text_view.update_property(&[gtk4::accessible::Property::Label("Post content")]);
 
         let scrolled = gtk4::ScrolledWindow::new();
         scrolled.set_vexpand(true);

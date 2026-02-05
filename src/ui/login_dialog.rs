@@ -98,9 +98,9 @@ impl LoginDialog {
         app_password_link.add_css_class("flat");
         app_password_link.add_css_class("link");
         app_password_link.set_halign(gtk4::Align::Center);
-        app_password_link.update_property(&[
-            gtk4::accessible::Property::Label("Create an App Password (opens in browser)"),
-        ]);
+        app_password_link.update_property(&[gtk4::accessible::Property::Label(
+            "Create an App Password (opens in browser)",
+        )]);
         app_password_link.connect_clicked(|_| {
             let _ = open::that("https://bsky.app/settings/app-passwords");
         });
