@@ -3023,7 +3023,50 @@ impl HangarWindow {
 
         let settings_box = gtk4::Box::new(gtk4::Orientation::Vertical, 24);
 
-        // ---- Display section ----
+        // ---- Appearance section ----
+        let appearance_group = adw::PreferencesGroup::new();
+        appearance_group.set_title("Appearance");
+
+        let scheme_model = gtk4::StringList::new(&["System", "Light", "Dark"]);
+        let scheme_row = adw::ComboRow::builder()
+            .title("Color Scheme")
+            .model(&scheme_model)
+            .build();
+
+        let active_index = match current_settings.color_scheme {
+            crate::state::ColorScheme::System => 0u32,
+            crate::state::ColorScheme::Light => 1,
+            crate::state::ColorScheme::Dark => 2,
+        };
+        scheme_row.set_selected(active_index);
+
+        scheme_row.update_property(&[gtk4::accessible::Property::Label(
+            "Color scheme preference",
+        )]);
+
+        let window_weak = self.downgrade();
+        scheme_row.connect_selected_notify(move |row| {
+            let scheme = match row.selected() {
+                1 => crate::state::ColorScheme::Light,
+                2 => crate::state::ColorScheme::Dark,
+                _ => crate::state::ColorScheme::System,
+            };
+
+            let mut settings = crate::state::AppSettings::load();
+            settings.color_scheme = scheme;
+            if let Err(e) = settings.save() {
+                eprintln!("Failed to save settings: {e}");
+            }
+
+            if let Some(window) = window_weak.upgrade() {
+                window.apply_color_scheme(scheme);
+            }
+        });
+
+        appearance_group.add(&scheme_row);
+        settings_box.append(&appearance_group);
+
+        // ---- Post Text Size section ----
         let display_group = adw::PreferencesGroup::new();
         display_group.set_title("Post Text Size");
 
@@ -3391,6 +3434,16 @@ impl HangarWindow {
             // Clear the CSS — system prefers-reduced-motion still works via style.css
             provider.load_from_data("");
         }
+    }
+
+    /// Apply color scheme preference via Adwaita's StyleManager
+    pub fn apply_color_scheme(&self, scheme: crate::state::ColorScheme) {
+        let adw_scheme = match scheme {
+            crate::state::ColorScheme::System => adw::ColorScheme::Default,
+            crate::state::ColorScheme::Light => adw::ColorScheme::ForceLight,
+            crate::state::ColorScheme::Dark => adw::ColorScheme::ForceDark,
+        };
+        adw::StyleManager::default().set_color_scheme(adw_scheme);
     }
 
     /// Set callback for when font size changes

@@ -247,6 +247,7 @@ mod imp {
             // Apply saved settings on startup
             let saved_settings = crate::state::AppSettings::load();
             window.apply_font_size(saved_settings.font_size);
+            window.apply_color_scheme(saved_settings.color_scheme);
             if saved_settings.reduce_motion {
                 window.apply_reduce_motion(true);
             }

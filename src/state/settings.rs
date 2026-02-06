@@ -54,6 +54,30 @@ impl Default for FontSize {
 
 impl Eq for FontSize {}
 
+/// User-preferred color scheme
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ColorScheme {
+    System,
+    Light,
+    Dark,
+}
+
+impl Default for ColorScheme {
+    fn default() -> Self {
+        Self::System
+    }
+}
+
+impl ColorScheme {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::System => "System",
+            Self::Light => "Light",
+            Self::Dark => "Dark",
+        }
+    }
+}
+
 /// Persistent application settings
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppSettings {
@@ -61,6 +85,9 @@ pub struct AppSettings {
     /// When true, disable animations/transitions regardless of system setting
     #[serde(default)]
     pub reduce_motion: bool,
+    /// Color scheme preference (System follows desktop theme)
+    #[serde(default)]
+    pub color_scheme: ColorScheme,
 }
 
 impl AppSettings {
