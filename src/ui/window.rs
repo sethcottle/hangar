@@ -2924,12 +2924,17 @@ impl HangarWindow {
 
         // Category entries: (id, label, icon)
         let categories: &[(&str, &str, &str)] = &[
-            ("display", "Display", "preferences-desktop-font-symbolic"),
+            (
+                "display",
+                "Display",
+                "preferences-desktop-appearance-symbolic",
+            ),
             (
                 "accessibility",
                 "Accessibility",
                 "preferences-desktop-accessibility-symbolic",
             ),
+            ("account", "Account", "avatar-default-symbolic"),
         ];
 
         for &(id, label, icon_name) in categories {
@@ -2980,6 +2985,13 @@ impl HangarWindow {
         let a11y_page = self.build_settings_accessibility_tab(&current_settings);
         a11y_scrolled.set_child(Some(&a11y_page));
         content_stack.add_named(&a11y_scrolled, Some("accessibility"));
+
+        // Account page (in a ScrolledWindow)
+        let account_scrolled = gtk4::ScrolledWindow::new();
+        account_scrolled.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
+        let account_page = self.build_settings_account_tab();
+        account_scrolled.set_child(Some(&account_page));
+        content_stack.add_named(&account_scrolled, Some("account"));
 
         // Wire sidebar selection to content stack
         let stack_ref = content_stack.clone();
@@ -3040,9 +3052,7 @@ impl HangarWindow {
         };
         scheme_row.set_selected(active_index);
 
-        scheme_row.update_property(&[gtk4::accessible::Property::Label(
-            "Color scheme preference",
-        )]);
+        scheme_row.update_property(&[gtk4::accessible::Property::Label("Color scheme preference")]);
 
         let window_weak = self.downgrade();
         scheme_row.connect_selected_notify(move |row| {
@@ -3277,6 +3287,96 @@ impl HangarWindow {
         reduce_motion_row.set_activatable_widget(Some(&reduce_motion_switch));
         motion_group.add(&reduce_motion_row);
         settings_box.append(&motion_group);
+
+        clamp.set_child(Some(&settings_box));
+        page_box.append(&clamp);
+        page_box
+    }
+
+    /// Build the Account tab contents for the settings page
+    fn build_settings_account_tab(&self) -> gtk4::Box {
+        let page_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        page_box.set_vexpand(true);
+
+        let clamp = adw::Clamp::new();
+        clamp.set_maximum_size(600);
+        clamp.set_margin_top(16);
+        clamp.set_margin_bottom(16);
+        clamp.set_margin_start(16);
+        clamp.set_margin_end(16);
+
+        let settings_box = gtk4::Box::new(gtk4::Orientation::Vertical, 24);
+
+        // ---- Content & Safety section ----
+        let safety_group = adw::PreferencesGroup::new();
+        safety_group.set_title("Content &amp; Safety");
+        safety_group.set_description(Some("Manage content preferences on the Bluesky website."));
+
+        let safety_row = adw::ActionRow::builder()
+            .title("Content Filtering")
+            .subtitle("Manage content labels and filters")
+            .activatable(true)
+            .build();
+        safety_row.add_suffix(&gtk4::Image::from_icon_name("window-new-symbolic"));
+        safety_row.update_property(&[gtk4::accessible::Property::Label(
+            "Content Filtering (opens in browser)",
+        )]);
+        safety_row.connect_activated(|_| {
+            let _ = open::that("https://bsky.app/settings/content-and-media");
+        });
+        safety_group.add(&safety_row);
+
+        let moderation_row = adw::ActionRow::builder()
+            .title("Moderation")
+            .subtitle("Manage muted words, accounts, and lists")
+            .activatable(true)
+            .build();
+        moderation_row.add_suffix(&gtk4::Image::from_icon_name("window-new-symbolic"));
+        moderation_row.update_property(&[gtk4::accessible::Property::Label(
+            "Moderation (opens in browser)",
+        )]);
+        moderation_row.connect_activated(|_| {
+            let _ = open::that("https://bsky.app/moderation");
+        });
+        safety_group.add(&moderation_row);
+
+        settings_box.append(&safety_group);
+
+        // ---- Data section ----
+        let data_group = adw::PreferencesGroup::new();
+        data_group.set_title("Data");
+
+        let cache_row = adw::ActionRow::builder()
+            .title("Clear Cache")
+            .subtitle("Remove cached posts, profiles, and images")
+            .build();
+
+        let cache_btn = gtk4::Button::with_label("Clear");
+        cache_btn.add_css_class("destructive-action");
+        cache_btn.set_valign(gtk4::Align::Center);
+        cache_btn.set_tooltip_text(Some("Clear all cached data"));
+        cache_btn.update_property(&[gtk4::accessible::Property::Label("Clear cache")]);
+
+        let window_weak = self.downgrade();
+        cache_btn.connect_clicked(move |btn| {
+            btn.set_sensitive(false);
+            btn.set_label("Cleared");
+
+            // Delete cache files from disk
+            if let Some(window) = window_weak.upgrade() {
+                if let Some(did) = window.imp().current_user_did.borrow().as_ref() {
+                    if let Some(data_dir) = dirs::data_dir() {
+                        let safe_did = did.replace(':', "_");
+                        let cache_dir = data_dir.join("hangar").join(safe_did);
+                        let _ = std::fs::remove_dir_all(&cache_dir);
+                    }
+                }
+            }
+        });
+
+        cache_row.add_suffix(&cache_btn);
+        data_group.add(&cache_row);
+        settings_box.append(&data_group);
 
         clamp.set_child(Some(&settings_box));
         page_box.append(&clamp);

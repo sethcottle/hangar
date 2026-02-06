@@ -5,15 +5,17 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Font size as a scale factor (1.0 = default)
-/// Slider steps: 0.8, 0.85, 0.9, 0.95, 1.0, 1.05, 1.1, 1.15, 1.2
+/// Extended range for low-vision accessibility (WCAG 1.4.4)
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct FontSize(pub f64);
 
 impl FontSize {
     /// All discrete slider positions
-    pub const STEPS: &'static [f64] = &[0.8, 0.85, 0.9, 0.95, 1.0, 1.05, 1.1, 1.15, 1.2];
-    pub const MIN: f64 = 0.8;
-    pub const MAX: f64 = 1.2;
+    pub const STEPS: &'static [f64] = &[
+        0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 1.0, 1.05, 1.1, 1.15, 1.2, 1.25, 1.3, 1.35, 1.4, 1.45, 1.5,
+    ];
+    pub const MIN: f64 = 0.7;
+    pub const MAX: f64 = 1.5;
     pub const STEP: f64 = 0.05;
     pub const DEFAULT: f64 = 1.0;
 
@@ -22,14 +24,17 @@ impl FontSize {
     }
 
     pub fn label(self) -> &'static str {
-        // Snap to nearest step for label
         let val = self.0;
-        if val <= 0.82 {
+        if val <= 0.72 {
             "Smallest"
-        } else if val <= 0.87 {
+        } else if val <= 0.77 {
+            "Tiny"
+        } else if val <= 0.82 {
             "Smaller"
-        } else if val <= 0.92 {
+        } else if val <= 0.87 {
             "Small"
+        } else if val <= 0.92 {
+            "Compact"
         } else if val <= 0.97 {
             "Medium"
         } else if val <= 1.02 {
@@ -39,7 +44,19 @@ impl FontSize {
         } else if val <= 1.12 {
             "Larger"
         } else if val <= 1.17 {
+            "Big"
+        } else if val <= 1.22 {
+            "Biggest"
+        } else if val <= 1.27 {
+            "Huge"
+        } else if val <= 1.32 {
+            "Huger"
+        } else if val <= 1.37 {
+            "Extra Large"
+        } else if val <= 1.42 {
             "Largest"
+        } else if val <= 1.47 {
+            "Massive"
         } else {
             "Maximum"
         }
@@ -55,17 +72,12 @@ impl Default for FontSize {
 impl Eq for FontSize {}
 
 /// User-preferred color scheme
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ColorScheme {
+    #[default]
     System,
     Light,
     Dark,
-}
-
-impl Default for ColorScheme {
-    fn default() -> Self {
-        Self::System
-    }
 }
 
 impl ColorScheme {
