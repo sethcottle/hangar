@@ -52,9 +52,37 @@ impl LoginDialog {
     }
 
     fn setup_ui(&self) {
-        self.set_title("Hangar");
+        self.set_title("Sign In to Bluesky");
         self.set_content_width(400);
         // Let dialog auto-size height based on content
+
+        // Header bar with Cancel (start) and Sign In (end) — GNOME HIG pattern
+        let header = adw::HeaderBar::new();
+        header.set_show_start_title_buttons(false);
+        header.set_show_end_title_buttons(false);
+
+        let cancel_btn = gtk4::Button::with_label("Cancel");
+        cancel_btn.connect_clicked(glib::clone!(
+            #[weak(rename_to = dialog)]
+            self,
+            move |_| {
+                dialog.close();
+            }
+        ));
+        header.pack_start(&cancel_btn);
+
+        let spinner = gtk4::Spinner::new();
+        spinner.set_visible(false);
+        spinner.update_property(&[gtk4::accessible::Property::Label("Signing in")]);
+        header.pack_end(&spinner);
+
+        let login_button = gtk4::Button::with_label("Sign In");
+        login_button.add_css_class("suggested-action");
+        login_button.set_sensitive(false);
+        header.pack_end(&login_button);
+
+        let toolbar = adw::ToolbarView::new();
+        toolbar.add_top_bar(&header);
 
         // Main content box
         let content = gtk4::Box::new(gtk4::Orientation::Vertical, 16);
@@ -62,11 +90,6 @@ impl LoginDialog {
         content.set_margin_end(24);
         content.set_margin_top(24);
         content.set_margin_bottom(24);
-
-        // App title
-        let title = gtk4::Label::new(Some("Sign In to Bluesky"));
-        title.add_css_class("title-1");
-        content.append(&title);
 
         // Description
         let desc = gtk4::Label::new(Some(
@@ -83,7 +106,6 @@ impl LoginDialog {
         let handle_row = adw::EntryRow::new();
         handle_row.set_title("Handle");
         handle_row.set_input_purpose(gtk4::InputPurpose::Email);
-        handle_row.set_text("yourname.bsky.social");
         handle_row.set_show_apply_button(false);
         prefs_group.add(&handle_row);
 
@@ -93,19 +115,6 @@ impl LoginDialog {
 
         content.append(&prefs_group);
 
-        // App password help link
-        let app_password_link = gtk4::Button::with_label("Create an App Password →");
-        app_password_link.add_css_class("flat");
-        app_password_link.add_css_class("link");
-        app_password_link.set_halign(gtk4::Align::Center);
-        app_password_link.update_property(&[gtk4::accessible::Property::Label(
-            "Create an App Password (opens in browser)",
-        )]);
-        app_password_link.connect_clicked(|_| {
-            let _ = open::that("https://bsky.app/settings/app-passwords");
-        });
-        content.append(&app_password_link);
-
         // Error label (hidden by default)
         let error_label = gtk4::Label::new(None);
         error_label.set_halign(gtk4::Align::Center);
@@ -114,44 +123,42 @@ impl LoginDialog {
         error_label.set_wrap(true);
         content.append(&error_label);
 
-        // Button box with spinner
-        let button_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
-        button_box.set_halign(gtk4::Align::Center);
-        button_box.set_margin_top(12);
+        // Links row: App Password (left) and Privacy (right)
+        let links_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        links_box.set_margin_top(8);
 
-        let spinner = gtk4::Spinner::new();
-        spinner.set_visible(false);
-        spinner.update_property(&[gtk4::accessible::Property::Label("Signing in")]);
-        button_box.append(&spinner);
-
-        let cancel_btn = gtk4::Button::with_label("Cancel");
-        cancel_btn.connect_clicked(glib::clone!(
-            #[weak(rename_to = dialog)]
-            self,
-            move |_| {
-                dialog.close();
-            }
-        ));
-        button_box.append(&cancel_btn);
-
-        let login_button = gtk4::Button::with_label("Sign In");
-        login_button.add_css_class("suggested-action");
-        login_button.set_sensitive(false);
-        button_box.append(&login_button);
-
-        content.append(&button_box);
-
-        // Privacy link
-        let privacy_link = gtk4::Button::with_label("Privacy & Security");
+        let privacy_link = gtk4::Button::with_label("Privacy & Security →");
         privacy_link.add_css_class("flat");
         privacy_link.add_css_class("link");
-        privacy_link.add_css_class("dim-label");
-        privacy_link.set_halign(gtk4::Align::Center);
-        privacy_link.set_margin_top(8);
+        privacy_link.set_halign(gtk4::Align::Start);
+        privacy_link.update_property(&[gtk4::accessible::Property::Label(
+            "Privacy & Security (opens in browser)",
+        )]);
         privacy_link.connect_clicked(|_| {
             let _ = open::that("https://hangar.blue/privacy/");
         });
-        content.append(&privacy_link);
+        links_box.append(&privacy_link);
+
+        // Spacer to push app password link to the right
+        let spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        spacer.set_hexpand(true);
+        links_box.append(&spacer);
+
+        let app_password_link = gtk4::Button::with_label("Create an App Password →");
+        app_password_link.add_css_class("flat");
+        app_password_link.add_css_class("link");
+        app_password_link.set_halign(gtk4::Align::End);
+        app_password_link.update_property(&[gtk4::accessible::Property::Label(
+            "Create an App Password (opens in browser)",
+        )]);
+        app_password_link.connect_clicked(|_| {
+            let _ = open::that("https://bsky.app/settings/app-passwords");
+        });
+        links_box.append(&app_password_link);
+
+        content.append(&links_box);
+
+        toolbar.set_content(Some(&content));
 
         // Connect entry changes to enable/disable login button
         let login_btn_weak = login_button.downgrade();
@@ -203,7 +210,7 @@ impl LoginDialog {
         imp.spinner.replace(Some(spinner));
         imp.error_label.replace(Some(error_label));
 
-        self.set_child(Some(&content));
+        self.set_child(Some(&toolbar));
     }
 
     pub fn handle(&self) -> String {

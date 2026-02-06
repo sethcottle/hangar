@@ -138,10 +138,32 @@ impl ComposeDialog {
     }
 
     fn setup_ui(&self) {
+        // Header bar with Cancel (start) and Post (end) — GNOME HIG pattern
+        let header = adw::HeaderBar::new();
+        header.set_show_start_title_buttons(false);
+        header.set_show_end_title_buttons(false);
+
+        let cancel_btn = gtk4::Button::with_label("Cancel");
+        cancel_btn.connect_clicked(glib::clone!(
+            #[weak(rename_to = dialog)]
+            self,
+            move |_| {
+                dialog.close();
+            }
+        ));
+        header.pack_start(&cancel_btn);
+
+        let post_btn = gtk4::Button::with_label("Post");
+        post_btn.add_css_class("suggested-action");
+        header.pack_end(&post_btn);
+
+        let toolbar = adw::ToolbarView::new();
+        toolbar.add_top_bar(&header);
+
         let content = gtk4::Box::new(gtk4::Orientation::Vertical, 16);
         content.set_margin_start(24);
         content.set_margin_end(24);
-        content.set_margin_top(24);
+        content.set_margin_top(12);
         content.set_margin_bottom(24);
         content.set_vexpand(true);
 
@@ -179,28 +201,9 @@ impl ComposeDialog {
         error_label.set_visible(false);
         content.append(&error_label);
 
-        // Button box at bottom
-        let button_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
-        button_box.set_halign(gtk4::Align::End);
-        button_box.set_margin_top(12);
+        toolbar.set_content(Some(&content));
 
-        let cancel_btn = gtk4::Button::with_label("Cancel");
-        cancel_btn.connect_clicked(glib::clone!(
-            #[weak(rename_to = dialog)]
-            self,
-            move |_| {
-                dialog.close();
-            }
-        ));
-        button_box.append(&cancel_btn);
-
-        let post_btn = gtk4::Button::with_label("Post");
-        post_btn.add_css_class("suggested-action");
-        button_box.append(&post_btn);
-
-        content.append(&button_box);
-
-        self.set_child(Some(&content));
+        self.set_child(Some(&toolbar));
 
         let imp = self.imp();
         imp.text_view.replace(Some(text_view));
