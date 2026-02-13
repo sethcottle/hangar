@@ -1005,7 +1005,7 @@ impl HangarWindow {
             if let Some(desc) = &feed.description {
                 // Truncate long descriptions
                 let truncated = if desc.len() > 60 {
-                    format!("{}...", &desc[..57])
+                    format!("{}...", &desc[..desc.floor_char_boundary(57)])
                 } else {
                     desc.clone()
                 };

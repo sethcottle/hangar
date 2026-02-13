@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 #![allow(clippy::collapsible_if)]
 
+use crate::atproto::facets;
 use crate::atproto::types::{
     ChatMessage, Conversation, Embed, ExternalEmbed, ImageEmbed, Notification, Post, Profile,
     QuoteEmbed, ReplyContext, RepostReason, SavedFeed, Session, VideoEmbed,
@@ -11,6 +12,7 @@ use atrium_api::agent::store::MemorySessionStore;
 use atrium_api::com::atproto::repo::{create_record, delete_record};
 use atrium_api::types::Unknown;
 use atrium_xrpc_client::reqwest::ReqwestClient;
+use std::collections::HashMap;
 use std::sync::RwLock;
 use thiserror::Error;
 
@@ -762,6 +764,48 @@ impl HangarClient {
         Ok(())
     }
 
+    /// Resolve an AT Protocol handle to a DID.
+    #[allow(clippy::await_holding_lock)]
+    pub async fn resolve_handle(&self, handle: &str) -> Result<String, ClientError> {
+        let agent_guard = self.agent.read().unwrap();
+        let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
+
+        let params = atrium_api::com::atproto::identity::resolve_handle::ParametersData {
+            handle: handle
+                .parse()
+                .map_err(|_| ClientError::InvalidResponse("invalid handle".into()))?,
+        };
+
+        let output = agent
+            .api
+            .com
+            .atproto
+            .identity
+            .resolve_handle(params.into())
+            .await
+            .map_err(|e| ClientError::Network(e.to_string()))?;
+
+        Ok(output.data.did.to_string())
+    }
+
+    /// Parse text for facets and resolve any mention handles to DIDs.
+    /// Must be called before acquiring the agent lock for create_record.
+    async fn resolve_facets(&self, text: &str) -> (Vec<facets::RawFacet>, HashMap<String, String>) {
+        let raw_facets = facets::parse_facets(text);
+        let mut resolved_dids = HashMap::new();
+
+        for raw in &raw_facets {
+            if let facets::RawFacet::Mention { handle, .. } = raw {
+                if let Ok(did) = self.resolve_handle(handle).await {
+                    resolved_dids.insert(handle.clone(), did);
+                }
+                // Failed resolutions silently skipped — no facet will be created
+            }
+        }
+
+        (raw_facets, resolved_dids)
+    }
+
     #[allow(clippy::await_holding_lock)]
     pub async fn create_post(&self, text: &str) -> Result<(), ClientError> {
         self.create_post_internal(text, None).await
@@ -795,6 +839,9 @@ impl HangarClient {
         quoted_uri: &str,
         quoted_cid: &str,
     ) -> Result<(), ClientError> {
+        // Resolve facets before acquiring the agent lock for create_record
+        let (raw_facets, resolved_dids) = self.resolve_facets(text).await;
+
         let agent_guard = self.agent.read().unwrap();
         let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
         let session = agent
@@ -802,7 +849,7 @@ impl HangarClient {
             .await
             .ok_or(ClientError::NotAuthenticated)?;
 
-        let record_json = serde_json::json!({
+        let mut record_json = serde_json::json!({
             "$type": "app.bsky.feed.post",
             "text": text,
             "createdAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
@@ -814,6 +861,14 @@ impl HangarClient {
                 }
             }
         });
+
+        // Add facets if any were detected
+        let facets_json = facets::build_facets_json(&raw_facets, &resolved_dids);
+        if let serde_json::Value::Array(ref arr) = facets_json {
+            if !arr.is_empty() {
+                record_json["facets"] = facets_json;
+            }
+        }
 
         let record: Unknown = serde_json::from_value(record_json)
             .map_err(|e| ClientError::InvalidResponse(e.to_string()))?;
@@ -847,6 +902,9 @@ impl HangarClient {
         text: &str,
         reply: Option<ReplyRef>,
     ) -> Result<(), ClientError> {
+        // Resolve facets before acquiring the agent lock for create_record
+        let (raw_facets, resolved_dids) = self.resolve_facets(text).await;
+
         let agent_guard = self.agent.read().unwrap();
         let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
         let session = agent
@@ -865,6 +923,14 @@ impl HangarClient {
                 "root": { "uri": r.root_uri, "cid": r.root_cid },
                 "parent": { "uri": r.parent_uri, "cid": r.parent_cid }
             });
+        }
+
+        // Add facets if any were detected
+        let facets_json = facets::build_facets_json(&raw_facets, &resolved_dids);
+        if let serde_json::Value::Array(ref arr) = facets_json {
+            if !arr.is_empty() {
+                record_json["facets"] = facets_json;
+            }
         }
 
         let record: Unknown = serde_json::from_value(record_json)
@@ -1593,6 +1659,62 @@ impl HangarClient {
 
     /// Search actors (users) by query string
     #[allow(clippy::await_holding_lock)]
+    /// Fast typeahead search for actors (used by mention autocomplete).
+    /// Returns a lightweight list of matching profiles.
+    #[allow(clippy::await_holding_lock)]
+    pub async fn search_actors_typeahead(
+        &self,
+        query: &str,
+        limit: u8,
+    ) -> Result<Vec<Profile>, ClientError> {
+        let agent_guard = self.agent.read().unwrap();
+        let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
+
+        let params = atrium_api::app::bsky::actor::search_actors_typeahead::ParametersData {
+            q: Some(query.to_string()),
+            limit: atrium_api::types::LimitedNonZeroU8::try_from(limit).ok(),
+            term: None,
+        };
+
+        let output = agent
+            .api
+            .app
+            .bsky
+            .actor
+            .search_actors_typeahead(params.into())
+            .await
+            .map_err(|e| ClientError::Network(e.to_string()))?;
+
+        let actors: Vec<Profile> = output
+            .data
+            .actors
+            .into_iter()
+            .map(|actor| Profile {
+                did: actor.data.did.to_string(),
+                handle: actor.data.handle.to_string(),
+                display_name: actor.data.display_name.clone(),
+                avatar: actor.data.avatar.clone(),
+                banner: None,
+                description: None,
+                followers_count: None,
+                following_count: None,
+                posts_count: None,
+                viewer_following: actor
+                    .data
+                    .viewer
+                    .as_ref()
+                    .and_then(|v| v.data.following.clone()),
+                viewer_followed_by: actor
+                    .data
+                    .viewer
+                    .as_ref()
+                    .and_then(|v| v.data.followed_by.clone()),
+            })
+            .collect();
+
+        Ok(actors)
+    }
+
     pub async fn search_actors(
         &self,
         query: &str,

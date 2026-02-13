@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 mod client;
+mod facets;
 mod types;
 
 pub use client::HangarClient;

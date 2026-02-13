@@ -670,6 +670,40 @@ impl HangarApplication {
         });
     }
 
+    /// Wire up mention typeahead search on a compose dialog.
+    fn setup_mention_search(&self, dialog: &ComposeDialog) {
+        let client = self.client();
+        let dialog_weak = dialog.downgrade();
+
+        dialog.connect_mention_search(move |query| {
+            let client = client.clone();
+            let query = query.clone();
+            let dialog_weak = dialog_weak.clone();
+
+            let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<Profile>, String>>();
+
+            thread::spawn(move || {
+                let result =
+                    runtime::block_on(async { client.search_actors_typeahead(&query, 6).await });
+                let _ = tx.send(result.map_err(|e| e.to_string()));
+            });
+
+            glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+                match rx.try_recv() {
+                    Ok(Ok(profiles)) => {
+                        if let Some(dialog) = dialog_weak.upgrade() {
+                            dialog.set_mention_results(profiles);
+                        }
+                        glib::ControlFlow::Break
+                    }
+                    Ok(Err(_)) => glib::ControlFlow::Break,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+                }
+            });
+        });
+    }
+
     fn open_compose_dialog(&self) {
         let window = match self.imp().window.borrow().as_ref() {
             Some(w) => w.clone(),
@@ -726,6 +760,7 @@ impl HangarApplication {
             });
         });
 
+        self.setup_mention_search(&dialog);
         dialog.present(Some(&window));
     }
 
@@ -794,6 +829,7 @@ impl HangarApplication {
             });
         });
 
+        self.setup_mention_search(&dialog);
         dialog.present(Some(&window));
     }
 
@@ -865,6 +901,7 @@ impl HangarApplication {
             });
         });
 
+        self.setup_mention_search(&dialog);
         dialog.present(Some(&window));
     }
 
