@@ -2,6 +2,7 @@
 #![allow(clippy::type_complexity)]
 
 use crate::atproto::Profile;
+use crate::state::AppSettings;
 use crate::ui::avatar_cache;
 use gtk4::gdk;
 use gtk4::glib;
@@ -265,6 +266,7 @@ impl ComposeDialog {
         text_view.set_top_margin(8);
         text_view.set_bottom_margin(8);
         text_view.set_accepts_tab(false);
+        text_view.add_css_class("compose-text");
         text_view.update_property(&[gtk4::accessible::Property::Label("Post content")]);
 
         // Create text tags for rich text highlighting (mentions, hashtags, URLs).
@@ -306,10 +308,16 @@ impl ComposeDialog {
         // line_height(1.4) prevents emoji from overlapping adjacent lines.
         // letter_spacing adds trailing space after the emoji glyph so the
         // next character doesn't render under the emoji's right edge.
-        // Value is in Pango units (1024 per pixel); 3px ≈ 3072 units.
+        // Base is 6px (6144 Pango units), scaled by the font size setting so
+        // the gap stays proportional at larger text sizes. Note that Pango
+        // splits letter_spacing across both sides of the glyph, so higher
+        // values also increase the left gap. 6px is the best compromise
+        // between right-side clearance and left-side inflation.
+        let font_scale = AppSettings::load().font_size.scale_factor();
+        let emoji_spacing = (6144.0 * font_scale) as i32;
         let emoji_tag = gtk4::TextTag::new(Some(TAG_EMOJI));
         emoji_tag.set_line_height(1.4);
-        emoji_tag.set_letter_spacing(3072);
+        emoji_tag.set_letter_spacing(emoji_spacing);
         tag_table.add(&emoji_tag);
 
         let scrolled = gtk4::ScrolledWindow::new();

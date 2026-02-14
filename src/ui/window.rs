@@ -3079,6 +3079,7 @@ impl HangarWindow {
         // ---- Post Text Size section ----
         let display_group = adw::PreferencesGroup::new();
         display_group.set_title("Post Text Size");
+        display_group.set_description(Some("Applies to posts in your feed and the compose view."));
 
         // Text Size label row
         let size_label_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
@@ -3489,6 +3490,9 @@ impl HangarWindow {
     font-size: {caption}em;
 }}
 .text-size-preview .preview-body {{
+    font-size: {body}em;
+}}
+.compose-text {{
     font-size: {body}em;
 }}
 "#,
