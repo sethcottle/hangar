@@ -926,7 +926,7 @@ impl PostRow {
 
         // Set composite accessible label on the PostRow for screen readers
         let text_preview = if post.text.len() > 200 {
-            &post.text[..post.text.floor_char_boundary(200)]
+            &post.text[..super::floor_char_boundary(&post.text, 200)]
         } else {
             &post.text
         };

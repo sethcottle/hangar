@@ -204,7 +204,7 @@ impl ComposeDialog {
             let text = if context.text.len() > 100 {
                 format!(
                     "{}...",
-                    &context.text[..context.text.floor_char_boundary(100)]
+                    &context.text[..super::floor_char_boundary(&context.text, 100)]
                 )
             } else {
                 context.text.clone()
