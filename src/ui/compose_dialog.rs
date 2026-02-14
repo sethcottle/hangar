@@ -302,10 +302,14 @@ impl ComposeDialog {
         url_tag.set_underline(gtk4::pango::Underline::Single);
         tag_table.add(&url_tag);
 
-        // Emoji tag: increase line height on lines containing emoji so they
-        // don't overlap with adjacent text. Only applied to emoji characters.
+        // Emoji tag: fix vertical line overlap and horizontal overshoot.
+        // line_height(1.4) prevents emoji from overlapping adjacent lines.
+        // letter_spacing adds trailing space after the emoji glyph so the
+        // next character doesn't render under the emoji's right edge.
+        // Value is in Pango units (1024 per pixel); 3px ≈ 3072 units.
         let emoji_tag = gtk4::TextTag::new(Some(TAG_EMOJI));
-        emoji_tag.set_line_height(1.5);
+        emoji_tag.set_line_height(1.4);
+        emoji_tag.set_letter_spacing(3072);
         tag_table.add(&emoji_tag);
 
         let scrolled = gtk4::ScrolledWindow::new();
@@ -566,16 +570,14 @@ impl ComposeDialog {
             }
         }
 
-        // Apply emoji line-height tag to any emoji characters so they don't
-        // overlap adjacent lines. We detect emoji by Unicode category.
-        let mut char_offset = 0i32;
-        for ch in text.chars() {
+        // Apply emoji tags for vertical line-height fix
+        let chars: Vec<char> = text.chars().collect();
+        for (i, &ch) in chars.iter().enumerate() {
             if is_emoji(ch) {
-                let s = buffer.iter_at_offset(char_offset);
-                let e = buffer.iter_at_offset(char_offset + 1);
+                let s = buffer.iter_at_offset(i as i32);
+                let e = buffer.iter_at_offset(i as i32 + 1);
                 buffer.apply_tag_by_name(TAG_EMOJI, &s, &e);
             }
-            char_offset += 1;
         }
     }
 
