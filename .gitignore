@@ -33,6 +33,7 @@ repo/
 
 # Internal docs (not for public repo yet)
 DOCS/
+CLAUDE.md
 
 # Rust specific
 **/*.rs.bk

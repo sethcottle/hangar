@@ -86,6 +86,15 @@ jobs:
           cp assets/icons/io.github.sethcottle.Hangar.svg AppDir/usr/share/icons/hicolor/scalable/apps/
           cp data/io.github.sethcottle.Hangar.metainfo.xml AppDir/usr/share/metainfo/
 
+      - name: Determine update channel
+        id: update-channel
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            echo "update_info=gh-releases-zsync|sethcottle|hangar|latest|Hangar*.AppImage.zsync" >> $GITHUB_OUTPUT
+          else
+            echo "update_info=gh-releases-zsync|sethcottle|hangar|nightly|Hangar*.AppImage.zsync" >> $GITHUB_OUTPUT
+          fi
+
       - name: Build AppImage
         run: |
           export DEPLOY_GTK_VERSION=4
@@ -93,13 +102,16 @@ jobs:
             --plugin gtk \
             --desktop-file AppDir/usr/share/applications/io.github.sethcottle.Hangar.desktop \
             --icon-file AppDir/usr/share/icons/hicolor/scalable/apps/io.github.sethcottle.Hangar.svg \
+            --update-information "${{ steps.update-channel.outputs.update_info }}" \
             --output appimage
 
       - name: Upload AppImage artifact
         uses: actions/upload-artifact@v4
         with:
           name: hangar-appimage
-          path: Hangar*.AppImage
+          path: |
+            Hangar*.AppImage
+            Hangar*.AppImage.zsync
 
   release:
     name: Create Release
@@ -174,6 +186,7 @@ jobs:
           files: |
             hangar.flatpak
             Hangar*.AppImage
+            Hangar*.AppImage.zsync
           draft: false
           prerelease: true
 
@@ -197,6 +210,7 @@ jobs:
           files: |
             hangar.flatpak
             Hangar*.AppImage
+            Hangar*.AppImage.zsync
           draft: false
           prerelease: false
 
@@ -206,6 +220,7 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.DO_SPACES_SECRET }}
         run: |
           APPIMAGE=$(ls Hangar*.AppImage)
+          ZSYNC=$(ls Hangar*.AppImage.zsync)
 
           if [ "${{ steps.release-type.outputs.is_nightly }}" == "true" ]; then
             # Nightly builds use -nightly suffix
@@ -215,12 +230,18 @@ jobs:
             aws s3 cp "$APPIMAGE" s3://seth/hangar/releases/Hangar-nightly-x86_64.AppImage \
               --endpoint-url https://nyc3.digitaloceanspaces.com \
               --acl public-read
+            aws s3 cp "$ZSYNC" s3://seth/hangar/releases/Hangar-nightly-x86_64.AppImage.zsync \
+              --endpoint-url https://nyc3.digitaloceanspaces.com \
+              --acl public-read
           else
             # Versioned releases use standard names
             aws s3 cp hangar.flatpak s3://seth/hangar/releases/hangar.flatpak \
               --endpoint-url https://nyc3.digitaloceanspaces.com \
               --acl public-read
             aws s3 cp "$APPIMAGE" s3://seth/hangar/releases/Hangar-x86_64.AppImage \
+              --endpoint-url https://nyc3.digitaloceanspaces.com \
+              --acl public-read
+            aws s3 cp "$ZSYNC" s3://seth/hangar/releases/Hangar-x86_64.AppImage.zsync \
               --endpoint-url https://nyc3.digitaloceanspaces.com \
               --acl public-read
           fi

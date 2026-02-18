@@ -60,11 +60,14 @@ jobs:
             --plugin gtk \
             --desktop-file AppDir/usr/share/applications/io.github.sethcottle.Hangar.desktop \
             --icon-file AppDir/usr/share/icons/hicolor/scalable/apps/io.github.sethcottle.Hangar.svg \
+            --update-information "gh-releases-zsync|sethcottle|hangar|latest|Hangar*.AppImage.zsync" \
             --output appimage
 
       - name: Upload AppImage
         uses: actions/upload-artifact@v4
         with:
           name: hangar-appimage
-          path: Hangar*.AppImage
+          path: |
+            Hangar*.AppImage
+            Hangar*.AppImage.zsync
           retention-days: 7
