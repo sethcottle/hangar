@@ -56,11 +56,11 @@ jobs:
       - name: Build AppImage
         run: |
           export DEPLOY_GTK_VERSION=4
+          export UPDATE_INFORMATION="gh-releases-zsync|sethcottle|hangar|latest|Hangar*.AppImage.zsync"
           ./linuxdeploy --appdir AppDir \
             --plugin gtk \
             --desktop-file AppDir/usr/share/applications/io.github.sethcottle.Hangar.desktop \
             --icon-file AppDir/usr/share/icons/hicolor/scalable/apps/io.github.sethcottle.Hangar.svg \
-            --update-information "gh-releases-zsync|sethcottle|hangar|latest|Hangar*.AppImage.zsync" \
             --output appimage
 
       - name: Upload AppImage

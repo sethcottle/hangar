@@ -98,11 +98,11 @@ jobs:
       - name: Build AppImage
         run: |
           export DEPLOY_GTK_VERSION=4
+          export UPDATE_INFORMATION="${{ steps.update-channel.outputs.update_info }}"
           ./linuxdeploy --appdir AppDir \
             --plugin gtk \
             --desktop-file AppDir/usr/share/applications/io.github.sethcottle.Hangar.desktop \
             --icon-file AppDir/usr/share/icons/hicolor/scalable/apps/io.github.sethcottle.Hangar.svg \
-            --update-information "${{ steps.update-channel.outputs.update_info }}" \
             --output appimage
 
       - name: Upload AppImage artifact
