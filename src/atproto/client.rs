@@ -3,8 +3,9 @@
 
 use crate::atproto::facets;
 use crate::atproto::types::{
-    ChatMessage, Conversation, Embed, ExternalEmbed, ImageEmbed, Notification, Post, Profile,
-    QuoteEmbed, ReplyContext, RepostReason, SavedFeed, Session, VideoEmbed,
+    ChatMessage, ComposeData, Conversation, Embed, ExternalEmbed, ImageEmbed, LinkCardData,
+    Notification, Post, PostgateConfig, Profile, QuoteEmbed, ReplyContext, RepostReason, SavedFeed,
+    Session, ThreadgateConfig, ThreadgateRule, VideoEmbed,
 };
 use crate::config::DEFAULT_PDS;
 use atrium_api::agent::AtpAgent;
@@ -30,12 +31,13 @@ pub enum ClientError {
 
 type Agent = AtpAgent<MemorySessionStore, ReqwestClient>;
 
-/// Internal struct for reply references
-struct ReplyRef {
-    root_uri: String,
-    root_cid: String,
-    parent_uri: String,
-    parent_cid: String,
+/// Reply reference for post creation (root + parent URIs).
+#[derive(Clone)]
+pub struct ReplyRef {
+    pub root_uri: String,
+    pub root_cid: String,
+    pub parent_uri: String,
+    pub parent_cid: String,
 }
 
 /// Wraps atrium so the rest of the app only sees our own types.
@@ -832,15 +834,84 @@ impl HangarClient {
     }
 
     /// Create a quote post (post with an embedded reference to another post)
-    #[allow(clippy::await_holding_lock)]
     pub async fn create_quote_post(
         &self,
         text: &str,
         quoted_uri: &str,
         quoted_cid: &str,
     ) -> Result<(), ClientError> {
-        // Resolve facets before acquiring the agent lock for create_record
-        let (raw_facets, resolved_dids) = self.resolve_facets(text).await;
+        let data = ComposeData {
+            text: text.to_string(),
+            ..Default::default()
+        };
+        self.create_post_with_data(&data, None, Some((quoted_uri, quoted_cid)))
+            .await?;
+        Ok(())
+    }
+
+    /// Upload a blob (image/video) to the PDS and return the blob ref as JSON.
+    #[allow(clippy::await_holding_lock)]
+    pub async fn upload_blob(
+        &self,
+        data: Vec<u8>,
+        mime_type: &str,
+    ) -> Result<serde_json::Value, ClientError> {
+        let agent_guard = self.agent.read().unwrap();
+        let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
+
+        let output = agent
+            .api
+            .com
+            .atproto
+            .repo
+            .upload_blob(data)
+            .await
+            .map_err(|e| ClientError::Network(e.to_string()))?;
+
+        // Serialize the BlobRef to JSON — atrium's BlobRef implements Serialize.
+        // The output contains the blob reference we need for embeds.
+        let blob_json = serde_json::to_value(&output.data.blob)
+            .map_err(|e| ClientError::InvalidResponse(e.to_string()))?;
+
+        // Ensure the mime_type in the blob ref matches what we uploaded
+        // (atrium may set it from Content-Type header, but let's be explicit)
+        let mut blob = blob_json;
+        if let Some(obj) = blob.as_object_mut() {
+            obj.insert("mimeType".to_string(), serde_json::json!(mime_type));
+        }
+
+        Ok(blob)
+    }
+
+    /// Create a post with full compose data (images, language, CW, threadgate, etc.)
+    /// Returns `(uri, cid)` of the created post.
+    #[allow(clippy::await_holding_lock)]
+    pub async fn create_post_with_data(
+        &self,
+        data: &ComposeData,
+        reply: Option<ReplyRef>,
+        quote: Option<(&str, &str)>,
+    ) -> Result<(String, String), ClientError> {
+        // Resolve facets before acquiring the agent lock
+        let (raw_facets, resolved_dids) = self.resolve_facets(&data.text).await;
+
+        // Upload image blobs (if any) before acquiring the agent lock for create_record
+        let mut image_blobs = Vec::new();
+        for img in &data.images {
+            let blob_ref = self.upload_blob(img.data.clone(), &img.mime_type).await?;
+            image_blobs.push((blob_ref, img.alt_text.clone(), img.width, img.height));
+        }
+
+        // Upload link card thumbnail (if present)
+        let link_card_thumb_blob = if let Some(ref card) = data.link_card {
+            if let Some((ref thumb_data, ref thumb_mime)) = card.thumb {
+                Some(self.upload_blob(thumb_data.clone(), thumb_mime).await?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         let agent_guard = self.agent.read().unwrap();
         let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
@@ -849,25 +920,104 @@ impl HangarClient {
             .await
             .ok_or(ClientError::NotAuthenticated)?;
 
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+
         let mut record_json = serde_json::json!({
             "$type": "app.bsky.feed.post",
-            "text": text,
-            "createdAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-            "embed": {
-                "$type": "app.bsky.embed.record",
-                "record": {
-                    "uri": quoted_uri,
-                    "cid": quoted_cid
-                }
-            }
+            "text": data.text,
+            "createdAt": now
         });
 
-        // Add facets if any were detected
+        // Reply reference
+        if let Some(r) = &reply {
+            record_json["reply"] = serde_json::json!({
+                "root": { "uri": r.root_uri, "cid": r.root_cid },
+                "parent": { "uri": r.parent_uri, "cid": r.parent_cid }
+            });
+        }
+
+        // Facets
         let facets_json = facets::build_facets_json(&raw_facets, &resolved_dids);
         if let serde_json::Value::Array(ref arr) = facets_json {
             if !arr.is_empty() {
                 record_json["facets"] = facets_json;
             }
+        }
+
+        // Language tags
+        if !data.langs.is_empty() {
+            record_json["langs"] = serde_json::json!(data.langs);
+        }
+
+        // Content warning (self-labels)
+        if let Some(ref cw) = data.content_warning {
+            record_json["labels"] = serde_json::json!({
+                "$type": "com.atproto.label.defs#selfLabels",
+                "values": [{ "val": cw }]
+            });
+        }
+
+        // Build embed based on what's attached.
+        // Priority: images > link card (images win when both present).
+        // Quote embed can be combined with media via recordWithMedia.
+        let media_embed = if !image_blobs.is_empty() {
+            // Image embed
+            let images: Vec<serde_json::Value> = image_blobs
+                .iter()
+                .map(|(blob, alt, w, h)| {
+                    serde_json::json!({
+                        "alt": alt,
+                        "image": blob,
+                        "aspectRatio": { "width": w, "height": h }
+                    })
+                })
+                .collect();
+            Some(serde_json::json!({
+                "$type": "app.bsky.embed.images",
+                "images": images
+            }))
+        } else if let Some(ref card) = data.link_card {
+            // External link card embed
+            let mut external = serde_json::json!({
+                "uri": card.url,
+                "title": card.title,
+                "description": card.description
+            });
+            if let Some(ref thumb_blob) = link_card_thumb_blob {
+                external["thumb"] = thumb_blob.clone();
+            }
+            Some(serde_json::json!({
+                "$type": "app.bsky.embed.external",
+                "external": external
+            }))
+        } else {
+            None
+        };
+
+        if let Some((quoted_uri, quoted_cid)) = quote {
+            let quote_record = serde_json::json!({
+                "uri": quoted_uri,
+                "cid": quoted_cid
+            });
+            if let Some(media) = media_embed {
+                // Quote + media → recordWithMedia
+                record_json["embed"] = serde_json::json!({
+                    "$type": "app.bsky.embed.recordWithMedia",
+                    "record": {
+                        "$type": "app.bsky.embed.record",
+                        "record": quote_record
+                    },
+                    "media": media
+                });
+            } else {
+                // Quote only
+                record_json["embed"] = serde_json::json!({
+                    "$type": "app.bsky.embed.record",
+                    "record": quote_record
+                });
+            }
+        } else if let Some(media) = media_embed {
+            record_json["embed"] = media;
         }
 
         let record: Unknown = serde_json::from_value(record_json)
@@ -881,6 +1031,93 @@ impl HangarClient {
             record,
             repo: session.data.did.clone().into(),
             rkey: None,
+            swap_commit: None,
+            validate: None,
+        };
+
+        let output = agent
+            .api
+            .com
+            .atproto
+            .repo
+            .create_record(input.into())
+            .await
+            .map_err(|e| ClientError::Network(e.to_string()))?;
+
+        let post_uri = output.data.uri.to_string();
+        let post_cid = output.data.cid.as_ref().to_string();
+
+        // Drop the agent lock before creating gate records (they acquire their own)
+        drop(agent_guard);
+
+        // Create threadgate record if configured
+        if let Some(ref tg) = data.threadgate {
+            self.create_threadgate(&post_uri, tg, &now).await?;
+        }
+
+        // Create postgate record if configured
+        if let Some(ref pg) = data.postgate {
+            if pg.disable_quoting {
+                self.create_postgate(&post_uri, pg, &now).await?;
+            }
+        }
+
+        Ok((post_uri, post_cid))
+    }
+
+    /// Create a threadgate record controlling who can reply to a post.
+    #[allow(clippy::await_holding_lock)]
+    async fn create_threadgate(
+        &self,
+        post_uri: &str,
+        config: &ThreadgateConfig,
+        created_at: &str,
+    ) -> Result<(), ClientError> {
+        let agent_guard = self.agent.read().unwrap();
+        let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
+        let session = agent
+            .get_session()
+            .await
+            .ok_or(ClientError::NotAuthenticated)?;
+
+        let allow_rules: Vec<serde_json::Value> = config
+            .allow_rules
+            .iter()
+            .map(|r| match r {
+                ThreadgateRule::MentionRule => {
+                    serde_json::json!({"$type": "app.bsky.feed.threadgate#mentionRule"})
+                }
+                ThreadgateRule::FollowingRule => {
+                    serde_json::json!({"$type": "app.bsky.feed.threadgate#followingRule"})
+                }
+                ThreadgateRule::FollowersRule => {
+                    serde_json::json!({"$type": "app.bsky.feed.threadgate#followerRule"})
+                }
+            })
+            .collect();
+
+        let record_json = serde_json::json!({
+            "$type": "app.bsky.feed.threadgate",
+            "post": post_uri,
+            "allow": allow_rules,
+            "createdAt": created_at
+        });
+
+        let record: Unknown = serde_json::from_value(record_json)
+            .map_err(|e| ClientError::InvalidResponse(e.to_string()))?;
+
+        // Threadgate rkey must match the post's rkey
+        let rkey = post_uri.rsplit('/').next().map(|s| s.to_string());
+
+        let collection =
+            atrium_api::types::string::Nsid::new("app.bsky.feed.threadgate".to_string())
+                .map_err(|_| ClientError::InvalidResponse("invalid collection".into()))?;
+
+        let input = create_record::InputData {
+            collection,
+            record,
+            repo: session.data.did.clone().into(),
+            rkey,
             swap_commit: None,
             validate: None,
         };
@@ -896,15 +1133,14 @@ impl HangarClient {
         Ok(())
     }
 
+    /// Create a postgate record controlling quoting of a post.
     #[allow(clippy::await_holding_lock)]
-    async fn create_post_internal(
+    async fn create_postgate(
         &self,
-        text: &str,
-        reply: Option<ReplyRef>,
+        post_uri: &str,
+        _config: &PostgateConfig,
+        created_at: &str,
     ) -> Result<(), ClientError> {
-        // Resolve facets before acquiring the agent lock for create_record
-        let (raw_facets, resolved_dids) = self.resolve_facets(text).await;
-
         let agent_guard = self.agent.read().unwrap();
         let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
         let session = agent
@@ -912,38 +1148,26 @@ impl HangarClient {
             .await
             .ok_or(ClientError::NotAuthenticated)?;
 
-        let mut record_json = serde_json::json!({
-            "$type": "app.bsky.feed.post",
-            "text": text,
-            "createdAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        let record_json = serde_json::json!({
+            "$type": "app.bsky.feed.postgate",
+            "post": post_uri,
+            "embeddingRules": [{"$type": "app.bsky.feed.postgate#disableRule"}],
+            "createdAt": created_at
         });
-
-        if let Some(r) = reply {
-            record_json["reply"] = serde_json::json!({
-                "root": { "uri": r.root_uri, "cid": r.root_cid },
-                "parent": { "uri": r.parent_uri, "cid": r.parent_cid }
-            });
-        }
-
-        // Add facets if any were detected
-        let facets_json = facets::build_facets_json(&raw_facets, &resolved_dids);
-        if let serde_json::Value::Array(ref arr) = facets_json {
-            if !arr.is_empty() {
-                record_json["facets"] = facets_json;
-            }
-        }
 
         let record: Unknown = serde_json::from_value(record_json)
             .map_err(|e| ClientError::InvalidResponse(e.to_string()))?;
 
-        let collection = atrium_api::types::string::Nsid::new("app.bsky.feed.post".to_string())
+        let rkey = post_uri.rsplit('/').next().map(|s| s.to_string());
+
+        let collection = atrium_api::types::string::Nsid::new("app.bsky.feed.postgate".to_string())
             .map_err(|_| ClientError::InvalidResponse("invalid collection".into()))?;
 
         let input = create_record::InputData {
             collection,
             record,
             repo: session.data.did.clone().into(),
-            rkey: None,
+            rkey,
             swap_commit: None,
             validate: None,
         };
@@ -956,6 +1180,61 @@ impl HangarClient {
             .create_record(input.into())
             .await
             .map_err(|e| ClientError::Network(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Create a thread (multiple posts, each replying to the previous).
+    /// Returns `Vec<(uri, cid)>` for all created posts.
+    pub async fn create_thread(
+        &self,
+        posts: &[ComposeData],
+        reply_to: Option<ReplyRef>,
+    ) -> Result<Vec<(String, String)>, ClientError> {
+        if posts.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut results: Vec<(String, String)> = Vec::new();
+        let mut root_uri = String::new();
+        let mut root_cid = String::new();
+
+        for (i, post_data) in posts.iter().enumerate() {
+            let reply = if i == 0 {
+                reply_to.clone()
+            } else {
+                let (parent_uri, parent_cid) = &results[i - 1];
+                Some(ReplyRef {
+                    root_uri: root_uri.clone(),
+                    root_cid: root_cid.clone(),
+                    parent_uri: parent_uri.clone(),
+                    parent_cid: parent_cid.clone(),
+                })
+            };
+
+            let (uri, cid) = self.create_post_with_data(post_data, reply, None).await?;
+
+            if i == 0 {
+                root_uri = uri.clone();
+                root_cid = cid.clone();
+            }
+
+            results.push((uri, cid));
+        }
+
+        Ok(results)
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    async fn create_post_internal(
+        &self,
+        text: &str,
+        reply: Option<ReplyRef>,
+    ) -> Result<(), ClientError> {
+        let data = ComposeData {
+            text: text.to_string(),
+            ..Default::default()
+        };
+        self.create_post_with_data(&data, reply, None).await?;
         Ok(())
     }
 
@@ -1715,6 +1994,7 @@ impl HangarClient {
         Ok(actors)
     }
 
+    #[allow(clippy::await_holding_lock)]
     pub async fn search_actors(
         &self,
         query: &str,
@@ -1774,4 +2054,131 @@ impl Default for HangarClient {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ─── Open Graph metadata fetching (for link card previews) ───
+
+static OG_TITLE_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r#"<meta\s+(?:property|name)="og:title"\s+content="([^"]*)"#).unwrap()
+});
+
+static OG_DESC_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r#"<meta\s+(?:property|name)="og:description"\s+content="([^"]*)"#).unwrap()
+});
+
+static OG_IMAGE_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r#"<meta\s+(?:property|name)="og:image"\s+content="([^"]*)"#).unwrap()
+});
+
+// Also match reversed attribute order (content before property)
+static OG_TITLE_RE2: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r#"<meta\s+content="([^"]*)"\s+(?:property|name)="og:title""#).unwrap()
+});
+
+static OG_DESC_RE2: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r#"<meta\s+content="([^"]*)"\s+(?:property|name)="og:description""#).unwrap()
+});
+
+static OG_IMAGE_RE2: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r#"<meta\s+content="([^"]*)"\s+(?:property|name)="og:image""#).unwrap()
+});
+
+static HTML_TITLE_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"<title[^>]*>([^<]*)</title>").unwrap());
+
+/// Fetch Open Graph metadata from a URL for link card previews.
+/// This is a plain HTTP request — does not require authentication.
+pub async fn fetch_link_card_meta(url: &str) -> Result<LinkCardData, ClientError> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .user_agent("Hangar/1.0 (Bluesky Desktop Client)")
+        .build()
+        .map_err(|e| ClientError::Network(e.to_string()))?;
+
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| ClientError::Network(e.to_string()))?;
+
+    let final_url = response.url().to_string();
+    let html = response
+        .text()
+        .await
+        .map_err(|e| ClientError::Network(e.to_string()))?;
+
+    // Extract OG metadata with regex (both attribute orderings)
+    let title = OG_TITLE_RE
+        .captures(&html)
+        .or_else(|| OG_TITLE_RE2.captures(&html))
+        .and_then(|c| c.get(1))
+        .map(|m| html_decode(m.as_str()))
+        .or_else(|| {
+            HTML_TITLE_RE
+                .captures(&html)
+                .and_then(|c| c.get(1))
+                .map(|m| html_decode(m.as_str()))
+        })
+        .unwrap_or_default();
+
+    let description = OG_DESC_RE
+        .captures(&html)
+        .or_else(|| OG_DESC_RE2.captures(&html))
+        .and_then(|c| c.get(1))
+        .map(|m| html_decode(m.as_str()))
+        .unwrap_or_default();
+
+    let og_image_url = OG_IMAGE_RE
+        .captures(&html)
+        .or_else(|| OG_IMAGE_RE2.captures(&html))
+        .and_then(|c| c.get(1))
+        .map(|m| html_decode(m.as_str()));
+
+    // Fetch thumbnail if og:image is present
+    let thumb = if let Some(ref img_url) = og_image_url {
+        match client.get(img_url).send().await {
+            Ok(resp) => {
+                let content_type = resp
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("image/jpeg")
+                    .to_string();
+                let mime = if content_type.contains("png") {
+                    "image/png".to_string()
+                } else if content_type.contains("webp") {
+                    "image/webp".to_string()
+                } else if content_type.contains("gif") {
+                    "image/gif".to_string()
+                } else {
+                    "image/jpeg".to_string()
+                };
+                match resp.bytes().await {
+                    Ok(bytes) => Some((bytes.to_vec(), mime)),
+                    Err(_) => None,
+                }
+            }
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
+    Ok(LinkCardData {
+        url: final_url,
+        title,
+        description,
+        thumb,
+    })
+}
+
+/// Basic HTML entity decoding for OG metadata values.
+fn html_decode(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&#x27;", "'")
+        .replace("&apos;", "'")
 }

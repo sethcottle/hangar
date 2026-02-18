@@ -671,6 +671,39 @@ impl HangarApplication {
     }
 
     /// Wire up mention typeahead search on a compose dialog.
+    fn setup_link_card_fetch(&self, dialog: &ComposeDialog) {
+        let dialog_weak = dialog.downgrade();
+
+        dialog.connect_link_preview_fetch(move |url| {
+            let dialog_weak = dialog_weak.clone();
+            let url = url.clone();
+
+            let (tx, rx) =
+                std::sync::mpsc::channel::<Result<crate::atproto::LinkCardData, String>>();
+
+            thread::spawn(move || {
+                let result = runtime::block_on(async {
+                    crate::atproto::client::fetch_link_card_meta(&url).await
+                });
+                let _ = tx.send(result.map_err(|e| e.to_string()));
+            });
+
+            glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+                match rx.try_recv() {
+                    Ok(Ok(data)) => {
+                        if let Some(dialog) = dialog_weak.upgrade() {
+                            dialog.set_link_card_data(data);
+                        }
+                        glib::ControlFlow::Break
+                    }
+                    Ok(Err(_)) => glib::ControlFlow::Break,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+                }
+            });
+        });
+    }
+
     fn setup_mention_search(&self, dialog: &ComposeDialog) {
         let client = self.client();
         let dialog_weak = dialog.downgrade();
@@ -714,7 +747,7 @@ impl HangarApplication {
         let app = self.clone();
         let dialog_weak = dialog.downgrade();
 
-        dialog.connect_post(move |text| {
+        dialog.connect_post(move |data| {
             if let Some(dialog) = dialog_weak.upgrade() {
                 dialog.set_loading(true);
                 dialog.hide_error();
@@ -725,11 +758,60 @@ impl HangarApplication {
 
             let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
             let client = app.client();
-            let text = text.to_string();
 
             thread::spawn(move || {
-                let result = runtime::block_on(async { client.create_post(&text).await });
-                let _ = tx.send(result.map_err(|e| e.to_string()));
+                let result = runtime::block_on(async {
+                    client.create_post_with_data(&data, None, None).await
+                });
+                let _ = tx.send(result.map(|_| ()).map_err(|e| e.to_string()));
+            });
+
+            glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+                match rx.try_recv() {
+                    Ok(Ok(())) => {
+                        if let Some(dialog) = dialog_weak.upgrade() {
+                            dialog.set_loading(false);
+                            dialog.close();
+                        }
+                        app.fetch_timeline();
+                        glib::ControlFlow::Break
+                    }
+                    Ok(Err(e)) => {
+                        if let Some(dialog) = dialog_weak.upgrade() {
+                            dialog.set_loading(false);
+                            dialog.show_error(&e);
+                        }
+                        glib::ControlFlow::Break
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        if let Some(dialog) = dialog_weak.upgrade() {
+                            dialog.set_loading(false);
+                        }
+                        glib::ControlFlow::Break
+                    }
+                }
+            });
+        });
+
+        // Thread callback
+        let app2 = self.clone();
+        let dialog_weak2 = dialog.downgrade();
+        dialog.connect_thread(move |posts| {
+            if let Some(dialog) = dialog_weak2.upgrade() {
+                dialog.set_loading(true);
+                dialog.hide_error();
+            }
+
+            let app = app2.clone();
+            let dialog_weak = dialog_weak2.clone();
+
+            let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+            let client = app.client();
+
+            thread::spawn(move || {
+                let result = runtime::block_on(async { client.create_thread(&posts, None).await });
+                let _ = tx.send(result.map(|_| ()).map_err(|e| e.to_string()));
             });
 
             glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
@@ -761,6 +843,7 @@ impl HangarApplication {
         });
 
         self.setup_mention_search(&dialog);
+        self.setup_link_card_fetch(&dialog);
         dialog.present(Some(&window));
     }
 
@@ -781,7 +864,7 @@ impl HangarApplication {
         let app = self.clone();
         let dialog_weak = dialog.downgrade();
 
-        dialog.connect_reply(move |text, parent_uri, parent_cid| {
+        dialog.connect_reply(move |data, parent_uri, parent_cid| {
             if let Some(dialog) = dialog_weak.upgrade() {
                 dialog.set_loading(true);
                 dialog.hide_error();
@@ -792,13 +875,78 @@ impl HangarApplication {
 
             let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
             let client = app.client();
-            let text = text.to_string();
 
             thread::spawn(move || {
                 let result = runtime::block_on(async {
-                    client.create_reply(&text, &parent_uri, &parent_cid).await
+                    let reply = crate::atproto::ReplyRef {
+                        root_uri: parent_uri.clone(),
+                        root_cid: parent_cid.clone(),
+                        parent_uri,
+                        parent_cid,
+                    };
+                    client.create_post_with_data(&data, Some(reply), None).await
                 });
-                let _ = tx.send(result.map_err(|e| e.to_string()));
+                let _ = tx.send(result.map(|_| ()).map_err(|e| e.to_string()));
+            });
+
+            glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+                match rx.try_recv() {
+                    Ok(Ok(())) => {
+                        if let Some(dialog) = dialog_weak.upgrade() {
+                            dialog.set_loading(false);
+                            dialog.close();
+                        }
+                        app.fetch_timeline();
+                        glib::ControlFlow::Break
+                    }
+                    Ok(Err(e)) => {
+                        if let Some(dialog) = dialog_weak.upgrade() {
+                            dialog.set_loading(false);
+                            dialog.show_error(&e);
+                        }
+                        glib::ControlFlow::Break
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        if let Some(dialog) = dialog_weak.upgrade() {
+                            dialog.set_loading(false);
+                        }
+                        glib::ControlFlow::Break
+                    }
+                }
+            });
+        });
+
+        // Thread callback for replies
+        let app2 = self.clone();
+        let dialog_weak2 = dialog.downgrade();
+        let reply_uri = parent_post.uri.clone();
+        let reply_cid = parent_post.cid.clone();
+        dialog.connect_thread(move |posts| {
+            if let Some(dialog) = dialog_weak2.upgrade() {
+                dialog.set_loading(true);
+                dialog.hide_error();
+            }
+
+            let app = app2.clone();
+            let dialog_weak = dialog_weak2.clone();
+            let reply_uri = reply_uri.clone();
+            let reply_cid = reply_cid.clone();
+
+            let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+            let client = app.client();
+
+            thread::spawn(move || {
+                let result = runtime::block_on(async {
+                    let reply_ref = crate::atproto::ReplyRef {
+                        root_uri: reply_uri.clone(),
+                        root_cid: reply_cid.clone(),
+                        parent_uri: reply_uri,
+                        parent_cid: reply_cid,
+                    };
+                    client.create_thread(&posts, Some(reply_ref)).await
+                });
+                let _ = tx.send(result.map(|_| ()).map_err(|e| e.to_string()));
             });
 
             glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
@@ -830,6 +978,7 @@ impl HangarApplication {
         });
 
         self.setup_mention_search(&dialog);
+        self.setup_link_card_fetch(&dialog);
         dialog.present(Some(&window));
     }
 
@@ -851,7 +1000,7 @@ impl HangarApplication {
         let app = self.clone();
         let dialog_weak = dialog.downgrade();
 
-        dialog.connect_quote(move |text, quoted_uri, quoted_cid| {
+        dialog.connect_quote(move |data, quoted_uri, quoted_cid| {
             if let Some(dialog) = dialog_weak.upgrade() {
                 dialog.set_loading(true);
                 dialog.hide_error();
@@ -862,15 +1011,62 @@ impl HangarApplication {
 
             let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
             let client = app.client();
-            let text = text.to_string();
 
             thread::spawn(move || {
                 let result = runtime::block_on(async {
                     client
-                        .create_quote_post(&text, &quoted_uri, &quoted_cid)
+                        .create_post_with_data(&data, None, Some((&quoted_uri, &quoted_cid)))
                         .await
                 });
-                let _ = tx.send(result.map_err(|e| e.to_string()));
+                let _ = tx.send(result.map(|_| ()).map_err(|e| e.to_string()));
+            });
+
+            glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+                match rx.try_recv() {
+                    Ok(Ok(())) => {
+                        if let Some(dialog) = dialog_weak.upgrade() {
+                            dialog.set_loading(false);
+                            dialog.close();
+                        }
+                        app.fetch_timeline();
+                        glib::ControlFlow::Break
+                    }
+                    Ok(Err(e)) => {
+                        if let Some(dialog) = dialog_weak.upgrade() {
+                            dialog.set_loading(false);
+                            dialog.show_error(&e);
+                        }
+                        glib::ControlFlow::Break
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        if let Some(dialog) = dialog_weak.upgrade() {
+                            dialog.set_loading(false);
+                        }
+                        glib::ControlFlow::Break
+                    }
+                }
+            });
+        });
+
+        // Thread callback for quotes
+        let app2 = self.clone();
+        let dialog_weak2 = dialog.downgrade();
+        dialog.connect_thread(move |posts| {
+            if let Some(dialog) = dialog_weak2.upgrade() {
+                dialog.set_loading(true);
+                dialog.hide_error();
+            }
+
+            let app = app2.clone();
+            let dialog_weak = dialog_weak2.clone();
+
+            let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+            let client = app.client();
+
+            thread::spawn(move || {
+                let result = runtime::block_on(async { client.create_thread(&posts, None).await });
+                let _ = tx.send(result.map(|_| ()).map_err(|e| e.to_string()));
             });
 
             glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
@@ -902,6 +1098,7 @@ impl HangarApplication {
         });
 
         self.setup_mention_search(&dialog);
+        self.setup_link_card_fetch(&dialog);
         dialog.present(Some(&window));
     }
 

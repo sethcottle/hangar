@@ -196,6 +196,73 @@ impl SavedFeed {
     }
 }
 
+// ─── Compose data types (passed from UI → client when creating posts) ───
+
+/// Everything needed to create a post, assembled by the compose dialog.
+#[derive(Debug, Clone, Default)]
+pub struct ComposeData {
+    pub text: String,
+    /// Images to attach (up to 4)
+    pub images: Vec<ImageAttachment>,
+    /// BCP 47 language tags (e.g. ["en"])
+    pub langs: Vec<String>,
+    /// Content warning self-label value (e.g. "sexual", "nudity", "graphic-media")
+    pub content_warning: Option<String>,
+    /// External link card metadata (auto-detected from URLs in text)
+    pub link_card: Option<LinkCardData>,
+    /// Threadgate: who can reply. `None` means everyone (no threadgate record).
+    pub threadgate: Option<ThreadgateConfig>,
+    /// Postgate: quote controls. `None` means quoting allowed (no postgate record).
+    pub postgate: Option<PostgateConfig>,
+}
+
+/// An image the user wants to attach to a post.
+#[derive(Debug, Clone)]
+pub struct ImageAttachment {
+    pub data: Vec<u8>,
+    pub mime_type: String,
+    pub alt_text: String,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Metadata for an external link card (fetched from OG tags).
+#[derive(Debug, Clone)]
+pub struct LinkCardData {
+    pub url: String,
+    pub title: String,
+    pub description: String,
+    /// Thumbnail image bytes + MIME type (fetched from og:image)
+    pub thumb: Option<(Vec<u8>, String)>,
+}
+
+/// Threadgate configuration — controls who can reply to a post.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ThreadgateConfig {
+    /// Which groups are allowed to reply. Empty vec = nobody can reply.
+    pub allow_rules: Vec<ThreadgateRule>,
+}
+
+/// Individual threadgate allow rule.
+/// Names match the AT Protocol spec (mentionRule, followingRule, followerRule).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
+pub enum ThreadgateRule {
+    /// Users mentioned in the post can reply
+    MentionRule,
+    /// Users the author follows can reply
+    FollowingRule,
+    /// Users who follow the author can reply
+    FollowersRule,
+}
+
+/// Postgate configuration — controls quoting of a post.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PostgateConfig {
+    /// If true, quoting this post is disabled.
+    pub disable_quoting: bool,
+}
+
 /// A direct message conversation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Conversation {

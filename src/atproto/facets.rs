@@ -73,7 +73,7 @@ fn overlaps(byte_start: usize, byte_end: usize, existing: &[RawFacet]) -> bool {
 
 /// Trim trailing punctuation that is likely sentence-ending, not part of the URL.
 fn trim_url_trailing(url: &str) -> &str {
-    url.trim_end_matches(|c| matches!(c, '.' | ',' | ';' | '!' | '?'))
+    url.trim_end_matches(['.', ',', ';', '!', '?'])
 }
 
 /// Parse all facets from post text. Pure text processing, no network calls.

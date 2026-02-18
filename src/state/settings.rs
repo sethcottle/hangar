@@ -100,6 +100,15 @@ pub struct AppSettings {
     /// Color scheme preference (System follows desktop theme)
     #[serde(default)]
     pub color_scheme: ColorScheme,
+    /// Default post language (BCP 47 code, e.g. "en"). None = "en".
+    #[serde(default)]
+    pub default_post_language: Option<String>,
+    /// Default threadgate config (who can reply). None = everyone.
+    #[serde(default)]
+    pub default_threadgate: Option<crate::atproto::ThreadgateConfig>,
+    /// Default postgate config (quote controls). None = quoting allowed.
+    #[serde(default)]
+    pub default_postgate: Option<crate::atproto::PostgateConfig>,
 }
 
 impl AppSettings {

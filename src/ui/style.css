@@ -448,6 +448,29 @@ popover.mention-popover > contents {
     font-size: 0.95em;
 }
 
+/* Compose dialog image attachment strip */
+.compose-image-strip {
+    margin-top: 8px;
+}
+
+.compose-thumbnail {
+    border-radius: 8px;
+    overflow: hidden;
+}
+
+.compose-thumbnail-image {
+    border-radius: 8px;
+}
+
+.compose-alt-badge {
+    font-size: 10px;
+    font-weight: 700;
+    padding: 2px 4px;
+    border-radius: 4px;
+    background-color: alpha(black, 0.6);
+    color: white;
+}
+
 /* Compose dialog character counter */
 .char-counter {
     font-variant-numeric: tabular-nums;
@@ -462,5 +485,31 @@ popover.mention-popover > contents {
 .char-counter-over {
     color: @error_color;
     font-weight: 700;
+}
+
+/* Compose dialog link card preview */
+.compose-link-card {
+    background-color: alpha(@card_bg_color, 0.4);
+    border: 1px solid alpha(@borders, 0.5);
+    border-radius: 12px;
+    padding: 10px;
+}
+
+.compose-link-card .compose-link-thumb {
+    border-radius: 8px;
+    min-width: 72px;
+    min-height: 72px;
+}
+
+/* Compose status row — right-aligned labels */
+.compose-status-row {
+    margin-top: 2px;
+    margin-bottom: 4px;
+}
+
+/* Thread post separator */
+.thread-post-separator {
+    margin-top: 8px;
+    margin-bottom: 4px;
 }
 
