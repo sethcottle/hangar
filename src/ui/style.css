@@ -363,14 +363,6 @@ popover.menu > contents {
    Accessibility Enhancements
    ============================================================ */
 
-/* Reduced motion: respect user's system preference */
-@media (prefers-reduced-motion: reduce) {
-    * {
-        animation-duration: 0s !important;
-        transition-duration: 0s !important;
-    }
-}
-
 /* Links in post content should be underlined (WCAG 1.4.1 - color alone not sufficient) */
 .post-row label a {
     text-decoration: underline;
@@ -385,6 +377,11 @@ popover.menu > contents {
 .flat.circular.liked image,
 button.flat.circular.liked image {
     font-weight: 900;
+}
+
+/* Liked state: filled icon style (separate block for GTK version compat) */
+.flat.circular.liked image,
+button.flat.circular.liked image {
     -gtk-icon-style: filled;
 }
 
@@ -392,6 +389,11 @@ button.flat.circular.liked image {
 .flat.circular.reposted image,
 menubutton.flat.circular.reposted > button image {
     font-weight: 900;
+}
+
+/* Reposted state: filled icon style (separate block for GTK version compat) */
+.flat.circular.reposted image,
+menubutton.flat.circular.reposted > button image {
     -gtk-icon-style: filled;
 }
 
@@ -455,7 +457,6 @@ popover.mention-popover > contents {
 
 .compose-thumbnail {
     border-radius: 8px;
-    overflow: hidden;
 }
 
 .compose-thumbnail-image {
@@ -511,5 +512,16 @@ popover.mention-popover > contents {
 .thread-post-separator {
     margin-top: 8px;
     margin-bottom: 4px;
+}
+
+/* ============================================================
+   Reduced motion — placed last so @media parse failures on
+   older GTK versions don't break any rules above.
+   ============================================================ */
+@media (prefers-reduced-motion: reduce) {
+    * {
+        animation-duration: 0s !important;
+        transition-duration: 0s !important;
+    }
 }
 

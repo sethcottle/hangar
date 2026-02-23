@@ -14,6 +14,7 @@ use tokio::sync::Semaphore;
 
 use crate::atproto::{Conversation, HangarClient, Notification, Post, Profile, SavedFeed, Session};
 use crate::cache::{CacheDb, FeedCache, FeedState, PostCache, ProfileCache};
+use crate::config;
 use crate::runtime;
 use crate::state::SessionManager;
 use crate::ui::avatar_cache;
@@ -124,6 +125,9 @@ mod imp {
 
             // Create main window
             let window = HangarWindow::new(app.upcast_ref::<adw::Application>());
+            if config::IS_DEVEL {
+                window.add_css_class("devel");
+            }
             self.window.replace(Some(window.clone()));
 
             let app_clone = app.clone();

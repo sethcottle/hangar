@@ -265,11 +265,16 @@ glib::wrapper! {
 
 impl HangarWindow {
     pub fn new(app: &adw::Application) -> Self {
+        let title = if crate::config::IS_DEVEL {
+            "Hangar (Nightly)"
+        } else {
+            "Hangar"
+        };
         glib::Object::builder()
             .property("application", app)
             .property("default-width", 620)
             .property("default-height", 780)
-            .property("title", "Hangar")
+            .property("title", title)
             .build()
     }
 

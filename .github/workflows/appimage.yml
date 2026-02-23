@@ -22,8 +22,7 @@ jobs:
             libadwaita-1-dev \
             libsecret-1-dev \
             librsvg2-dev \
-            libfuse2 \
-            adwaita-icon-theme
+            libfuse2
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -31,11 +30,10 @@ jobs:
       - name: Build release binary
         run: cargo build --release
 
-      - name: Download linuxdeploy
+      - name: Download appimagetool
         run: |
-          curl -sSL https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage -o linuxdeploy
-          curl -sSL https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh -o linuxdeploy-plugin-gtk.sh
-          chmod +x linuxdeploy linuxdeploy-plugin-gtk.sh
+          curl -sSL https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage -o appimagetool
+          chmod +x appimagetool
 
       - name: Create AppDir structure
         run: |
@@ -49,19 +47,45 @@ jobs:
           cp assets/icons/io.github.sethcottle.Hangar.svg AppDir/usr/share/icons/hicolor/scalable/apps/
           cp data/io.github.sethcottle.Hangar.metainfo.xml AppDir/usr/share/metainfo/
 
-          # Bundle Adwaita icons (symbolic icons used by the app)
-          mkdir -p AppDir/usr/share/icons/Adwaita
-          cp -r /usr/share/icons/Adwaita/* AppDir/usr/share/icons/Adwaita/
+          # Desktop file and icon symlinks at AppDir root (required by AppImage spec)
+          ln -s usr/share/applications/io.github.sethcottle.Hangar.desktop AppDir/io.github.sethcottle.Hangar.desktop
+          ln -s usr/share/icons/hicolor/scalable/apps/io.github.sethcottle.Hangar.svg AppDir/io.github.sethcottle.Hangar.svg
+          # .DirIcon is used as the AppImage icon
+          ln -s usr/share/icons/hicolor/scalable/apps/io.github.sethcottle.Hangar.svg AppDir/.DirIcon
+
+      - name: Create AppRun script
+        run: |
+          printf '%s\n' '#!/bin/bash' > AppDir/AppRun
+          printf '%s\n' '# AppRun for Hangar — GTK4 + libadwaita app' >> AppDir/AppRun
+          printf '%s\n' '#' >> AppDir/AppRun
+          printf '%s\n' '# Hangar does NOT bundle GTK4/libadwaita libraries. It uses the' >> AppDir/AppRun
+          printf '%s\n' '# host system libraries, which are available on all supported' >> AppDir/AppRun
+          printf '%s\n' '# Linux desktops (GNOME 43+, Fedora 39+, Ubuntu 23.10+, etc).' >> AppDir/AppRun
+          printf '%s\n' '#' >> AppDir/AppRun
+          printf '%s\n' '# This is intentional: bundling GTK4/libadwaita from the build' >> AppDir/AppRun
+          printf '%s\n' '# environment (Ubuntu 24.04) causes theme/rendering failures on' >> AppDir/AppRun
+          printf '%s\n' '# newer distros due to library version mismatches.' >> AppDir/AppRun
+          printf '%s\n' '' >> AppDir/AppRun
+          printf '%s\n' 'HERE="$(dirname "$(readlink -f "$0")")"' >> AppDir/AppRun
+          printf '%s\n' '' >> AppDir/AppRun
+          printf '%s\n' '# Make system data dirs available for icon and GSettings schema lookup,' >> AppDir/AppRun
+          printf '%s\n' '# while also including our own data dir for the app icon and metainfo.' >> AppDir/AppRun
+          printf '%s\n' 'export XDG_DATA_DIRS="${HERE}/usr/share:/usr/share:/usr/local/share:${XDG_DATA_DIRS:-/usr/share}"' >> AppDir/AppRun
+          printf '%s\n' '' >> AppDir/AppRun
+          printf '%s\n' 'exec "${HERE}/usr/bin/hangar" "$@"' >> AppDir/AppRun
+          chmod +x AppDir/AppRun
 
       - name: Build AppImage
         run: |
-          export DEPLOY_GTK_VERSION=4
-          export UPDATE_INFORMATION="gh-releases-zsync|sethcottle|hangar|latest|Hangar*.AppImage.zsync"
-          ./linuxdeploy --appdir AppDir \
-            --plugin gtk \
-            --desktop-file AppDir/usr/share/applications/io.github.sethcottle.Hangar.desktop \
-            --icon-file AppDir/usr/share/icons/hicolor/scalable/apps/io.github.sethcottle.Hangar.svg \
-            --output appimage
+          # Build the AppImage using appimagetool directly.
+          # No linuxdeploy = no automatic library bundling.
+          # Hangar relies on the host system's GTK4 + libadwaita.
+          #
+          # --appimage-extract-and-run: required in CI (no FUSE available)
+          # -u: update information for delta updates via zsync
+          ARCH=x86_64 ./appimagetool --appimage-extract-and-run \
+            -u "gh-releases-zsync|sethcottle|hangar|latest|Hangar*.AppImage.zsync" \
+            AppDir
 
       - name: Upload AppImage
         uses: actions/upload-artifact@v4

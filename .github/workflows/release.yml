@@ -30,6 +30,14 @@ jobs:
           curl -sSL https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/master/cargo/flatpak-cargo-generator.py -o flatpak-cargo-generator.py
           python3 flatpak-cargo-generator.py Cargo.lock -o cargo-sources.json
 
+      - name: Patch manifest for nightly
+        if: inputs.version == ''
+        run: |
+          # Build with devel feature for nightly
+          sed -i 's/cargo --offline build --release/cargo --offline build --release --features devel/' io.github.sethcottle.Hangar.yml
+          # Use devel icon for nightly
+          sed -i 's|assets/icons/io.github.sethcottle.Hangar.svg|assets/icons/io.github.sethcottle.Hangar.Devel.svg|' io.github.sethcottle.Hangar.yml
+
       - name: Build Flatpak
         uses: flatpak/flatpak-github-actions/flatpak-builder@v6
         with:
@@ -66,7 +74,12 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build release binary
-        run: cargo build --release
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            cargo build --release
+          else
+            cargo build --release --features devel
+          fi
 
       - name: Download linuxdeploy
         run: |
@@ -83,8 +96,14 @@ jobs:
 
           cp target/release/hangar AppDir/usr/bin/
           cp data/io.github.sethcottle.Hangar.desktop AppDir/usr/share/applications/
-          cp assets/icons/io.github.sethcottle.Hangar.svg AppDir/usr/share/icons/hicolor/scalable/apps/
           cp data/io.github.sethcottle.Hangar.metainfo.xml AppDir/usr/share/metainfo/
+
+          # Use devel icon for nightly builds
+          if [ -n "${{ inputs.version }}" ]; then
+            cp assets/icons/io.github.sethcottle.Hangar.svg AppDir/usr/share/icons/hicolor/scalable/apps/
+          else
+            cp assets/icons/io.github.sethcottle.Hangar.Devel.svg AppDir/usr/share/icons/hicolor/scalable/apps/io.github.sethcottle.Hangar.svg
+          fi
 
       - name: Determine update channel
         id: update-channel

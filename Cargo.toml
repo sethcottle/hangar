@@ -32,6 +32,9 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 regex = "1"
 unicode-segmentation = "1.12.0"
 
+[features]
+devel = []
+
 # No build dependencies needed currently
 # Blueprint compilation handled via build.rs if blueprint-compiler is available
 
