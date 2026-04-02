@@ -35,7 +35,7 @@ This is a **technical preview**. The app is functional but incomplete. Developme
 
 ### What Works
 
-- **Authentication**: Login with handle + app password, session persistence via libsecret
+- **Authentication**: OAuth (PKCE + DPoP) with persistent sessions, app password fallback
 - **Timeline**: Home feed with infinite scroll, cursor-based pagination, pull-to-refresh
 - **Custom Feeds**: Feed selector with Following, Discover, and pinned feeds
 - **Live Updates**: Background polling with seamless new post insertion
@@ -58,38 +58,30 @@ This is a **technical preview**. The app is functional but incomplete. Developme
 - Chat message thread view and sending
 - Keyboard shortcuts for navigation and post actions
 - Enhanced screen reader support (composite labels, live regions, focus management)
-- Image lightbox, loading skeletons, empty states
+- Image lightbox, loading skeletons
 - Full profile view on drill-down, profile editing
 - Internationalization (i18n) and Flatpak distribution
-- OAuth authentication and bookmarks (blocked on AT Protocol OAuth spec)
-- Moderation tools, desktop notifications, multi-account support
+- Bookmarks, moderation tools, desktop notifications, multi-account support
 - Lots of polish
 
-## Security Notice
+## Authentication
 
-### Use an App Password
+### OAuth (Recommended)
 
-Hangar currently uses **handle + app password authentication**, not OAuth.
+Hangar uses **OAuth (PKCE + DPoP)** for authentication. When you sign in, a browser window opens to complete the authorization flow via your Bluesky PDS. Sessions are persisted locally and automatically refreshed.
 
-**Create a dedicated app password for Hangar:**
+### App Password (Fallback)
+
+App password authentication is also supported as a fallback:
 1. Go to [bsky.app/settings/app-passwords](https://bsky.app/settings/app-passwords)
 2. Create a new app password
 3. Use that password to log in to Hangar
 
 App passwords can be revoked at any time without affecting your main account password.
 
-### OAuth Migration Planned
-
-OAuth support is on the roadmap. This will enable:
-- More secure authentication flow
-- Access to features like Bookmarks (stored off-protocol)
-- Better session management
-
-Until then, app passwords are the recommended authentication method.
-
 ### Session Storage
 
-Login sessions are stored securely using [libsecret](https://wiki.gnome.org/Projects/Libsecret) (the GNOME keyring). If libsecret/D-Bus is unavailable, session persistence will fail gracefully and you'll need to log in each time.
+OAuth sessions are stored in a local file-based session store. App password sessions are stored securely using [libsecret](https://wiki.gnome.org/Projects/Libsecret) (the GNOME keyring). If libsecret/D-Bus is unavailable, app password session persistence will fail gracefully and you'll need to log in each time.
 
 ## Installation
 
@@ -184,7 +176,7 @@ GTK runs on the main thread. Network I/O runs on background threads with a share
 |-----------|------------|
 | Language | [Rust](https://www.rust-lang.org/) (2024 edition) |
 | UI Toolkit | [GTK4](https://gtk.org/) + [Libadwaita](https://gnome.pages.gitlab.gnome.org/libadwaita/) |
-| AT Protocol | [atrium-api](https://github.com/sugyan/atrium) |
+| AT Protocol | [atrium-api](https://github.com/sugyan/atrium) + [atrium-oauth](https://github.com/sugyan/atrium) |
 | HTTP Client | [reqwest](https://github.com/seanmonstar/reqwest) (rustls-tls) |
 | Async Runtime | [Tokio](https://tokio.rs/) |
 | Cache | [rusqlite](https://github.com/rusqlite/rusqlite) (SQLite, bundled) |
@@ -210,7 +202,9 @@ src/
 │   ├── feeds.rs         # Feed cache operations
 │   └── profiles.rs      # Profile cache operations
 ├── state/
-│   ├── session.rs       # Session persistence via libsecret
+│   ├── oauth.rs         # OAuth flow (PKCE + DPoP, localhost callback)
+│   ├── session.rs       # App password session persistence via libsecret
+│   ├── session_store.rs # File-based OAuth session store
 │   └── settings.rs      # AppSettings + FontSize (persistent JSON)
 └── ui/
     ├── window.rs        # Main window, stack navigation, settings page

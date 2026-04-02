@@ -20,9 +20,12 @@
 
 # Flatpak build
 .flatpak-builder/
+build-dir/
 builddir/
 repo/
 *.flatpak
+cargo-sources.json
+flatpak-cargo-generator.py
 
 # Blueprint compiled files
 *.ui

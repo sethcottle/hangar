@@ -17,7 +17,7 @@ jobs:
     name: Build Flatpak
     runs-on: ubuntu-latest
     container:
-      image: bilelmoussaoui/flatpak-github-actions:gnome-47
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-49
       options: --privileged
 
     steps:
@@ -26,7 +26,7 @@ jobs:
 
       - name: Generate Cargo sources
         run: |
-          dnf install -y python3-toml python3-tomlkit python3-aiohttp
+          pip3 install toml tomlkit aiohttp
           curl -sSL https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/master/cargo/flatpak-cargo-generator.py -o flatpak-cargo-generator.py
           python3 flatpak-cargo-generator.py Cargo.lock -o cargo-sources.json
 
@@ -199,9 +199,9 @@ jobs:
             - **Flatpak**: `hangar.flatpak` — Install with `flatpak install hangar.flatpak`
             - **AppImage**: Make executable and run
 
-            ### Security Notice
+            ### Authentication
 
-            This release uses app password authentication. Please use a dedicated [app password](https://bsky.app/settings/app-passwords) rather than your main account password.
+            Hangar uses OAuth for authentication. An app password fallback is also available — create one at [bsky.app/settings/app-passwords](https://bsky.app/settings/app-passwords).
           files: |
             hangar.flatpak
             Hangar*.AppImage
@@ -223,9 +223,9 @@ jobs:
             - **Flatpak**: `hangar.flatpak` — Install with `flatpak install hangar.flatpak`
             - **AppImage**: Make executable and run
 
-            ### Security Notice
+            ### Authentication
 
-            This release uses app password authentication. Please use a dedicated [app password](https://bsky.app/settings/app-passwords) rather than your main account password.
+            Hangar uses OAuth for authentication. An app password fallback is also available — create one at [bsky.app/settings/app-passwords](https://bsky.app/settings/app-passwords).
           files: |
             hangar.flatpak
             Hangar*.AppImage
@@ -233,34 +233,28 @@ jobs:
           draft: false
           prerelease: false
 
-      - name: Upload to DigitalOcean Spaces
+      - name: Upload to Cloudflare R2
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.DO_SPACES_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.DO_SPACES_SECRET }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         run: |
           APPIMAGE=$(ls Hangar*.AppImage)
           ZSYNC=$(ls Hangar*.AppImage.zsync)
 
           if [ "${{ steps.release-type.outputs.is_nightly }}" == "true" ]; then
             # Nightly builds use -nightly suffix
-            aws s3 cp hangar.flatpak s3://seth/hangar/releases/hangar-nightly.flatpak \
-              --endpoint-url https://nyc3.digitaloceanspaces.com \
-              --acl public-read
-            aws s3 cp "$APPIMAGE" s3://seth/hangar/releases/Hangar-nightly-x86_64.AppImage \
-              --endpoint-url https://nyc3.digitaloceanspaces.com \
-              --acl public-read
-            aws s3 cp "$ZSYNC" s3://seth/hangar/releases/Hangar-nightly-x86_64.AppImage.zsync \
-              --endpoint-url https://nyc3.digitaloceanspaces.com \
-              --acl public-read
+            aws s3 cp hangar.flatpak s3://${{ secrets.R2_BUCKET_NAME }}/hangar/releases/hangar-nightly.flatpak \
+              --endpoint-url ${{ secrets.R2_ENDPOINT_URL }}
+            aws s3 cp "$APPIMAGE" s3://${{ secrets.R2_BUCKET_NAME }}/hangar/releases/Hangar-nightly-x86_64.AppImage \
+              --endpoint-url ${{ secrets.R2_ENDPOINT_URL }}
+            aws s3 cp "$ZSYNC" s3://${{ secrets.R2_BUCKET_NAME }}/hangar/releases/Hangar-nightly-x86_64.AppImage.zsync \
+              --endpoint-url ${{ secrets.R2_ENDPOINT_URL }}
           else
             # Versioned releases use standard names
-            aws s3 cp hangar.flatpak s3://seth/hangar/releases/hangar.flatpak \
-              --endpoint-url https://nyc3.digitaloceanspaces.com \
-              --acl public-read
-            aws s3 cp "$APPIMAGE" s3://seth/hangar/releases/Hangar-x86_64.AppImage \
-              --endpoint-url https://nyc3.digitaloceanspaces.com \
-              --acl public-read
-            aws s3 cp "$ZSYNC" s3://seth/hangar/releases/Hangar-x86_64.AppImage.zsync \
-              --endpoint-url https://nyc3.digitaloceanspaces.com \
-              --acl public-read
+            aws s3 cp hangar.flatpak s3://${{ secrets.R2_BUCKET_NAME }}/hangar/releases/hangar.flatpak \
+              --endpoint-url ${{ secrets.R2_ENDPOINT_URL }}
+            aws s3 cp "$APPIMAGE" s3://${{ secrets.R2_BUCKET_NAME }}/hangar/releases/Hangar-x86_64.AppImage \
+              --endpoint-url ${{ secrets.R2_ENDPOINT_URL }}
+            aws s3 cp "$ZSYNC" s3://${{ secrets.R2_BUCKET_NAME }}/hangar/releases/Hangar-x86_64.AppImage.zsync \
+              --endpoint-url ${{ secrets.R2_ENDPOINT_URL }}
           fi

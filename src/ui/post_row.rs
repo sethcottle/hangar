@@ -1360,11 +1360,33 @@ impl PostRow {
 
         card_btn.set_child(Some(&card));
 
-        // Open quoted post in browser when clicked
-        let url = Self::get_post_url(&quote.author.handle, &quote.uri);
-        card_btn.connect_clicked(move |_| {
-            let _ = open::that(&url);
-        });
+        // Navigate to quoted post in-app
+        let quoted_post = Post {
+            uri: quote.uri.clone(),
+            cid: quote.cid.clone(),
+            author: quote.author.clone(),
+            text: quote.text.clone(),
+            created_at: quote.indexed_at.clone(),
+            indexed_at: quote.indexed_at.clone(),
+            like_count: None,
+            repost_count: None,
+            reply_count: None,
+            embed: quote.embed.as_deref().cloned(),
+            viewer_like: None,
+            viewer_repost: None,
+            repost_reason: None,
+            reply_context: None,
+        };
+        let imp = self.imp();
+        card_btn.connect_clicked(glib::clone!(
+            #[weak]
+            imp,
+            move |_| {
+                if let Some(cb) = imp.post_clicked_callback.borrow().as_ref() {
+                    cb(quoted_post.clone());
+                }
+            }
+        ));
 
         container.append(&card_btn);
     }

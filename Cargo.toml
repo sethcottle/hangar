@@ -15,9 +15,13 @@ categories = ["gui"]
 gtk4 = { version = "0.9", features = ["v4_6"] }
 libadwaita = { version = "0.7", features = ["v1_5"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-atrium-api = { version = "0.24", features = ["agent", "namespace-chatbsky"] }
+atrium-api = { version = "0.25", features = ["agent", "namespace-chatbsky"] }
+atrium-common = "0.1"
+atrium-identity = "0.1"
+atrium-oauth = { version = "0.1", features = ["default-client"] }
 atrium-xrpc-client = { version = "0.5", features = ["reqwest"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+tiny_http = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 url = "2"

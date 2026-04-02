@@ -17,6 +17,7 @@ use crate::cache::{CacheDb, FeedCache, FeedState, PostCache, ProfileCache};
 use crate::config;
 use crate::runtime;
 use crate::state::SessionManager;
+use crate::state::oauth::OAuthManager;
 use crate::ui::avatar_cache;
 use crate::ui::post_row::PostRow;
 use crate::ui::{ComposeDialog, HangarWindow, LoginDialog, NavItem, QuoteContext, ReplyContext};
@@ -470,6 +471,119 @@ impl HangarApplication {
                     }
                 }
             });
+        });
+
+        // OAuth login handler
+        let app2 = self.clone();
+        let dialog_weak2 = dialog.downgrade();
+
+        dialog.connect_oauth_login(move |dlg| {
+            let handle = dlg.handle();
+            if handle.is_empty() {
+                return;
+            }
+
+            dlg.set_oauth_waiting(true);
+            dlg.hide_error();
+
+            let (tx, rx) = std::sync::mpsc::channel::<Result<Session, String>>();
+            let hangar_client = app2.client();
+
+            thread::spawn(move || {
+                let result = runtime::block_on(async {
+                    // Start authorization — binds callback server, creates OAuth client
+                    let session_store = crate::state::session_store::FileSessionStore::new();
+                    let (auth_url, oauth_client, callback_rx) =
+                        OAuthManager::start_auth(&handle, session_store)
+                            .await
+                            .map_err(|e| format!("Authorization failed: {e}"))?;
+
+                    // Open browser for user to authenticate
+                    open::that(&auth_url).map_err(|e| format!("Failed to open browser: {e}"))?;
+
+                    // Wait for callback from browser (blocking on this thread)
+                    let callback_params = callback_rx
+                        .recv_timeout(std::time::Duration::from_secs(300))
+                        .map_err(|_| "Sign-in timed out. Please try again.".to_string())?;
+
+                    // Exchange code for session
+                    let oauth_session = OAuthManager::complete_auth(&oauth_client, callback_params)
+                        .await
+                        .map_err(|e| format!("Authentication failed: {e}"))?;
+
+                    // Set the OAuth session on the client
+                    let session = hangar_client.set_oauth_session(oauth_session).await;
+
+                    // Store session in keyring
+                    let session_for_store = session.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = SessionManager::store(&session_for_store).await {
+                            eprintln!("Failed to persist session: {}", e);
+                        }
+                    });
+
+                    Ok(session)
+                });
+                let _ = tx.send(result);
+            });
+
+            // Poll for results on GTK main thread
+            let app = app2.clone();
+            let dialog_weak = dialog_weak2.clone();
+            glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+                match rx.try_recv() {
+                    Ok(Ok(session)) => {
+                        println!("OAuth login success: {}", session.did);
+
+                        if let Some(dialog) = dialog_weak.upgrade() {
+                            dialog.close();
+                        }
+
+                        // Initialize cache for this user
+                        match CacheDb::open(&session.did) {
+                            Ok(cache) => {
+                                let cache_for_cleanup = cache.clone();
+                                std::thread::spawn(move || {
+                                    if let Err(e) = cache_for_cleanup.cleanup_stale() {
+                                        eprintln!("Cache cleanup failed: {}", e);
+                                    }
+                                });
+                                avatar_cache::init(Arc::new(cache.clone()));
+                                avatar_cache::cleanup_cache();
+                                app.imp().cache.replace(Some(cache));
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to open cache: {}", e);
+                            }
+                        }
+
+                        app.fetch_user_profile(&session.did);
+                        app.fetch_saved_feeds();
+                        app.fetch_timeline();
+                        glib::ControlFlow::Break
+                    }
+                    Ok(Err(e)) => {
+                        if let Some(dialog) = dialog_weak.upgrade() {
+                            dialog.set_oauth_waiting(false);
+                            dialog.show_error(&format!("Login failed: {}", e));
+                        }
+                        glib::ControlFlow::Break
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        if let Some(dialog) = dialog_weak.upgrade() {
+                            dialog.set_oauth_waiting(false);
+                            dialog.show_error("Login failed: connection lost");
+                        }
+                        glib::ControlFlow::Break
+                    }
+                }
+            });
+        });
+
+        // OAuth cancel handler — resets UI back to initial state
+        dialog.connect_oauth_cancel(move |dlg| {
+            dlg.set_oauth_waiting(false);
         });
 
         dialog.present(Some(window));

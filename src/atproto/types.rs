@@ -2,13 +2,92 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Decoupled from atrium's internal representation so we own the API boundary.
+/// How this session was authenticated.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "auth_type")]
+pub enum AuthMethod {
+    /// Legacy app-password authentication (access + refresh JWTs).
+    AppPassword {
+        access_jwt: String,
+        refresh_jwt: String,
+    },
+    /// OAuth 2.0 session (tokens managed by atrium-oauth internally).
+    /// Store DID here; the OAuthSession is restored separately.
+    OAuth,
+}
+
+/// Decoupled from atrium's internal representation
+/// Supports both app-password and OAuth authentication methods
+///
+/// Backward-compatible: old keyring entries with flat `access_jwt`/`refresh_jwt`
+/// fields are deserialized as `AuthMethod::AppPassword` via custom deserialization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "SessionRaw")]
 pub struct Session {
     pub did: String,
     pub handle: String,
-    pub access_jwt: String,
-    pub refresh_jwt: String,
+    pub auth: AuthMethod,
+}
+
+impl Session {
+    /// Helper to extract JWTs for app-password sessions
+    pub fn access_jwt(&self) -> Option<&str> {
+        match &self.auth {
+            AuthMethod::AppPassword { access_jwt, .. } => Some(access_jwt),
+            AuthMethod::OAuth => None,
+        }
+    }
+
+    pub fn refresh_jwt(&self) -> Option<&str> {
+        match &self.auth {
+            AuthMethod::AppPassword { refresh_jwt, .. } => Some(refresh_jwt),
+            AuthMethod::OAuth => None,
+        }
+    }
+
+    pub fn is_oauth(&self) -> bool {
+        matches!(self.auth, AuthMethod::OAuth)
+    }
+}
+
+/// Raw deserialization target that handles both old (flat JWT) and new (tagged) formats.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SessionRaw {
+    /// New format with explicit auth_type tag
+    Tagged {
+        did: String,
+        handle: String,
+        auth: AuthMethod,
+    },
+    /// Legacy format with flat access_jwt/refresh_jwt fields
+    Legacy {
+        did: String,
+        handle: String,
+        access_jwt: String,
+        refresh_jwt: String,
+    },
+}
+
+impl From<SessionRaw> for Session {
+    fn from(raw: SessionRaw) -> Self {
+        match raw {
+            SessionRaw::Tagged { did, handle, auth } => Session { did, handle, auth },
+            SessionRaw::Legacy {
+                did,
+                handle,
+                access_jwt,
+                refresh_jwt,
+            } => Session {
+                did,
+                handle,
+                auth: AuthMethod::AppPassword {
+                    access_jwt,
+                    refresh_jwt,
+                },
+            },
+        }
+    }
 }
 
 /// External link card embed (URLs with previews)

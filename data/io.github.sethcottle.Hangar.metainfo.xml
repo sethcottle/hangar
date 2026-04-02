@@ -23,9 +23,10 @@
 
   <launchable type="desktop-id">io.github.sethcottle.Hangar.desktop</launchable>
 
-  <url type="homepage">https://github.com/sethcottle/hangar</url>
+  <url type="homepage">https://hangar.blue</url>
   <url type="bugtracker">https://github.com/sethcottle/hangar/issues</url>
   <url type="vcs-browser">https://github.com/sethcottle/hangar</url>
+  <url type="donation">https://github.com/sponsors/sethcottle</url>
 
   <developer id="io.github.sethcottle">
     <name>Seth Cottle</name>
@@ -51,7 +52,52 @@
   </supports>
 
   <releases>
-    <release version="0.1.0" date="2025-01-01">
+    <release version="0.7.0" date="2026-04-02">
+      <description>
+        <p>OAuth authentication, direct messages, and quality improvements.</p>
+        <ul>
+          <li>OAuth authentication (PKCE + DPoP) with persistent sessions</li>
+          <li>Direct messages: conversation list with unread badges and message preview</li>
+          <li>Quote post navigation opens threads in-app instead of the browser</li>
+          <li>Chat empty state for accounts with no messages</li>
+          <li>Flatpak runtime updated to GNOME 48</li>
+          <li>Fixed GTK CSS parser warnings</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.6.0" date="2026-02-23">
+      <description>
+        <p>Bug fixes and improvements.</p>
+      </description>
+    </release>
+    <release version="0.5.0" date="2026-02-18">
+      <description>
+        <p>The rich composer update.</p>
+        <ul>
+          <li>Rich compose dialog with image attachments, threaded posting, link card previews, content warnings, language picker, and interaction settings</li>
+          <li>Color scheme settings (system, light, dark)</li>
+          <li>Extended text size range</li>
+          <li>AppImage delta updates</li>
+          <li>Fixed emoji horizontal overshoot in post rendering</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.4.0" date="2026-02-05">
+      <description>
+        <p>Continued feature development and polish.</p>
+      </description>
+    </release>
+    <release version="0.3.0" date="2026-02-05">
+      <description>
+        <p>Continued feature development and polish.</p>
+      </description>
+    </release>
+    <release version="0.2.0" date="2026-02-03">
+      <description>
+        <p>Continued feature development and polish.</p>
+      </description>
+    </release>
+    <release version="0.1.0" date="2026-02-01">
       <description>
         <p>Initial technical preview release.</p>
       </description>

@@ -379,22 +379,10 @@ button.flat.circular.liked image {
     font-weight: 900;
 }
 
-/* Liked state: filled icon style (separate block for GTK version compat) */
-.flat.circular.liked image,
-button.flat.circular.liked image {
-    -gtk-icon-style: filled;
-}
-
 /* Reposted state: add font-weight as non-color indicator */
 .flat.circular.reposted image,
 menubutton.flat.circular.reposted > button image {
     font-weight: 900;
-}
-
-/* Reposted state: filled icon style (separate block for GTK version compat) */
-.flat.circular.reposted image,
-menubutton.flat.circular.reposted > button image {
-    -gtk-icon-style: filled;
 }
 
 /* Ensure focus rings are always visible on interactive elements */
@@ -514,14 +502,4 @@ popover.mention-popover > contents {
     margin-bottom: 4px;
 }
 
-/* ============================================================
-   Reduced motion — placed last so @media parse failures on
-   older GTK versions don't break any rules above.
-   ============================================================ */
-@media (prefers-reduced-motion: reduce) {
-    * {
-        animation-duration: 0s !important;
-        transition-duration: 0s !important;
-    }
-}
 

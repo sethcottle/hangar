@@ -192,6 +192,8 @@ mod imp {
         pub chat_load_more_callback: RefCell<Option<Box<dyn Fn() + 'static>>>,
         pub chat_scrolled_window: RefCell<Option<gtk4::ScrolledWindow>>,
         pub chat_spinner: RefCell<Option<gtk4::Spinner>>,
+        pub chat_overlay: RefCell<Option<gtk4::Overlay>>,
+        pub chat_empty_state: RefCell<Option<adw::StatusPage>>,
         pub conversation_clicked_callback: RefCell<Option<Box<dyn Fn(Conversation) + 'static>>>,
         // Current user info
         pub current_user_did: RefCell<Option<String>>,
@@ -1198,7 +1200,7 @@ impl HangarWindow {
 
         // Helper to create a PostRow with all callbacks wired up
         // `clickable` controls whether clicking the post opens its thread
-        let create_post_row = |win: &Self, post: Post, clickable: bool| -> PostRow {
+        let create_post_row = |win: &Self, post: Post| -> PostRow {
             let post_row = PostRow::new();
             post_row.bind(&post);
 
@@ -1252,8 +1254,10 @@ impl HangarWindow {
                     .map(|cb| cb(post_clone.clone()));
             });
 
-            // Post click callback (only if clickable - main post in thread shouldn't re-open)
-            if clickable {
+            // Post click callback — always set so embedded quotes can navigate.
+            // When !clickable (main post in thread), the row body click is
+            // disabled via set_not_clickable(), but quote cards still fire this.
+            {
                 let w = win.clone();
                 post_row.set_post_clicked_callback(move |p| {
                     if let Some(cb) = w.imp().post_clicked_callback.borrow().as_ref() {
@@ -1281,12 +1285,12 @@ impl HangarWindow {
 
         // Add parent posts (if any) - these are clickable to navigate to them
         for post in parent_posts {
-            let post_row = create_post_row(self, post, true);
+            let post_row = create_post_row(self, post);
             scroll_content.append(&post_row);
         }
 
-        // Add the main post - NOT clickable since we're already viewing it
-        let main_row = create_post_row(self, the_main_post.clone(), false);
+        // Add the main post - body click disabled since we're already viewing it
+        let main_row = create_post_row(self, the_main_post.clone());
         main_row.set_not_clickable();
         scroll_content.append(&main_row);
 
@@ -1320,7 +1324,7 @@ impl HangarWindow {
             scroll_content.append(&replies_header);
 
             for post in reply_posts {
-                let post_row = create_post_row(self, post, true);
+                let post_row = create_post_row(self, post);
                 scroll_content.append(&post_row);
             }
         }
@@ -1940,12 +1944,23 @@ impl HangarWindow {
         spinner.set_margin_bottom(16);
         overlay.add_overlay(&spinner);
 
+        // Empty state (shown instead of the overlay when there are no conversations)
+        let empty_state = adw::StatusPage::new();
+        empty_state.set_icon_name(Some("chat-message-new-symbolic"));
+        empty_state.set_title("No messages yet");
+        empty_state.set_description(Some("Your direct messages will appear here."));
+        empty_state.set_vexpand(true);
+        empty_state.set_visible(false);
+
         chat_box.append(&overlay);
+        chat_box.append(&empty_state);
 
         let imp = self.imp();
         imp.chat_model.replace(Some(model));
         imp.chat_scrolled_window.replace(Some(scrolled.clone()));
         imp.chat_spinner.replace(Some(spinner));
+        imp.chat_overlay.replace(Some(overlay));
+        imp.chat_empty_state.replace(Some(empty_state));
 
         // Infinite scroll
         let adj = scrolled.vadjustment();
@@ -1971,11 +1986,18 @@ impl HangarWindow {
 
     /// Set conversations in the chat list
     pub fn set_conversations(&self, conversations: Vec<Conversation>) {
+        let empty = conversations.is_empty();
         if let Some(model) = self.imp().chat_model.borrow().as_ref() {
             model.remove_all();
             for convo in conversations {
                 model.append(&ConversationObject::new(convo));
             }
+        }
+        if let Some(overlay) = self.imp().chat_overlay.borrow().as_ref() {
+            overlay.set_visible(!empty);
+        }
+        if let Some(empty_state) = self.imp().chat_empty_state.borrow().as_ref() {
+            empty_state.set_visible(empty);
         }
     }
 
@@ -3536,11 +3558,8 @@ impl HangarWindow {
         };
 
         if enabled {
-            provider.load_from_data(
-                "* { animation-duration: 0s !important; transition-duration: 0s !important; }",
-            );
+            provider.load_from_data("* { animation-duration: 0s; transition-duration: 0s; }");
         } else {
-            // Clear the CSS — system prefers-reduced-motion still works via style.css
             provider.load_from_data("");
         }
     }

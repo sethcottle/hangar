@@ -3,15 +3,16 @@
 
 use crate::atproto::facets;
 use crate::atproto::types::{
-    ChatMessage, ComposeData, Conversation, Embed, ExternalEmbed, ImageEmbed, LinkCardData,
-    Notification, Post, PostgateConfig, Profile, QuoteEmbed, ReplyContext, RepostReason, SavedFeed,
-    Session, ThreadgateConfig, ThreadgateRule, VideoEmbed,
+    AuthMethod, ChatMessage, ComposeData, Conversation, Embed, ExternalEmbed, ImageEmbed,
+    LinkCardData, Notification, Post, PostgateConfig, Profile, QuoteEmbed, ReplyContext,
+    RepostReason, SavedFeed, Session, ThreadgateConfig, ThreadgateRule, VideoEmbed,
 };
 use crate::config::DEFAULT_PDS;
-use atrium_api::agent::AtpAgent;
-use atrium_api::agent::store::MemorySessionStore;
+use atrium_api::agent::atp_agent::AtpAgent;
+use atrium_api::agent::atp_agent::store::MemorySessionStore;
 use atrium_api::com::atproto::repo::{create_record, delete_record};
 use atrium_api::types::Unknown;
+use atrium_api::types::string::RecordKey;
 use atrium_xrpc_client::reqwest::ReqwestClient;
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -29,7 +30,11 @@ pub enum ClientError {
     NotAuthenticated,
 }
 
-type Agent = AtpAgent<MemorySessionStore, ReqwestClient>;
+use crate::state::oauth::HangarOAuthSession;
+use atrium_api::agent::Agent as OAuthAgent;
+
+type CredentialAgent = AtpAgent<MemorySessionStore, ReqwestClient>;
+type OAuthAgentType = OAuthAgent<HangarOAuthSession>;
 
 /// Reply reference for post creation (root + parent URIs).
 #[derive(Clone)]
@@ -41,15 +46,62 @@ pub struct ReplyRef {
 }
 
 /// Wraps atrium so the rest of the app only sees our own types.
+/// Supports both credential-based (app password) and OAuth authentication.
+/// Only one of `credential_agent` or `oauth_agent` is set at a time.
 pub struct HangarClient {
-    agent: RwLock<Option<Agent>>,
+    credential_agent: RwLock<Option<CredentialAgent>>,
+    oauth_agent: RwLock<Option<OAuthAgentType>>,
     service_url: String,
+}
+
+/// Dispatch an expression through whichever agent is active.
+/// Both agent types expose the same `.api.app.bsky.*` surface.
+/// The macro duplicates `$body` for each variant so the compiler
+/// monomorphizes the API calls for each concrete agent type.
+macro_rules! with_agent {
+    ($self:expr, $agent:ident => $body:expr) => {{
+        // Try credential agent first (more common), then OAuth
+        let cred_guard = $self.credential_agent.read().unwrap();
+        if let Some($agent) = cred_guard.as_ref() {
+            $body
+        } else {
+            drop(cred_guard);
+            let oauth_guard = $self.oauth_agent.read().unwrap();
+            let $agent = oauth_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
+            $body
+        }
+    }};
+}
+
+/// Like `with_agent!` but also provides the authenticated DID.
+/// Use for methods that create/delete records (which need `repo: did`).
+macro_rules! with_agent_and_did {
+    ($self:expr, $agent:ident, $did:ident => $body:expr) => {{
+        let cred_guard = $self.credential_agent.read().unwrap();
+        if let Some($agent) = cred_guard.as_ref() {
+            let $did = $agent
+                .get_session()
+                .await
+                .ok_or(ClientError::NotAuthenticated)?
+                .data
+                .did
+                .clone();
+            $body
+        } else {
+            drop(cred_guard);
+            let oauth_guard = $self.oauth_agent.read().unwrap();
+            let $agent = oauth_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
+            let $did = $agent.did().await.ok_or(ClientError::NotAuthenticated)?;
+            $body
+        }
+    }};
 }
 
 impl HangarClient {
     pub fn new() -> Self {
         Self {
-            agent: RwLock::new(None),
+            credential_agent: RwLock::new(None),
+            oauth_agent: RwLock::new(None),
             service_url: DEFAULT_PDS.to_string(),
         }
     }
@@ -57,7 +109,8 @@ impl HangarClient {
     #[allow(dead_code)]
     pub fn with_service(service_url: &str) -> Self {
         Self {
-            agent: RwLock::new(None),
+            credential_agent: RwLock::new(None),
+            oauth_agent: RwLock::new(None),
             service_url: service_url.to_string(),
         }
     }
@@ -74,24 +127,60 @@ impl HangarClient {
         let session = Session {
             did: result.data.did.to_string(),
             handle: result.data.handle.to_string(),
-            access_jwt: result.data.access_jwt.clone(),
-            refresh_jwt: result.data.refresh_jwt.clone(),
+            auth: AuthMethod::AppPassword {
+                access_jwt: result.data.access_jwt.clone(),
+                refresh_jwt: result.data.refresh_jwt.clone(),
+            },
         };
 
-        let mut agent_guard = self.agent.write().unwrap();
-        *agent_guard = Some(agent);
+        // Clear any existing OAuth agent
+        *self.oauth_agent.write().unwrap() = None;
+        *self.credential_agent.write().unwrap() = Some(agent);
 
         Ok(session)
     }
 
-    #[allow(dead_code)]
+    /// Set an OAuth session as the active agent.
+    pub async fn set_oauth_session(&self, oauth_session: HangarOAuthSession) -> Session {
+        use atrium_api::agent::SessionManager;
+
+        let did = oauth_session.did().await;
+        let did_str = did.map(|d| d.to_string()).unwrap_or_default();
+        let agent = OAuthAgent::new(oauth_session);
+
+        // Clear any existing credential agent
+        *self.credential_agent.write().unwrap() = None;
+        *self.oauth_agent.write().unwrap() = Some(agent);
+
+        Session {
+            did: did_str,
+            handle: String::new(), // Will be populated by profile fetch
+            auth: AuthMethod::OAuth,
+        }
+    }
+
+    /// Resume a session from stored data.
+    /// For app passwords, restores from JWTs.
+    /// For OAuth, restores from the persistent FileSessionStore.
     pub async fn resume_session(&self, session: &Session) -> Result<(), ClientError> {
+        if matches!(session.auth, AuthMethod::OAuth) {
+            return self.resume_oauth_session(session).await;
+        }
+
+        let (access_jwt, refresh_jwt) = match &session.auth {
+            AuthMethod::AppPassword {
+                access_jwt,
+                refresh_jwt,
+            } => (access_jwt.clone(), refresh_jwt.clone()),
+            AuthMethod::OAuth => unreachable!("handled above"),
+        };
+
         let client = ReqwestClient::new(&self.service_url);
         let agent = AtpAgent::new(client, MemorySessionStore::default());
 
-        let atrium_session = atrium_api::agent::Session::from(
+        let atrium_session = atrium_api::com::atproto::server::create_session::Output::from(
             atrium_api::com::atproto::server::create_session::OutputData {
-                access_jwt: session.access_jwt.clone(),
+                access_jwt,
                 active: None,
                 did: session
                     .did
@@ -105,7 +194,7 @@ impl HangarClient {
                     .handle
                     .parse()
                     .map_err(|e| ClientError::Auth(format!("invalid handle: {e}")))?,
-                refresh_jwt: session.refresh_jwt.clone(),
+                refresh_jwt,
                 status: None,
             },
         );
@@ -115,40 +204,81 @@ impl HangarClient {
             .await
             .map_err(|e| ClientError::Auth(e.to_string()))?;
 
-        let mut agent_guard = self.agent.write().unwrap();
-        *agent_guard = Some(agent);
+        // Clear any existing OAuth agent
+        *self.oauth_agent.write().unwrap() = None;
+        *self.credential_agent.write().unwrap() = Some(agent);
 
+        Ok(())
+    }
+
+    /// Restore an OAuth session from the persistent store.
+    async fn resume_oauth_session(&self, session: &Session) -> Result<(), ClientError> {
+        use crate::state::oauth::OAuthManager;
+        use crate::state::session_store::FileSessionStore;
+
+        let did: atrium_api::types::string::Did = session
+            .did
+            .parse()
+            .map_err(|e| ClientError::Auth(format!("invalid DID: {e}")))?;
+
+        let store = FileSessionStore::new();
+        let oauth_client = OAuthManager::build_restore_client(store)
+            .map_err(|e| ClientError::Auth(format!("failed to build OAuth client: {e}")))?;
+
+        let oauth_session = OAuthManager::restore_session(&oauth_client, &did)
+            .await
+            .map_err(|e| ClientError::Auth(format!("failed to restore OAuth session: {e}")))?;
+
+        // Set the restored session as the active agent
+        self.set_oauth_session(oauth_session).await;
         Ok(())
     }
 
     #[allow(dead_code, clippy::await_holding_lock)]
     pub async fn is_authenticated(&self) -> bool {
-        let agent_guard = self.agent.read().unwrap();
-        if let Some(agent) = agent_guard.as_ref() {
-            agent.get_session().await.is_some()
-        } else {
-            false
+        {
+            let cred = self.credential_agent.read().unwrap();
+            if let Some(agent) = cred.as_ref() {
+                if agent.get_session().await.is_some() {
+                    return true;
+                }
+            }
         }
+        self.oauth_agent.read().unwrap().is_some()
     }
 
     #[allow(dead_code, clippy::await_holding_lock)]
     pub async fn session(&self) -> Option<Session> {
-        let agent_guard = self.agent.read().unwrap();
-        let agent = agent_guard.as_ref()?;
-        let atrium_session = agent.get_session().await?;
-
-        Some(Session {
-            did: atrium_session.data.did.to_string(),
-            handle: atrium_session.data.handle.to_string(),
-            access_jwt: atrium_session.data.access_jwt.clone(),
-            refresh_jwt: atrium_session.data.refresh_jwt.clone(),
-        })
+        {
+            let cred = self.credential_agent.read().unwrap();
+            if let Some(agent) = cred.as_ref() {
+                let atrium_session = agent.get_session().await?;
+                return Some(Session {
+                    did: atrium_session.data.did.to_string(),
+                    handle: atrium_session.data.handle.to_string(),
+                    auth: AuthMethod::AppPassword {
+                        access_jwt: atrium_session.data.access_jwt.clone(),
+                        refresh_jwt: atrium_session.data.refresh_jwt.clone(),
+                    },
+                });
+            }
+        }
+        {
+            let oauth = self.oauth_agent.read().unwrap();
+            let agent = oauth.as_ref()?;
+            let did = agent.did().await?;
+            Some(Session {
+                did: did.to_string(),
+                handle: String::new(),
+                auth: AuthMethod::OAuth,
+            })
+        }
     }
 
     #[allow(dead_code)]
     pub async fn clear_session(&self) {
-        let mut agent_guard = self.agent.write().unwrap();
-        *agent_guard = None;
+        *self.credential_agent.write().unwrap() = None;
+        *self.oauth_agent.write().unwrap() = None;
     }
 
     #[allow(clippy::await_holding_lock)]
@@ -156,8 +286,7 @@ impl HangarClient {
         &self,
         cursor: Option<&str>,
     ) -> Result<(Vec<Post>, Option<String>), ClientError> {
-        let agent_guard = self.agent.read().unwrap();
-        let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
+        with_agent!(self, agent => {
 
         let params = atrium_api::app::bsky::feed::get_timeline::ParametersData {
             algorithm: None,
@@ -182,6 +311,7 @@ impl HangarClient {
             .collect();
 
         Ok((posts, output.data.cursor))
+        })
     }
 
     fn convert_feed_view_post(
@@ -526,8 +656,7 @@ impl HangarClient {
 
     #[allow(clippy::await_holding_lock)]
     pub async fn get_profile(&self, actor: &str) -> Result<Profile, ClientError> {
-        let agent_guard = self.agent.read().unwrap();
-        let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
+        with_agent!(self, agent => {
 
         let params = atrium_api::app::bsky::actor::get_profile::ParametersData {
             actor: actor
@@ -569,6 +698,7 @@ impl HangarClient {
             viewer_following,
             viewer_followed_by,
         })
+        })
     }
 
     /// Fetch multiple profiles in a single batch request (up to 25 at a time)
@@ -578,8 +708,7 @@ impl HangarClient {
             return Ok(vec![]);
         }
 
-        let agent_guard = self.agent.read().unwrap();
-        let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
+        with_agent!(self, agent => {
 
         // ATProto limits to 25 profiles per request
         let actors: Vec<_> = actors
@@ -627,17 +756,14 @@ impl HangarClient {
             .collect();
 
         Ok(profiles)
+        })
     }
 
     /// Like a post and return the URI of the created like record
     #[allow(clippy::await_holding_lock)]
     pub async fn like(&self, uri: &str, cid: &str) -> Result<String, ClientError> {
-        let agent_guard = self.agent.read().unwrap();
-        let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
-        let session = agent
-            .get_session()
-            .await
-            .ok_or(ClientError::NotAuthenticated)?;
+        with_agent_and_did!(self, agent, did => {
+        // DID available as `did`
 
         let record_json = serde_json::json!({
             "$type": "app.bsky.feed.like",
@@ -653,7 +779,7 @@ impl HangarClient {
         let input = create_record::InputData {
             collection,
             record,
-            repo: session.data.did.clone().into(),
+            repo: did.clone().into(),
             rkey: None,
             swap_commit: None,
             validate: None,
@@ -669,17 +795,14 @@ impl HangarClient {
             .map_err(|e| ClientError::Network(e.to_string()))?;
 
         Ok(output.data.uri.to_string())
+        })
     }
 
     /// Repost a post and return the URI of the created repost record
     #[allow(clippy::await_holding_lock)]
     pub async fn repost(&self, uri: &str, cid: &str) -> Result<String, ClientError> {
-        let agent_guard = self.agent.read().unwrap();
-        let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
-        let session = agent
-            .get_session()
-            .await
-            .ok_or(ClientError::NotAuthenticated)?;
+        with_agent_and_did!(self, agent, did => {
+        // DID available as `did`
 
         let record_json = serde_json::json!({
             "$type": "app.bsky.feed.repost",
@@ -695,7 +818,7 @@ impl HangarClient {
         let input = create_record::InputData {
             collection,
             record,
-            repo: session.data.did.clone().into(),
+            repo: did.clone().into(),
             rkey: None,
             swap_commit: None,
             validate: None,
@@ -711,6 +834,7 @@ impl HangarClient {
             .map_err(|e| ClientError::Network(e.to_string()))?;
 
         Ok(output.data.uri.to_string())
+        })
     }
 
     /// Unlike a post by deleting the like record
@@ -730,8 +854,7 @@ impl HangarClient {
     /// Generic delete record helper
     #[allow(clippy::await_holding_lock)]
     async fn delete_record(&self, record_uri: &str, collection: &str) -> Result<(), ClientError> {
-        let agent_guard = self.agent.read().unwrap();
-        let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
+        with_agent!(self, agent => {
 
         // Parse the AT-URI to extract repo and rkey
         // Format: at://did:plc:xxx/app.bsky.feed.like/rkey
@@ -750,7 +873,9 @@ impl HangarClient {
             repo: repo
                 .parse()
                 .map_err(|_| ClientError::InvalidResponse("invalid repo DID".into()))?,
-            rkey: rkey.to_string(),
+            rkey: rkey
+                .parse::<RecordKey>()
+                .map_err(|_| ClientError::InvalidResponse("invalid record key".into()))?,
             swap_commit: None,
             swap_record: None,
         };
@@ -764,13 +889,13 @@ impl HangarClient {
             .await
             .map_err(|e| ClientError::Network(e.to_string()))?;
         Ok(())
+        })
     }
 
     /// Resolve an AT Protocol handle to a DID.
     #[allow(clippy::await_holding_lock)]
     pub async fn resolve_handle(&self, handle: &str) -> Result<String, ClientError> {
-        let agent_guard = self.agent.read().unwrap();
-        let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
+        with_agent!(self, agent => {
 
         let params = atrium_api::com::atproto::identity::resolve_handle::ParametersData {
             handle: handle
@@ -788,6 +913,7 @@ impl HangarClient {
             .map_err(|e| ClientError::Network(e.to_string()))?;
 
         Ok(output.data.did.to_string())
+        })
     }
 
     /// Parse text for facets and resolve any mention handles to DIDs.
@@ -856,8 +982,7 @@ impl HangarClient {
         data: Vec<u8>,
         mime_type: &str,
     ) -> Result<serde_json::Value, ClientError> {
-        let agent_guard = self.agent.read().unwrap();
-        let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
+        with_agent!(self, agent => {
 
         let output = agent
             .api
@@ -881,6 +1006,7 @@ impl HangarClient {
         }
 
         Ok(blob)
+        })
     }
 
     /// Create a post with full compose data (images, language, CW, threadgate, etc.)
@@ -913,12 +1039,8 @@ impl HangarClient {
             None
         };
 
-        let agent_guard = self.agent.read().unwrap();
-        let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
-        let session = agent
-            .get_session()
-            .await
-            .ok_or(ClientError::NotAuthenticated)?;
+        with_agent_and_did!(self, agent, did => {
+        // DID available as `did`
 
         let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
@@ -1029,7 +1151,7 @@ impl HangarClient {
         let input = create_record::InputData {
             collection,
             record,
-            repo: session.data.did.clone().into(),
+            repo: did.clone().into(),
             rkey: None,
             swap_commit: None,
             validate: None,
@@ -1047,8 +1169,7 @@ impl HangarClient {
         let post_uri = output.data.uri.to_string();
         let post_cid = output.data.cid.as_ref().to_string();
 
-        // Drop the agent lock before creating gate records (they acquire their own)
-        drop(agent_guard);
+        // Gate methods acquire their own read locks (RwLock allows concurrent reads)
 
         // Create threadgate record if configured
         if let Some(ref tg) = data.threadgate {
@@ -1063,6 +1184,7 @@ impl HangarClient {
         }
 
         Ok((post_uri, post_cid))
+        })
     }
 
     /// Create a threadgate record controlling who can reply to a post.
@@ -1073,12 +1195,8 @@ impl HangarClient {
         config: &ThreadgateConfig,
         created_at: &str,
     ) -> Result<(), ClientError> {
-        let agent_guard = self.agent.read().unwrap();
-        let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
-        let session = agent
-            .get_session()
-            .await
-            .ok_or(ClientError::NotAuthenticated)?;
+        with_agent_and_did!(self, agent, did => {
+        // DID available as `did`
 
         let allow_rules: Vec<serde_json::Value> = config
             .allow_rules
@@ -1107,7 +1225,12 @@ impl HangarClient {
             .map_err(|e| ClientError::InvalidResponse(e.to_string()))?;
 
         // Threadgate rkey must match the post's rkey
-        let rkey = post_uri.rsplit('/').next().map(|s| s.to_string());
+        let rkey = post_uri
+            .rsplit('/')
+            .next()
+            .map(|s| s.parse::<RecordKey>())
+            .transpose()
+            .map_err(|_| ClientError::InvalidResponse("invalid record key".into()))?;
 
         let collection =
             atrium_api::types::string::Nsid::new("app.bsky.feed.threadgate".to_string())
@@ -1116,7 +1239,7 @@ impl HangarClient {
         let input = create_record::InputData {
             collection,
             record,
-            repo: session.data.did.clone().into(),
+            repo: did.clone().into(),
             rkey,
             swap_commit: None,
             validate: None,
@@ -1131,6 +1254,7 @@ impl HangarClient {
             .await
             .map_err(|e| ClientError::Network(e.to_string()))?;
         Ok(())
+        })
     }
 
     /// Create a postgate record controlling quoting of a post.
@@ -1141,12 +1265,8 @@ impl HangarClient {
         _config: &PostgateConfig,
         created_at: &str,
     ) -> Result<(), ClientError> {
-        let agent_guard = self.agent.read().unwrap();
-        let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
-        let session = agent
-            .get_session()
-            .await
-            .ok_or(ClientError::NotAuthenticated)?;
+        with_agent_and_did!(self, agent, did => {
+        // DID available as `did`
 
         let record_json = serde_json::json!({
             "$type": "app.bsky.feed.postgate",
@@ -1158,7 +1278,12 @@ impl HangarClient {
         let record: Unknown = serde_json::from_value(record_json)
             .map_err(|e| ClientError::InvalidResponse(e.to_string()))?;
 
-        let rkey = post_uri.rsplit('/').next().map(|s| s.to_string());
+        let rkey = post_uri
+            .rsplit('/')
+            .next()
+            .map(|s| s.parse::<RecordKey>())
+            .transpose()
+            .map_err(|_| ClientError::InvalidResponse("invalid record key".into()))?;
 
         let collection = atrium_api::types::string::Nsid::new("app.bsky.feed.postgate".to_string())
             .map_err(|_| ClientError::InvalidResponse("invalid collection".into()))?;
@@ -1166,7 +1291,7 @@ impl HangarClient {
         let input = create_record::InputData {
             collection,
             record,
-            repo: session.data.did.clone().into(),
+            repo: did.clone().into(),
             rkey,
             swap_commit: None,
             validate: None,
@@ -1181,6 +1306,7 @@ impl HangarClient {
             .await
             .map_err(|e| ClientError::Network(e.to_string()))?;
         Ok(())
+        })
     }
 
     /// Create a thread (multiple posts, each replying to the previous).
@@ -1264,8 +1390,7 @@ impl HangarClient {
     /// Get the user's saved/pinned feeds from preferences
     #[allow(clippy::await_holding_lock)]
     pub async fn get_saved_feeds(&self) -> Result<Vec<SavedFeed>, ClientError> {
-        let agent_guard = self.agent.read().unwrap();
-        let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
+        with_agent!(self, agent => {
 
         let output = agent
             .api
@@ -1321,7 +1446,7 @@ impl HangarClient {
             .collect();
 
         if !feed_uris.is_empty() {
-            if let Ok(generators) = self.get_feed_generators_internal(agent, &feed_uris).await {
+            if let Ok(generators) = self.get_feed_generators_internal(&feed_uris).await {
                 for (uri, name, description) in generators {
                     if let Some(feed) = feeds.iter_mut().find(|f| f.uri == uri) {
                         feed.display_name = name;
@@ -1332,15 +1457,16 @@ impl HangarClient {
         }
 
         Ok(feeds)
+        })
     }
 
     /// Internal helper to get feed generator metadata (uri, display_name, description)
-    #[allow(clippy::await_holding_lock)]
+    #[allow(clippy::await_holding_lock, dead_code)]
     async fn get_feed_generators_internal(
         &self,
-        agent: &Agent,
         uris: &[String],
     ) -> Result<Vec<(String, String, Option<String>)>, ClientError> {
+        with_agent!(self, agent => {
         let params = atrium_api::app::bsky::feed::get_feed_generators::ParametersData {
             feeds: uris.iter().map(|s| s.parse().unwrap()).collect(),
         };
@@ -1360,6 +1486,7 @@ impl HangarClient {
             .into_iter()
             .map(|f| (f.data.uri, f.data.display_name, f.data.description))
             .collect())
+        })
     }
 
     /// Fetch a custom feed by its AT-URI
@@ -1369,8 +1496,7 @@ impl HangarClient {
         feed_uri: &str,
         cursor: Option<&str>,
     ) -> Result<(Vec<Post>, Option<String>), ClientError> {
-        let agent_guard = self.agent.read().unwrap();
-        let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
+        with_agent!(self, agent => {
 
         let params = atrium_api::app::bsky::feed::get_feed::ParametersData {
             feed: feed_uri
@@ -1397,13 +1523,13 @@ impl HangarClient {
             .collect();
 
         Ok((posts, output.data.cursor))
+        })
     }
 
     /// Get a post thread (the main post and its replies)
     #[allow(clippy::await_holding_lock)]
     pub async fn get_thread(&self, post_uri: &str) -> Result<Vec<Post>, ClientError> {
-        let agent_guard = self.agent.read().unwrap();
-        let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
+        with_agent!(self, agent => {
 
         let params = atrium_api::app::bsky::feed::get_post_thread::ParametersData {
             uri: post_uri
@@ -1426,6 +1552,7 @@ impl HangarClient {
         let mut posts = Vec::new();
         self.extract_thread_posts(&output.data.thread, &mut posts);
         Ok(posts)
+        })
     }
 
     /// Recursively extract posts from a thread view
@@ -1562,8 +1689,7 @@ impl HangarClient {
         actor: &str,
         cursor: Option<&str>,
     ) -> Result<(Vec<Post>, Option<String>), ClientError> {
-        let agent_guard = self.agent.read().unwrap();
-        let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
+        with_agent!(self, agent => {
 
         let params = atrium_api::app::bsky::feed::get_author_feed::ParametersData {
             actor: actor
@@ -1592,6 +1718,7 @@ impl HangarClient {
             .collect();
 
         Ok((posts, output.data.cursor))
+        })
     }
 
     /// Get posts liked by a specific user
@@ -1601,8 +1728,7 @@ impl HangarClient {
         actor: &str,
         cursor: Option<&str>,
     ) -> Result<(Vec<Post>, Option<String>), ClientError> {
-        let agent_guard = self.agent.read().unwrap();
-        let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
+        with_agent!(self, agent => {
 
         let params = atrium_api::app::bsky::feed::get_actor_likes::ParametersData {
             actor: actor
@@ -1629,6 +1755,7 @@ impl HangarClient {
             .collect();
 
         Ok((posts, output.data.cursor))
+        })
     }
 
     /// Get notifications (mentions, replies, quotes, likes, reposts, follows)
@@ -1639,8 +1766,7 @@ impl HangarClient {
         cursor: Option<&str>,
         mentions_only: bool,
     ) -> Result<(Vec<Notification>, Option<String>), ClientError> {
-        let agent_guard = self.agent.read().unwrap();
-        let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
+        with_agent!(self, agent => {
 
         let params = atrium_api::app::bsky::notification::list_notifications::ParametersData {
             cursor: cursor.map(String::from),
@@ -1694,6 +1820,7 @@ impl HangarClient {
             .collect();
 
         Ok((notifications, output.data.cursor))
+        })
     }
 
     /// Extract post data from a notification record
@@ -1762,8 +1889,7 @@ impl HangarClient {
     ) -> Result<(Vec<Conversation>, Option<String>), ClientError> {
         use atrium_api::agent::bluesky::{AtprotoServiceType, BSKY_CHAT_DID};
 
-        let agent_guard = self.agent.read().unwrap();
-        let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
+        with_agent!(self, agent => {
 
         // Chat API requires proxying through the chat service
         let chat_did = BSKY_CHAT_DID
@@ -1774,6 +1900,8 @@ impl HangarClient {
         let params = atrium_api::chat::bsky::convo::list_convos::ParametersData {
             cursor: cursor.map(String::from),
             limit: None,
+            read_state: None,
+            status: None,
         };
 
         let output = chat_api
@@ -1792,6 +1920,7 @@ impl HangarClient {
             .collect();
 
         Ok((conversations, output.data.cursor))
+        })
     }
 
     /// Get messages for a specific conversation
@@ -1803,8 +1932,7 @@ impl HangarClient {
     ) -> Result<(Vec<ChatMessage>, Option<String>), ClientError> {
         use atrium_api::agent::bluesky::{AtprotoServiceType, BSKY_CHAT_DID};
 
-        let agent_guard = self.agent.read().unwrap();
-        let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
+        with_agent!(self, agent => {
 
         // Chat API requires proxying through the chat service
         let chat_did = BSKY_CHAT_DID
@@ -1849,6 +1977,7 @@ impl HangarClient {
             .collect();
 
         Ok((messages, output.data.cursor))
+        })
     }
 
     /// Convert atrium ConvoView to our Conversation type
@@ -1899,8 +2028,7 @@ impl HangarClient {
         query: &str,
         cursor: Option<&str>,
     ) -> Result<(Vec<Post>, Option<String>), ClientError> {
-        let agent_guard = self.agent.read().unwrap();
-        let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
+        with_agent!(self, agent => {
 
         let params = atrium_api::app::bsky::feed::search_posts::ParametersData {
             q: query.to_string(),
@@ -1934,6 +2062,7 @@ impl HangarClient {
             .collect();
 
         Ok((posts, output.data.cursor))
+        })
     }
 
     /// Search actors (users) by query string
@@ -1946,8 +2075,7 @@ impl HangarClient {
         query: &str,
         limit: u8,
     ) -> Result<Vec<Profile>, ClientError> {
-        let agent_guard = self.agent.read().unwrap();
-        let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
+        with_agent!(self, agent => {
 
         let params = atrium_api::app::bsky::actor::search_actors_typeahead::ParametersData {
             q: Some(query.to_string()),
@@ -1992,6 +2120,7 @@ impl HangarClient {
             .collect();
 
         Ok(actors)
+        })
     }
 
     #[allow(clippy::await_holding_lock)]
@@ -2000,8 +2129,7 @@ impl HangarClient {
         query: &str,
         cursor: Option<&str>,
     ) -> Result<(Vec<Profile>, Option<String>), ClientError> {
-        let agent_guard = self.agent.read().unwrap();
-        let agent = agent_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
+        with_agent!(self, agent => {
 
         let params = atrium_api::app::bsky::actor::search_actors::ParametersData {
             q: Some(query.to_string()),
@@ -2047,6 +2175,7 @@ impl HangarClient {
             .collect();
 
         Ok((actors, output.data.cursor))
+        })
     }
 }
 

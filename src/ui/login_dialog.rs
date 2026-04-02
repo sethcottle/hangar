@@ -16,9 +16,14 @@ mod imp {
     pub struct LoginDialog {
         pub handle_row: RefCell<Option<adw::EntryRow>>,
         pub password_row: RefCell<Option<adw::PasswordEntryRow>>,
+        pub oauth_button: RefCell<Option<gtk4::Button>>,
         pub login_button: RefCell<Option<gtk4::Button>>,
         pub spinner: RefCell<Option<gtk4::Spinner>>,
         pub error_label: RefCell<Option<gtk4::Label>>,
+        pub oauth_status: RefCell<Option<gtk4::Box>>,
+        pub oauth_cancel_button: RefCell<Option<gtk4::Button>>,
+        pub app_password_expander: RefCell<Option<gtk4::Expander>>,
+        pub main_content: RefCell<Option<gtk4::Box>>,
     }
 
     #[glib::object_subclass]
@@ -54,9 +59,8 @@ impl LoginDialog {
     fn setup_ui(&self) {
         self.set_title("Sign In to Bluesky");
         self.set_content_width(400);
-        // Let dialog auto-size height based on content
 
-        // Header bar with Cancel (start) and Sign In (end) — GNOME HIG pattern
+        // Header bar with Cancel (start) — GNOME HIG pattern
         let header = adw::HeaderBar::new();
         header.set_show_start_title_buttons(false);
         header.set_show_end_title_buttons(false);
@@ -76,11 +80,6 @@ impl LoginDialog {
         spinner.update_property(&[gtk4::accessible::Property::Label("Signing in")]);
         header.pack_end(&spinner);
 
-        let login_button = gtk4::Button::with_label("Sign In");
-        login_button.add_css_class("suggested-action");
-        login_button.set_sensitive(false);
-        header.pack_end(&login_button);
-
         let toolbar = adw::ToolbarView::new();
         toolbar.add_top_bar(&header);
 
@@ -92,28 +91,57 @@ impl LoginDialog {
         content.set_margin_bottom(24);
 
         // Description
-        let desc = gtk4::Label::new(Some(
-            "Enter your Bluesky handle and app password to sign in.",
-        ));
+        let desc = gtk4::Label::new(Some("Enter your Bluesky handle to sign in."));
         desc.set_wrap(true);
         desc.set_justify(gtk4::Justification::Center);
         desc.add_css_class("dim-label");
         content.append(&desc);
 
-        // Preferences group with entry rows (GNOME HIG pattern)
-        let prefs_group = adw::PreferencesGroup::new();
-
+        // Handle entry (used for both OAuth and app password)
+        let handle_group = adw::PreferencesGroup::new();
         let handle_row = adw::EntryRow::new();
         handle_row.set_title("Handle");
         handle_row.set_input_purpose(gtk4::InputPurpose::Email);
         handle_row.set_show_apply_button(false);
-        prefs_group.add(&handle_row);
+        handle_group.add(&handle_row);
+        content.append(&handle_group);
 
-        let password_row = adw::PasswordEntryRow::new();
-        password_row.set_title("App Password");
-        prefs_group.add(&password_row);
+        // Primary OAuth button
+        let oauth_button = gtk4::Button::with_label("Sign in with Bluesky");
+        oauth_button.add_css_class("suggested-action");
+        oauth_button.set_sensitive(false);
+        oauth_button.set_tooltip_text(Some("Sign in with Bluesky (opens browser)"));
+        oauth_button.update_property(&[gtk4::accessible::Property::Label(
+            "Sign in with Bluesky (opens browser)",
+        )]);
+        content.append(&oauth_button);
 
-        content.append(&prefs_group);
+        // OAuth waiting status (hidden by default)
+        let oauth_status = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+        oauth_status.set_visible(false);
+        oauth_status.set_halign(gtk4::Align::Center);
+
+        let status_spinner = gtk4::Spinner::new();
+        status_spinner.start();
+        status_spinner.set_width_request(32);
+        status_spinner.set_height_request(32);
+        oauth_status.append(&status_spinner);
+
+        let status_label = gtk4::Label::new(Some("Complete sign-in in your browser..."));
+        status_label.add_css_class("dim-label");
+        status_label.update_property(&[gtk4::accessible::Property::Label(
+            "Waiting for sign-in to complete in browser",
+        )]);
+        oauth_status.append(&status_label);
+
+        let oauth_cancel_btn = gtk4::Button::with_label("Cancel");
+        oauth_cancel_btn.add_css_class("destructive-action");
+        oauth_cancel_btn.set_margin_top(4);
+        oauth_cancel_btn.set_tooltip_text(Some("Cancel sign-in"));
+        oauth_cancel_btn.update_property(&[gtk4::accessible::Property::Label("Cancel sign-in")]);
+        oauth_status.append(&oauth_cancel_btn);
+
+        content.append(&oauth_status);
 
         // Error label (hidden by default)
         let error_label = gtk4::Label::new(None);
@@ -123,79 +151,101 @@ impl LoginDialog {
         error_label.set_wrap(true);
         content.append(&error_label);
 
-        // Links row: App Password (left) and Privacy (right)
-        let links_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-        links_box.set_margin_top(8);
+        // App Password fallback (collapsible)
+        let expander = gtk4::Expander::new(Some("Use App Password instead"));
+        expander.add_css_class("dim-label");
 
-        let privacy_link = gtk4::Button::with_label("Privacy & Security →");
-        privacy_link.add_css_class("flat");
-        privacy_link.add_css_class("link");
-        privacy_link.set_halign(gtk4::Align::Start);
-        privacy_link.update_property(&[gtk4::accessible::Property::Label(
-            "Privacy & Security (opens in browser)",
+        let password_box = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+        password_box.set_margin_top(8);
+
+        let password_group = adw::PreferencesGroup::new();
+        let password_row = adw::PasswordEntryRow::new();
+        password_row.set_title("App Password");
+        password_group.add(&password_row);
+        password_box.append(&password_group);
+
+        let login_button = gtk4::Button::with_label("Sign In");
+        login_button.add_css_class("suggested-action");
+        login_button.set_sensitive(false);
+        login_button.set_tooltip_text(Some("Sign in with app password"));
+        login_button.update_property(&[gtk4::accessible::Property::Label(
+            "Sign in with app password",
         )]);
-        privacy_link.connect_clicked(|_| {
-            let _ = open::that("https://hangar.blue/privacy/");
-        });
-        links_box.append(&privacy_link);
+        password_box.append(&login_button);
 
-        // Spacer to push app password link to the right
-        let spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-        spacer.set_hexpand(true);
-        links_box.append(&spacer);
-
+        // App password help link
         let app_password_link = gtk4::Button::with_label("Create an App Password →");
         app_password_link.add_css_class("flat");
         app_password_link.add_css_class("link");
-        app_password_link.set_halign(gtk4::Align::End);
+        app_password_link.set_halign(gtk4::Align::Start);
         app_password_link.update_property(&[gtk4::accessible::Property::Label(
             "Create an App Password (opens in browser)",
         )]);
         app_password_link.connect_clicked(|_| {
             let _ = open::that("https://bsky.app/settings/app-passwords");
         });
-        links_box.append(&app_password_link);
+        password_box.append(&app_password_link);
 
-        content.append(&links_box);
+        expander.set_child(Some(&password_box));
+        content.append(&expander);
+
+        // Privacy link at bottom
+        let privacy_link = gtk4::Button::with_label("Privacy & Security →");
+        privacy_link.add_css_class("flat");
+        privacy_link.add_css_class("link");
+        privacy_link.set_halign(gtk4::Align::Center);
+        privacy_link.update_property(&[gtk4::accessible::Property::Label(
+            "Privacy & Security (opens in browser)",
+        )]);
+        privacy_link.connect_clicked(|_| {
+            let _ = open::that("https://hangar.blue/privacy/");
+        });
+        content.append(&privacy_link);
 
         toolbar.set_content(Some(&content));
 
-        // Connect entry changes to enable/disable login button
-        let login_btn_weak = login_button.downgrade();
+        // Enable OAuth button when handle is filled
+        let oauth_btn_weak = oauth_button.downgrade();
         let handle_row_weak = handle_row.downgrade();
-        let password_row_weak = password_row.downgrade();
+        handle_row.connect_changed(move |_| {
+            if let (Some(btn), Some(handle)) = (oauth_btn_weak.upgrade(), handle_row_weak.upgrade())
+            {
+                btn.set_sensitive(!handle.text().is_empty());
+            }
+        });
 
-        let update_button_sensitivity = move || {
+        // Enable app password Sign In button when both handle and password filled
+        let login_btn_weak = login_button.downgrade();
+        let handle_row_weak2 = handle_row.downgrade();
+        let password_row_weak = password_row.downgrade();
+        let update_password_btn = move || {
             if let (Some(btn), Some(handle), Some(pass)) = (
                 login_btn_weak.upgrade(),
-                handle_row_weak.upgrade(),
+                handle_row_weak2.upgrade(),
                 password_row_weak.upgrade(),
             ) {
-                let handle_text = handle.text();
-                let pass_text = pass.text();
-                btn.set_sensitive(!handle_text.is_empty() && !pass_text.is_empty());
+                btn.set_sensitive(!handle.text().is_empty() && !pass.text().is_empty());
             }
         };
-
-        let update_fn = update_button_sensitivity.clone();
+        let update_fn = update_password_btn.clone();
         handle_row.connect_changed(move |_| update_fn());
-
-        let update_fn = update_button_sensitivity.clone();
+        let update_fn = update_password_btn.clone();
         password_row.connect_changed(move |_| update_fn());
 
-        // Also enable login on Enter key
-        let login_btn_weak2 = login_button.downgrade();
+        // Enter key on handle activates OAuth button
+        let oauth_btn_weak2 = oauth_button.downgrade();
         handle_row.connect_entry_activated(move |_| {
-            if let Some(btn) = login_btn_weak2.upgrade() {
+            if let Some(btn) = oauth_btn_weak2.upgrade() {
                 if btn.is_sensitive() {
                     btn.emit_clicked();
                 }
             }
         });
 
-        let login_btn_weak3 = login_button.downgrade();
+        // Enter key on password activates Sign In button
+        let login_btn_weak2 = login_button.downgrade();
         password_row.connect_entry_activated(move |_| {
-            if let Some(btn) = login_btn_weak3.upgrade() {
+            if let Some(btn) = login_btn_weak2.upgrade() {
                 if btn.is_sensitive() {
                     btn.emit_clicked();
                 }
@@ -206,9 +256,14 @@ impl LoginDialog {
         let imp = self.imp();
         imp.handle_row.replace(Some(handle_row));
         imp.password_row.replace(Some(password_row));
+        imp.oauth_button.replace(Some(oauth_button));
         imp.login_button.replace(Some(login_button));
         imp.spinner.replace(Some(spinner));
         imp.error_label.replace(Some(error_label));
+        imp.oauth_status.replace(Some(oauth_status));
+        imp.oauth_cancel_button.replace(Some(oauth_cancel_btn));
+        imp.app_password_expander.replace(Some(expander));
+        imp.main_content.replace(Some(content));
 
         self.set_child(Some(&toolbar));
     }
@@ -244,6 +299,28 @@ impl LoginDialog {
         }
     }
 
+    /// Show/hide the OAuth waiting state (spinner + status message).
+    pub fn set_oauth_waiting(&self, waiting: bool) {
+        let imp = self.imp();
+
+        if let Some(status) = imp.oauth_status.borrow().as_ref() {
+            status.set_visible(waiting);
+        }
+
+        if let Some(btn) = imp.oauth_button.borrow().as_ref() {
+            btn.set_sensitive(!waiting);
+            btn.set_visible(!waiting);
+        }
+
+        if let Some(handle) = imp.handle_row.borrow().as_ref() {
+            handle.set_sensitive(!waiting);
+        }
+
+        if let Some(expander) = imp.app_password_expander.borrow().as_ref() {
+            expander.set_sensitive(!waiting);
+        }
+    }
+
     pub fn set_loading(&self, loading: bool) {
         let imp = self.imp();
 
@@ -269,6 +346,27 @@ impl LoginDialog {
         }
     }
 
+    /// Connect callback for OAuth login (handle only).
+    pub fn connect_oauth_login<F: Fn(&Self) + 'static>(&self, f: F) {
+        if let Some(button) = self.imp().oauth_button.borrow().as_ref() {
+            let dialog = self.clone();
+            button.connect_clicked(move |_| {
+                f(&dialog);
+            });
+        }
+    }
+
+    /// Connect callback for cancelling an in-progress OAuth flow.
+    pub fn connect_oauth_cancel<F: Fn(&Self) + 'static>(&self, f: F) {
+        if let Some(button) = self.imp().oauth_cancel_button.borrow().as_ref() {
+            let dialog = self.clone();
+            button.connect_clicked(move |_| {
+                f(&dialog);
+            });
+        }
+    }
+
+    /// Connect callback for app-password login (handle + password).
     pub fn connect_login<F: Fn(&Self) + 'static>(&self, f: F) {
         if let Some(button) = self.imp().login_button.borrow().as_ref() {
             let dialog = self.clone();
