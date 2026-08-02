@@ -15,6 +15,18 @@ use libadwaita::prelude::*;
 use std::cell::Cell;
 use std::rc::Rc;
 
+/// Whether GTK has a media backend that can actually decode anything.
+///
+/// GtkMediaFile is backed by a loadable extension (libgtk-4-media-gstreamer on
+/// Debian and Ubuntu, gtk4-media-gstreamer on Fedora). It is a runtime
+/// dependency, not a build one, so it can be absent on a perfectly normal
+/// desktop. When it is, GTK falls back to GtkNothingMediaFile, which reports
+/// no error and simply shows black -- the type name is the only reliable
+/// signal that playback will not work.
+fn media_backend_available() -> bool {
+    gtk4::MediaFile::new().type_().name() != "GtkNothingMediaFile"
+}
+
 /// Play a video embed in a dialog.
 ///
 /// Bluesky serves video as an HLS playlist. Handing that URL to the browser is
@@ -32,6 +44,20 @@ pub fn show_video(parent: &impl IsA<gtk4::Widget>, playlist_url: String, fallbac
         Some(w) => w,
         None => return,
     };
+
+    // Without a media backend GtkMediaFile silently becomes GTK's do-nothing
+    // implementation: it renders black and never reports an error, so waiting
+    // for a failure signal would leave the user staring at an empty dialog.
+    // Ask first instead.
+    if !media_backend_available() {
+        eprintln!(
+            "hangar: no GTK media backend, so video cannot play in app; opening in browser.\n  \
+             Install libgtk-4-media-gstreamer (Debian/Ubuntu) or gtk4-media-gstreamer \
+             (Fedora), plus gstreamer1.0-plugins-bad for HLS."
+        );
+        let _ = open::that(&fallback_url);
+        return;
+    }
 
     let dialog = adw::Dialog::new();
     dialog.set_title("Video");

@@ -109,6 +109,15 @@ pub struct AppSettings {
     /// Default postgate config (quote controls). None = quoting allowed.
     #[serde(default)]
     pub default_postgate: Option<crate::atproto::PostgateConfig>,
+    /// Hide replies in the main feed.
+    ///
+    /// Bluesky hides replies by default; Hangar has always shown them, and
+    /// showing them stays the default so the feed does not quietly change for
+    /// anyone already using the app. Phrased as "hide" rather than "show" so
+    /// that `Default` and serde's missing-field default agree on false without
+    /// needing a hand-written Default impl.
+    #[serde(default)]
+    pub hide_replies_in_feed: bool,
 }
 
 impl AppSettings {

@@ -760,7 +760,23 @@ impl HangarWindow {
         }
     }
 
+    /// Drop replies from a feed batch when the user has asked for a quieter
+    /// timeline.
+    ///
+    /// Only applies to the main feed. Threads, profiles and likes deliberately
+    /// keep their replies, since a thread without replies is not a thread.
+    fn filter_feed_posts(posts: Vec<Post>) -> Vec<Post> {
+        if !crate::state::AppSettings::load().hide_replies_in_feed {
+            return posts;
+        }
+        posts
+            .into_iter()
+            .filter(|p| p.reply_context.is_none())
+            .collect()
+    }
+
     pub fn set_posts(&self, posts: Vec<Post>) {
+        let posts = Self::filter_feed_posts(posts);
         if let Some(model) = self.imp().timeline_model.borrow().as_ref() {
             model.remove_all();
 
@@ -772,6 +788,7 @@ impl HangarWindow {
     }
 
     pub fn append_posts(&self, posts: Vec<Post>) {
+        let posts = Self::filter_feed_posts(posts);
         if let Some(model) = self.imp().timeline_model.borrow().as_ref() {
             for post in posts {
                 let post_object = PostObject::new(post);
@@ -909,6 +926,7 @@ impl HangarWindow {
     /// Insert new posts at the top of the timeline without disrupting the current view.
     /// Rebuilds the model with new posts prepended, then restores scroll position.
     pub fn insert_posts_at_top(&self, posts: Vec<Post>) {
+        let posts = Self::filter_feed_posts(posts);
         let Some(model) = self.imp().timeline_model.borrow().as_ref().cloned() else {
             return;
         };
@@ -3311,6 +3329,37 @@ impl HangarWindow {
         let settings_box = gtk4::Box::new(gtk4::Orientation::Vertical, 24);
 
         // ---- Motion section ----
+        let feed_group = adw::PreferencesGroup::new();
+        feed_group.set_title("Feed");
+        feed_group.set_description(Some(
+            "Controls what appears in your main timeline. Threads, profiles and likes are unaffected.",
+        ));
+
+        let hide_replies_row = adw::ActionRow::builder()
+            .title("Hide Replies")
+            .subtitle("Show only top-level posts, the way bsky.app does")
+            .build();
+
+        let hide_replies_switch = gtk4::Switch::new();
+        hide_replies_switch.set_valign(gtk4::Align::Center);
+        hide_replies_switch.set_active(current_settings.hide_replies_in_feed);
+        hide_replies_switch.set_tooltip_text(Some("Toggle replies in the main feed"));
+        hide_replies_switch
+            .update_property(&[gtk4::accessible::Property::Label("Hide replies in feed")]);
+
+        hide_replies_switch.connect_state_set(move |_switch, state| {
+            let mut settings = crate::state::AppSettings::load();
+            settings.hide_replies_in_feed = state;
+            if let Err(e) = settings.save() {
+                eprintln!("Failed to save settings: {e}");
+            }
+            glib::Propagation::Proceed
+        });
+
+        hide_replies_row.add_suffix(&hide_replies_switch);
+        hide_replies_row.set_activatable_widget(Some(&hide_replies_switch));
+        feed_group.add(&hide_replies_row);
+
         let motion_group = adw::PreferencesGroup::new();
         motion_group.set_title("Motion");
         motion_group.set_description(Some(
@@ -3346,6 +3395,7 @@ impl HangarWindow {
         reduce_motion_row.add_suffix(&reduce_motion_switch);
         reduce_motion_row.set_activatable_widget(Some(&reduce_motion_switch));
         motion_group.add(&reduce_motion_row);
+        settings_box.append(&feed_group);
         settings_box.append(&motion_group);
 
         clamp.set_child(Some(&settings_box));
