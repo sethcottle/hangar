@@ -111,9 +111,18 @@ pub fn show_video(parent: &impl IsA<gtk4::Widget>, playlist_url: String, fallbac
     dialog.set_child(Some(&toolbar));
 
     // Stop decoding when the dialog goes away, otherwise audio keeps playing.
+    //
+    // Closing also cancels the prepare timeout. Without this, dismissing a
+    // video that had not started yet left the timer armed, and it fired later
+    // against a dialog that was already gone -- opening a browser tab the user
+    // had not asked for and warning about closing an unpresented AdwDialog.
     dialog.connect_closed({
         let media = media.clone();
-        move |_| media.set_playing(false)
+        let gave_up = gave_up.clone();
+        move |_| {
+            gave_up.set(true);
+            media.set_playing(false);
+        }
     });
 
     dialog.present(Some(&root));
