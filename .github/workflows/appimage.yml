@@ -12,7 +12,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install dependencies
         run: |
@@ -59,8 +59,8 @@ jobs:
           printf '%s\n' '# AppRun for Hangar — GTK4 + libadwaita app' >> AppDir/AppRun
           printf '%s\n' '#' >> AppDir/AppRun
           printf '%s\n' '# Hangar does NOT bundle GTK4/libadwaita libraries. It uses the' >> AppDir/AppRun
-          printf '%s\n' '# host system libraries, which are available on all supported' >> AppDir/AppRun
-          printf '%s\n' '# Linux desktops (GNOME 43+, Fedora 39+, Ubuntu 23.10+, etc).' >> AppDir/AppRun
+          printf '%s\n' '# host system libraries. Minimum: GTK 4.12 and libadwaita 1.5,' >> AppDir/AppRun
+          printf '%s\n' '# i.e. GNOME 45+ (Fedora 39+, Ubuntu 23.10+, etc).' >> AppDir/AppRun
           printf '%s\n' '#' >> AppDir/AppRun
           printf '%s\n' '# This is intentional: bundling GTK4/libadwaita from the build' >> AppDir/AppRun
           printf '%s\n' '# environment (Ubuntu 24.04) causes theme/rendering failures on' >> AppDir/AppRun
@@ -88,7 +88,7 @@ jobs:
             AppDir
 
       - name: Upload AppImage
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: hangar-appimage
           path: |

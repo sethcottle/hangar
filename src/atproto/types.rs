@@ -12,12 +12,12 @@ pub enum AuthMethod {
         refresh_jwt: String,
     },
     /// OAuth 2.0 session (tokens managed by atrium-oauth internally).
-    /// Store DID here; the OAuthSession is restored separately.
+    /// We store only the DID here; the OAuthSession is restored separately.
     OAuth,
 }
 
-/// Decoupled from atrium's internal representation
-/// Supports both app-password and OAuth authentication methods
+/// Decoupled from atrium's internal representation so we own the API boundary.
+/// Supports both app-password and OAuth authentication methods.
 ///
 /// Backward-compatible: old keyring entries with flat `access_jwt`/`refresh_jwt`
 /// fields are deserialized as `AuthMethod::AppPassword` via custom deserialization.
@@ -30,7 +30,7 @@ pub struct Session {
 }
 
 impl Session {
-    /// Helper to extract JWTs for app-password sessions
+    /// Helper to extract JWTs for app-password sessions.
     pub fn access_jwt(&self) -> Option<&str> {
         match &self.auth {
             AuthMethod::AppPassword { access_jwt, .. } => Some(access_jwt),

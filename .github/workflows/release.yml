@@ -17,12 +17,12 @@ jobs:
     name: Build Flatpak
     runs-on: ubuntu-latest
     container:
-      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-49
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-50
       options: --privileged
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Generate Cargo sources
         run: |
@@ -39,7 +39,7 @@ jobs:
           sed -i 's|assets/icons/io.github.sethcottle.Hangar.svg|assets/icons/io.github.sethcottle.Hangar.Devel.svg|' io.github.sethcottle.Hangar.yml
 
       - name: Build Flatpak
-        uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        uses: flatpak/flatpak-github-actions/flatpak-builder@v6.7
         with:
           manifest-path: io.github.sethcottle.Hangar.yml
           bundle: hangar.flatpak
@@ -47,7 +47,7 @@ jobs:
           cache-key: flatpak-builder-${{ github.sha }}
 
       - name: Upload Flatpak artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: hangar-flatpak
           path: hangar.flatpak
@@ -58,7 +58,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install dependencies
         run: |
@@ -125,7 +125,7 @@ jobs:
             --output appimage
 
       - name: Upload AppImage artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: hangar-appimage
           path: |
@@ -141,7 +141,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Determine release type
         id: release-type
@@ -161,12 +161,12 @@ jobs:
           fi
 
       - name: Download Flatpak artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: hangar-flatpak
 
       - name: Download AppImage artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: hangar-appimage
 
@@ -182,7 +182,7 @@ jobs:
 
       - name: Create nightly release
         if: steps.release-type.outputs.is_nightly == 'true'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: nightly
           name: "Nightly ${{ steps.release-type.outputs.date }} (${{ steps.release-type.outputs.short_sha }})"
@@ -211,7 +211,7 @@ jobs:
 
       - name: Create versioned release
         if: steps.release-type.outputs.is_nightly == 'false'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: v${{ steps.release-type.outputs.version }}
           name: Hangar v${{ steps.release-type.outputs.version }}

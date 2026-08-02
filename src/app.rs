@@ -112,7 +112,7 @@ mod imp {
 
             // Load CSS
             let css_provider = gtk4::CssProvider::new();
-            css_provider.load_from_data(include_str!("ui/style.css"));
+            css_provider.load_from_string(include_str!("ui/style.css"));
 
             gtk4::style_context_add_provider_for_display(
                 &display,

@@ -114,6 +114,11 @@ Flathub submission is planned but not yet available.
 
 #### Dependencies
 
+Building requires **GTK 4.14+** and **libadwaita 1.5+** (GNOME 46+, Fedora 40+,
+Ubuntu 24.04+). The resulting binary runs against **GTK 4.12+** and
+**libadwaita 1.5+** (GNOME 45+), so release builds target an older floor than
+the build host requires.
+
 **Fedora/RHEL:**
 ```bash
 sudo dnf install gtk4-devel libadwaita-devel gcc pkg-config

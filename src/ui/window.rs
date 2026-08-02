@@ -262,7 +262,8 @@ mod imp {
 glib::wrapper! {
     pub struct HangarWindow(ObjectSubclass<imp::HangarWindow>)
         @extends adw::ApplicationWindow, gtk4::ApplicationWindow, gtk4::Window, gtk4::Widget,
-        @implements gio::ActionGroup, gio::ActionMap;
+        @implements gio::ActionGroup, gio::ActionMap, gtk4::Accessible, gtk4::Buildable,
+                    gtk4::ConstraintTarget, gtk4::Native, gtk4::Root, gtk4::ShortcutManager;
 }
 
 impl HangarWindow {
@@ -3528,7 +3529,7 @@ impl HangarWindow {
             body = 1.0 * scale,
         );
 
-        provider.load_from_data(&css);
+        provider.load_from_string(&css);
     }
 
     /// Apply reduced motion setting by disabling GTK animations globally
@@ -3558,9 +3559,9 @@ impl HangarWindow {
         };
 
         if enabled {
-            provider.load_from_data("* { animation-duration: 0s; transition-duration: 0s; }");
+            provider.load_from_string("* { animation-duration: 0s; transition-duration: 0s; }");
         } else {
-            provider.load_from_data("");
+            provider.load_from_string("");
         }
     }
 

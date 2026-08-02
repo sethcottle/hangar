@@ -41,3 +41,4 @@ CLAUDE.md
 # Rust specific
 **/*.rs.bk
 *.pdb
+/docs

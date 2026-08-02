@@ -191,7 +191,7 @@ impl PostRow {
         header.append(&display_name);
 
         // Verified badge (checkmark)
-        let verified_badge = gtk4::Image::from_icon_name("emblem-ok-symbolic");
+        let verified_badge = gtk4::Image::from_icon_name("object-select-symbolic");
         verified_badge.add_css_class("verified-badge");
         verified_badge.set_pixel_size(14);
         verified_badge.set_margin_start(4);
@@ -1087,7 +1087,7 @@ impl PostRow {
                 let picture = gtk4::Picture::new();
                 picture.set_hexpand(true);
                 picture.set_can_shrink(true);
-                picture.set_keep_aspect_ratio(true);
+                picture.set_content_fit(gtk4::ContentFit::Contain);
                 // Set a reasonable max height via widget height request
                 picture.set_size_request(-1, 400);
 
@@ -1164,7 +1164,7 @@ impl PostRow {
         picture.set_hexpand(true);
         picture.set_vexpand(true);
         picture.set_can_shrink(true);
-        picture.set_keep_aspect_ratio(false); // Stretch to fill the cell
+        picture.set_content_fit(gtk4::ContentFit::Fill); // Stretch to fill the cell
 
         frame.set_child(Some(&picture));
         avatar_cache::load_image_into_picture(picture, url.to_string());
@@ -1190,7 +1190,7 @@ impl PostRow {
             thumb_frame.add_css_class("external-thumb");
 
             let thumb = gtk4::Picture::new();
-            thumb.set_keep_aspect_ratio(true);
+            thumb.set_content_fit(gtk4::ContentFit::Contain);
             thumb.set_can_shrink(true);
             thumb.set_size_request(72, 72); // Smaller thumbnail for compact window
             avatar_cache::load_image_into_picture(thumb.clone(), thumb_url.clone());
@@ -1264,7 +1264,7 @@ impl PostRow {
         // Thumbnail - responsive width, constrained height
         let thumb = gtk4::Picture::new();
         thumb.set_hexpand(true);
-        thumb.set_keep_aspect_ratio(true);
+        thumb.set_content_fit(gtk4::ContentFit::Contain);
         thumb.set_can_shrink(true);
         thumb.set_size_request(-1, 200); // Only constrain height, let width be flexible
         thumb.add_css_class("post-embed-image");

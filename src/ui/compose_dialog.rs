@@ -1246,9 +1246,12 @@ impl ComposeDialog {
                             let adj = sw.vadjustment();
                             // Compute row position relative to the ListBox (the scrollable content)
                             if let Some(list_parent) = row_ref.parent() {
-                                let (_, row_y) = row_ref
-                                    .translate_coordinates(&list_parent, 0.0, 0.0)
-                                    .unwrap_or((0.0, 0.0));
+                                let row_y = row_ref
+                                    .compute_point(
+                                        &list_parent,
+                                        &gtk4::graphene::Point::new(0.0, 0.0),
+                                    )
+                                    .map_or(0.0, |p| p.y() as f64);
                                 let row_h = row_ref.height() as f64;
                                 let page_top = adj.value();
                                 let page_bottom = page_top + adj.page_size();

@@ -12,8 +12,8 @@ keywords = ["bluesky", "atproto", "gtk", "gnome", "social"]
 categories = ["gui"]
 
 [dependencies]
-gtk4 = { version = "0.9", features = ["v4_6"] }
-libadwaita = { version = "0.7", features = ["v1_5"] }
+gtk4 = { version = "0.11", features = ["v4_14"] }
+libadwaita = { version = "0.9", features = ["v1_5", "gtk_v4_10"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 atrium-api = { version = "0.25", features = ["agent", "namespace-chatbsky"] }
 atrium-common = "0.1"
