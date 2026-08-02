@@ -16,6 +16,7 @@ use atrium_api::types::string::RecordKey;
 use atrium_xrpc_client::reqwest::ReqwestClient;
 use std::collections::HashMap;
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -28,6 +29,11 @@ pub enum ClientError {
     InvalidResponse(String),
     #[error("not authenticated")]
     NotAuthenticated,
+    /// The stored session cannot be revived and only a fresh sign-in recovers.
+    /// Distinct from `Auth` so the UI can say so instead of showing a bare
+    /// login dialog with no explanation.
+    #[error("session expired, sign in again")]
+    ReauthRequired,
 }
 
 use crate::state::oauth::HangarOAuthSession;
@@ -52,6 +58,11 @@ pub struct HangarClient {
     credential_agent: RwLock<Option<CredentialAgent>>,
     oauth_agent: RwLock<Option<OAuthAgentType>>,
     service_url: String,
+    /// Set once the server rejects our credentials after atrium has already
+    /// tried to refresh them. Latched rather than reported per call because a
+    /// dead session fails every in-flight request at once and the user should
+    /// be asked to sign in once, not a dozen times.
+    session_expired: AtomicBool,
 }
 
 /// Dispatch an expression through whichever agent is active.
@@ -103,6 +114,7 @@ impl HangarClient {
             credential_agent: RwLock::new(None),
             oauth_agent: RwLock::new(None),
             service_url: DEFAULT_PDS.to_string(),
+            session_expired: AtomicBool::new(false),
         }
     }
 
@@ -112,7 +124,55 @@ impl HangarClient {
             credential_agent: RwLock::new(None),
             oauth_agent: RwLock::new(None),
             service_url: service_url.to_string(),
+            session_expired: AtomicBool::new(false),
         }
+    }
+
+    /// Turn an XRPC failure into our own error, noticing a session the server
+    /// will not accept any more.
+    ///
+    /// Both agents answer a rejected token the same way: refresh, retry once,
+    /// and throw away whatever the refresh itself returned (atrium-oauth's
+    /// `oauth_session/inner.rs`, atrium-api's `atp_agent/inner.rs`). A rejection
+    /// reaching us is therefore the *second* one -- the refresh did not fix it
+    /// and no further in-process retry will. That silence is why this is the
+    /// only signal we get that a session is dead rather than merely stale, so
+    /// latch it here instead of letting it blur into the network errors.
+    fn xrpc_error<E: std::fmt::Debug + std::fmt::Display>(
+        &self,
+        e: atrium_api::xrpc::Error<E>,
+    ) -> ClientError {
+        use atrium_api::xrpc::error::{Error, XrpcError, XrpcErrorKind};
+
+        let rejected = match &e {
+            Error::Authentication(_) => true,
+            Error::XrpcResponse(XrpcError { status, error }) => {
+                *status == atrium_api::xrpc::http::StatusCode::UNAUTHORIZED
+                    || matches!(
+                        error,
+                        Some(XrpcErrorKind::Undefined(body))
+                            if matches!(
+                                body.error.as_deref(),
+                                Some("ExpiredToken" | "InvalidToken" | "AuthenticationRequired")
+                            )
+                    )
+            }
+            _ => false,
+        };
+
+        if rejected {
+            self.session_expired.store(true, Ordering::Relaxed);
+            return ClientError::ReauthRequired;
+        }
+        ClientError::Network(e.to_string())
+    }
+
+    /// Consume the expired-session flag, returning true at most once per death.
+    ///
+    /// The hook the UI needs to prompt for a new sign-in: nothing else in the
+    /// app can tell a session atrium failed to refresh from a working one.
+    pub fn take_session_expired(&self) -> bool {
+        self.session_expired.swap(false, Ordering::Relaxed)
     }
 
     pub async fn login(&self, handle: &str, password: &str) -> Result<Session, ClientError> {
@@ -136,8 +196,24 @@ impl HangarClient {
         // Clear any existing OAuth agent
         *self.oauth_agent.write().unwrap() = None;
         *self.credential_agent.write().unwrap() = Some(agent);
+        self.session_expired.store(false, Ordering::Relaxed);
 
         Ok(session)
+    }
+
+    /// Forget whichever session is active.
+    ///
+    /// The client outlives the window it was signed in through, so without this
+    /// a sign-out leaves the previous account's agent in place and usable. The
+    /// 30-second new-posts poll is held by the application rather than the
+    /// window and survives too, so that agent goes on making requests — and an
+    /// OAuth agent that refreshes writes the whole session file back as it
+    /// found it, over whatever the next sign-in has since written there.
+    pub fn sign_out(&self) {
+        *self.credential_agent.write().unwrap() = None;
+        *self.oauth_agent.write().unwrap() = None;
+        // Nothing is signed in any more, so there is no expiry left to report.
+        self.session_expired.store(false, Ordering::Relaxed);
     }
 
     /// Set an OAuth session as the active agent.
@@ -147,6 +223,9 @@ impl HangarClient {
         let did = oauth_session.did().await;
         let did_str = did.map(|d| d.to_string()).unwrap_or_default();
         let agent = OAuthAgent::new(oauth_session);
+
+        // A new set of credentials starts clean, whatever the last ones did.
+        self.session_expired.store(false, Ordering::Relaxed);
 
         // Clear any existing credential agent
         *self.credential_agent.write().unwrap() = None;
@@ -213,8 +292,9 @@ impl HangarClient {
 
     /// Restore an OAuth session from the persistent store.
     async fn resume_oauth_session(&self, session: &Session) -> Result<(), ClientError> {
-        use crate::state::oauth::OAuthManager;
+        use crate::state::oauth::{OAuthError, OAuthManager};
         use crate::state::session_store::FileSessionStore;
+        use atrium_common::store::Store;
 
         let did: atrium_api::types::string::Did = session
             .did
@@ -233,8 +313,27 @@ impl HangarClient {
             eprintln!("hangar: could not reset stored token expiry: {e}");
         }
 
-        let oauth_client = OAuthManager::build_restore_client(store)
-            .map_err(|e| ClientError::Auth(format!("failed to build OAuth client: {e}")))?;
+        let oauth_client = match OAuthManager::build_restore_client(store.clone(), &did) {
+            Ok(client) => client,
+            Err(OAuthError::MissingClientBinding) => {
+                // Unrecoverable and permanent: the client_id this session's
+                // refresh token was issued to was derived from a callback port
+                // that no longer exists anywhere. Drop the row so it stops
+                // presenting itself as a session we could still use.
+                if let Err(e) = store.del(&did).await {
+                    eprintln!("hangar: could not discard the unusable OAuth session: {e}");
+                }
+                // Reported through the return value rather than the latch: the
+                // caller is already waiting on this, and latching as well would
+                // have the UI raise the same thing twice.
+                return Err(ClientError::ReauthRequired);
+            }
+            Err(e) => {
+                return Err(ClientError::Auth(format!(
+                    "failed to build OAuth client: {e}"
+                )));
+            }
+        };
 
         let oauth_session = OAuthManager::restore_session(&oauth_client, &did)
             .await
@@ -312,7 +411,7 @@ impl HangarClient {
             .feed
             .get_timeline(params.into())
             .await
-            .map_err(|e| ClientError::Network(e.to_string()))?;
+            .map_err(|e| self.xrpc_error(e))?;
 
         let posts: Vec<Post> = output
             .data
@@ -682,7 +781,7 @@ impl HangarClient {
             .actor
             .get_profile(params.into())
             .await
-            .map_err(|e| ClientError::Network(e.to_string()))?;
+            .map_err(|e| self.xrpc_error(e))?;
 
         // Extract viewer state
         let viewer_following = output
@@ -740,7 +839,7 @@ impl HangarClient {
             .actor
             .get_profiles(params.into())
             .await
-            .map_err(|e| ClientError::Network(e.to_string()))?;
+            .map_err(|e| self.xrpc_error(e))?;
 
         let profiles = output
             .data
@@ -803,7 +902,7 @@ impl HangarClient {
             .repo
             .create_record(input.into())
             .await
-            .map_err(|e| ClientError::Network(e.to_string()))?;
+            .map_err(|e| self.xrpc_error(e))?;
 
         Ok(output.data.uri.to_string())
         })
@@ -842,7 +941,7 @@ impl HangarClient {
             .repo
             .create_record(input.into())
             .await
-            .map_err(|e| ClientError::Network(e.to_string()))?;
+            .map_err(|e| self.xrpc_error(e))?;
 
         Ok(output.data.uri.to_string())
         })
@@ -898,7 +997,7 @@ impl HangarClient {
             .repo
             .delete_record(input.into())
             .await
-            .map_err(|e| ClientError::Network(e.to_string()))?;
+            .map_err(|e| self.xrpc_error(e))?;
         Ok(())
         })
     }
@@ -921,7 +1020,7 @@ impl HangarClient {
             .identity
             .resolve_handle(params.into())
             .await
-            .map_err(|e| ClientError::Network(e.to_string()))?;
+            .map_err(|e| self.xrpc_error(e))?;
 
         Ok(output.data.did.to_string())
         })
@@ -1002,7 +1101,7 @@ impl HangarClient {
             .repo
             .upload_blob(data)
             .await
-            .map_err(|e| ClientError::Network(e.to_string()))?;
+            .map_err(|e| self.xrpc_error(e))?;
 
         // Serialize the BlobRef to JSON — atrium's BlobRef implements Serialize.
         // The output contains the blob reference we need for embeds.
@@ -1175,7 +1274,7 @@ impl HangarClient {
             .repo
             .create_record(input.into())
             .await
-            .map_err(|e| ClientError::Network(e.to_string()))?;
+            .map_err(|e| self.xrpc_error(e))?;
 
         let post_uri = output.data.uri.to_string();
         let post_cid = output.data.cid.as_ref().to_string();
@@ -1263,7 +1362,7 @@ impl HangarClient {
             .repo
             .create_record(input.into())
             .await
-            .map_err(|e| ClientError::Network(e.to_string()))?;
+            .map_err(|e| self.xrpc_error(e))?;
         Ok(())
         })
     }
@@ -1315,7 +1414,7 @@ impl HangarClient {
             .repo
             .create_record(input.into())
             .await
-            .map_err(|e| ClientError::Network(e.to_string()))?;
+            .map_err(|e| self.xrpc_error(e))?;
         Ok(())
         })
     }
@@ -1412,7 +1511,7 @@ impl HangarClient {
                 atrium_api::app::bsky::actor::get_preferences::ParametersData {}.into(),
             )
             .await
-            .map_err(|e| ClientError::Network(e.to_string()))?;
+            .map_err(|e| self.xrpc_error(e))?;
 
         let mut feeds = vec![SavedFeed::home()];
 
@@ -1489,7 +1588,7 @@ impl HangarClient {
             .feed
             .get_feed_generators(params.into())
             .await
-            .map_err(|e| ClientError::Network(e.to_string()))?;
+            .map_err(|e| self.xrpc_error(e))?;
 
         Ok(output
             .data
@@ -1524,7 +1623,7 @@ impl HangarClient {
             .feed
             .get_feed(params.into())
             .await
-            .map_err(|e| ClientError::Network(e.to_string()))?;
+            .map_err(|e| self.xrpc_error(e))?;
 
         let posts: Vec<Post> = output
             .data
@@ -1557,7 +1656,7 @@ impl HangarClient {
             .feed
             .get_post_thread(params.into())
             .await
-            .map_err(|e| ClientError::Network(e.to_string()))?;
+            .map_err(|e| self.xrpc_error(e))?;
 
         // Extract posts from thread view
         let mut posts = Vec::new();
@@ -1719,7 +1818,7 @@ impl HangarClient {
             .feed
             .get_author_feed(params.into())
             .await
-            .map_err(|e| ClientError::Network(e.to_string()))?;
+            .map_err(|e| self.xrpc_error(e))?;
 
         let posts: Vec<Post> = output
             .data
@@ -1756,7 +1855,7 @@ impl HangarClient {
             .feed
             .get_actor_likes(params.into())
             .await
-            .map_err(|e| ClientError::Network(e.to_string()))?;
+            .map_err(|e| self.xrpc_error(e))?;
 
         let posts: Vec<Post> = output
             .data
@@ -1794,7 +1893,7 @@ impl HangarClient {
             .notification
             .list_notifications(params.into())
             .await
-            .map_err(|e| ClientError::Network(e.to_string()))?;
+            .map_err(|e| self.xrpc_error(e))?;
 
         let notifications: Vec<Notification> = output
             .data
@@ -1921,7 +2020,7 @@ impl HangarClient {
             .convo
             .list_convos(params.into())
             .await
-            .map_err(|e| ClientError::Network(e.to_string()))?;
+            .map_err(|e| self.xrpc_error(e))?;
 
         let conversations: Vec<Conversation> = output
             .data
@@ -1963,7 +2062,7 @@ impl HangarClient {
             .convo
             .get_messages(params.into())
             .await
-            .map_err(|e| ClientError::Network(e.to_string()))?;
+            .map_err(|e| self.xrpc_error(e))?;
 
         use atrium_api::chat::bsky::convo::get_messages::OutputMessagesItem;
         use atrium_api::types::Union;
@@ -2063,7 +2162,7 @@ impl HangarClient {
             .feed
             .search_posts(params.into())
             .await
-            .map_err(|e| ClientError::Network(e.to_string()))?;
+            .map_err(|e| self.xrpc_error(e))?;
 
         let posts: Vec<Post> = output
             .data
@@ -2101,7 +2200,7 @@ impl HangarClient {
             .actor
             .search_actors_typeahead(params.into())
             .await
-            .map_err(|e| ClientError::Network(e.to_string()))?;
+            .map_err(|e| self.xrpc_error(e))?;
 
         let actors: Vec<Profile> = output
             .data
@@ -2156,7 +2255,7 @@ impl HangarClient {
             .actor
             .search_actors(params.into())
             .await
-            .map_err(|e| ClientError::Network(e.to_string()))?;
+            .map_err(|e| self.xrpc_error(e))?;
 
         let actors: Vec<Profile> = output
             .data

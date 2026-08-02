@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::thread;
 use tokio::sync::Semaphore;
 
+use crate::atproto::client::ClientError;
 use crate::atproto::{Conversation, HangarClient, Notification, Post, Profile, SavedFeed, Session};
 use crate::cache::{CacheDb, FeedCache, FeedState, PostCache, ProfileCache};
 use crate::config;
@@ -24,6 +25,21 @@ use crate::ui::{ComposeDialog, HangarWindow, LoginDialog, NavItem, QuoteContext,
 
 /// Limit concurrent API requests to prevent overwhelming the server during rapid scrolling
 static API_SEMAPHORE: Lazy<Arc<Semaphore>> = Lazy::new(|| Arc::new(Semaphore::new(4)));
+
+/// Why a stored session could not be resumed on launch.
+///
+/// The two arms need different handling and used to get none: the receiving end
+/// discarded the error and put up a bare login dialog either way, so a session
+/// the server had permanently refused looked exactly like a first run.
+enum RestoreFailure {
+    /// The session is dead and waiting will not revive it — the tokens were
+    /// refused, or the `client_id` they were issued under cannot be rebuilt.
+    /// What is in the keyring is worthless and has to go with it.
+    Reauth,
+    /// Everything else: nothing stored yet, the keyring unavailable, the
+    /// network down mid-restore. The stored session may well still be good.
+    Other(String),
+}
 
 mod imp {
     use super::*;
@@ -289,19 +305,25 @@ impl HangarApplication {
     }
 
     fn try_restore_session(&self) {
-        let (tx, rx) = std::sync::mpsc::channel::<Result<Session, String>>();
+        let (tx, rx) = std::sync::mpsc::channel::<Result<Session, RestoreFailure>>();
         let client = self.client();
 
         thread::spawn(move || {
             // Use the shared runtime for network operations so the HTTP client
             // context is consistent across all API calls
             let result = runtime::block_on(async {
-                let session = SessionManager::load().await.map_err(|e| e.to_string())?;
-                client
-                    .resume_session(&session)
+                let session = SessionManager::load()
                     .await
-                    .map_err(|e| e.to_string())?;
-                Ok(session)
+                    .map_err(|e| RestoreFailure::Other(e.to_string()))?;
+                match client.resume_session(&session).await {
+                    Ok(()) => Ok(session),
+                    // Kept apart from every other failure all the way to the
+                    // UI: this one is permanent, and it is the only one where
+                    // the right thing to do is throw the stored session away
+                    // and ask for a new sign-in.
+                    Err(ClientError::ReauthRequired) => Err(RestoreFailure::Reauth),
+                    Err(e) => Err(RestoreFailure::Other(e.to_string())),
+                }
             });
             let _ = tx.send(result);
         });
@@ -338,7 +360,38 @@ impl HangarApplication {
                     }
                     glib::ControlFlow::Break
                 }
-                Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Ok(Err(failure)) => {
+                    let notice = match &failure {
+                        RestoreFailure::Reauth => {
+                            // The OAuth row on disk has already been dropped as
+                            // unusable, but the keyring copy is what makes the
+                            // app try again on the next launch and land in the
+                            // same place. Clear it, or this repeats forever.
+                            thread::spawn(move || {
+                                if let Err(e) = runtime::block_on(SessionManager::clear()) {
+                                    eprintln!("hangar: could not clear the expired session: {e}");
+                                }
+                            });
+                            Some(
+                                "Your session expired and could not be renewed. \
+                                 Please sign in again.",
+                            )
+                        }
+                        RestoreFailure::Other(e) => {
+                            // Not fatal to the account, so the dialog says
+                            // nothing: it is the ordinary "no session stored
+                            // yet" case as often as it is a real fault. The log
+                            // is where the difference lives.
+                            eprintln!("hangar: could not restore the saved session: {e}");
+                            None
+                        }
+                    };
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        app.show_login_dialog_with_notice(window, notice);
+                    }
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     if let Some(window) = app.imp().window.borrow().as_ref() {
                         app.show_login_dialog(window);
                     }
@@ -351,6 +404,24 @@ impl HangarApplication {
 
     /// Sign out: clear session, close window, and restart fresh
     fn sign_out(&self) {
+        // Drop the live agent first. Closing the window does not: the client
+        // and the 30-second new-posts poll both hang off the application, so
+        // the old account's agent would otherwise keep issuing requests right
+        // through the next sign-in — refreshing tokens, and writing its own row
+        // back over the session file the new sign-in is writing into.
+        self.client().sign_out();
+
+        // Per-account state that outlives the window with it. `newest_post_uri`
+        // in particular is the only thing the poll checks before it does any
+        // work, so clearing it is what actually quiets the poll down until a
+        // new timeline has arrived.
+        let imp = self.imp();
+        imp.newest_post_uri.replace(None);
+        imp.timeline_cursor.replace(None);
+        imp.current_feed.replace(None);
+        imp.user_did.replace(None);
+        imp.cache.replace(None);
+
         // Clear the stored session
         thread::spawn(move || {
             let _ = runtime::block_on(SessionManager::clear());
@@ -366,7 +437,31 @@ impl HangarApplication {
         gio::prelude::ApplicationExt::activate(self.upcast_ref::<gio::Application>());
     }
 
+    /// Say so, once, if a request has just died of an expired session.
+    ///
+    /// The client latches a refusal it could not refresh past, because nothing
+    /// downstream of `e.to_string()` can tell that apart from the server being
+    /// briefly unreachable. Consuming the latch here is what turns "the
+    /// timeline silently stopped updating" into something with an answer.
+    fn report_session_expiry(&self) {
+        if !self.client().take_session_expired() {
+            return;
+        }
+        if let Some(window) = self.imp().window.borrow().as_ref() {
+            window.show_toast("Your session expired \u{2014} sign out and sign in again");
+        }
+    }
+
     fn show_login_dialog(&self, window: &HangarWindow) {
+        self.show_login_dialog_with_notice(window, None);
+    }
+
+    /// Show the login dialog, optionally saying why it came up.
+    ///
+    /// A dialog that appears out of nowhere on launch is indistinguishable from
+    /// never having been signed in, which is the wrong story to tell somebody
+    /// whose session has just been refused.
+    fn show_login_dialog_with_notice(&self, window: &HangarWindow, notice: Option<&str>) {
         let dialog = LoginDialog::new();
 
         let app = self.clone();
@@ -599,6 +694,10 @@ impl HangarApplication {
             dlg.set_oauth_waiting(false);
         });
 
+        if let Some(notice) = notice {
+            dialog.show_error(notice);
+        }
+
         dialog.present(Some(window));
     }
 
@@ -747,6 +846,7 @@ impl HangarApplication {
                 }
                 Ok(Err(e)) => {
                     eprintln!("Failed to fetch timeline: {}", e);
+                    app.report_session_expiry();
                     glib::ControlFlow::Break
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
@@ -1466,6 +1566,11 @@ impl HangarApplication {
                 Ok(Err(e)) => {
                     app.imp().checking_new_posts.replace(false);
                     eprintln!("Failed to check for new posts: {}", e);
+                    // The poll is the only thing still talking to the server on
+                    // an idle window, so it is where a session dying mid-use
+                    // shows up first — as the timeline quietly never updating
+                    // again.
+                    app.report_session_expiry();
                     glib::ControlFlow::Break
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,

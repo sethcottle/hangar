@@ -29,6 +29,11 @@ pub enum OAuthError {
     OAuth(String),
     #[error("callback server error: {0}")]
     CallbackServer(String),
+    /// The stored session predates Hangar recording what its `client_id` was
+    /// derived from, so no client we can build is able to refresh it. Only a
+    /// fresh sign-in recovers.
+    #[error("stored session was not recorded with a redirect URI")]
+    MissingClientBinding,
 }
 
 /// Manages the AT Protocol OAuth flow for desktop apps.
@@ -38,9 +43,24 @@ pub enum OAuthError {
 pub struct OAuthManager;
 
 impl OAuthManager {
+    /// The scopes we ask for at authorization.
+    ///
+    /// Single source of truth on purpose: a loopback `client_id` is derived
+    /// from the scope list as much as from the redirect URI, so editing this
+    /// in one place and not the other would hand the authorization server two
+    /// different clients for the same sign-in.
+    fn requested_scopes() -> Vec<Scope> {
+        vec![
+            Scope::Known(KnownScope::Atproto),
+            Scope::Known(KnownScope::TransitionGeneric),
+            Scope::Known(KnownScope::TransitionChatBsky),
+        ]
+    }
+
     /// Build an OAuthClient configured for a specific callback port.
     fn build_client(
         redirect_uri: &str,
+        scopes: Vec<Scope>,
         session_store: FileSessionStore,
     ) -> Result<HangarOAuthClient, OAuthError> {
         let http_client = Arc::new(DefaultHttpClient::default());
@@ -48,11 +68,7 @@ impl OAuthManager {
         let config = OAuthClientConfig {
             client_metadata: AtprotoLocalhostClientMetadata {
                 redirect_uris: Some(vec![redirect_uri.to_string()]),
-                scopes: Some(vec![
-                    Scope::Known(KnownScope::Atproto),
-                    Scope::Known(KnownScope::TransitionGeneric),
-                    Scope::Known(KnownScope::TransitionChatBsky),
-                ]),
+                scopes: Some(scopes),
             },
             keys: None,
             resolver: OAuthResolverConfig {
@@ -74,14 +90,32 @@ impl OAuthManager {
         HangarOAuthClient::new(config).map_err(|e| OAuthError::OAuth(e.to_string()))
     }
 
-    /// Build an OAuthClient for session restoration (no specific redirect URI needed).
+    /// Build an OAuthClient that reproduces the `client_id` this DID's session
+    /// was authorized under.
+    ///
+    /// atrium derives a loopback `client_id` from the redirect URI and scopes
+    /// and sends it with every token request, refreshes included, so restoring
+    /// with a placeholder URI produces a client the authorization server will
+    /// refuse to refresh for. The binding therefore has to come from the store,
+    /// and its absence is a hard failure rather than something to guess at.
     pub fn build_restore_client(
         session_store: FileSessionStore,
+        did: &atrium_api::types::string::Did,
     ) -> Result<HangarOAuthClient, OAuthError> {
-        // Use a dummy redirect URI — it won't be used for restore, only for
-        // client configuration. The actual redirect URI was used during the
-        // original authorization.
-        Self::build_client("http://127.0.0.1/callback", session_store)
+        let (redirect_uri, scopes) = session_store
+            .client_binding(did)
+            .map_err(|e| OAuthError::OAuth(e.to_string()))?
+            .ok_or(OAuthError::MissingClientBinding)?;
+
+        // Anything the stored binding fails validation on -- a URI atrium no
+        // longer accepts as loopback, a scope list it will not serialize --
+        // means the original client_id is unreconstructible, which is the same
+        // dead end as never having recorded it. Send it down the re-auth path
+        // instead of surfacing as a client-construction failure.
+        Self::build_client(&redirect_uri, scopes, session_store).map_err(|e| {
+            eprintln!("hangar: stored OAuth client binding is unusable: {e}");
+            OAuthError::MissingClientBinding
+        })
     }
 
     /// Run the full OAuth authorization flow.
@@ -111,18 +145,20 @@ impl OAuthManager {
             .port();
 
         let redirect_uri = format!("http://127.0.0.1:{port}/callback");
+        let scopes = Self::requested_scopes();
+
+        // atrium writes the session row itself when it exchanges the code, so
+        // the store has to be carrying the binding before the client is built
+        // -- there is no later point at which we could attach it to that row.
+        let session_store = session_store.with_client_binding(&redirect_uri, &scopes);
 
         // Build OAuth client with this specific redirect URI
-        let client = Self::build_client(&redirect_uri, session_store)?;
+        let client = Self::build_client(&redirect_uri, scopes.clone(), session_store)?;
 
         // Get authorization URL
         let options = AuthorizeOptions {
             redirect_uri: Some(redirect_uri),
-            scopes: vec![
-                Scope::Known(KnownScope::Atproto),
-                Scope::Known(KnownScope::TransitionGeneric),
-                Scope::Known(KnownScope::TransitionChatBsky),
-            ],
+            scopes,
             prompt: None,
             state: None,
         };
