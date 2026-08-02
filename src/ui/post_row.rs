@@ -740,7 +740,6 @@ impl PostRow {
         self.imp().post_clicked_callback.replace(Some(Box::new(f)));
     }
 
-
     /// Set callback for when the avatar/profile is clicked (to open profile)
     pub fn set_profile_clicked_callback<F: Fn(Profile) + 'static>(&self, f: F) {
         self.imp()
@@ -1110,6 +1109,7 @@ impl PostRow {
 
                 frame.set_child(Some(&picture));
                 avatar_cache::load_image_into_picture(picture, img.thumb.clone());
+                Self::attach_image_click(&frame, images, 0);
                 grid_container.append(&frame);
             }
             2 => {
@@ -1117,8 +1117,9 @@ impl PostRow {
                 let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
                 row.set_homogeneous(true);
 
-                for img in images.iter() {
+                for (i, img) in images.iter().enumerate() {
                     let cell = self.create_image_cell(&img.thumb, 200);
+                    Self::attach_image_click(&cell, images, i);
                     row.append(&cell);
                 }
                 grid_container.append(&row);
@@ -1130,12 +1131,15 @@ impl PostRow {
 
                 // Left image - tall (spans both rows visually)
                 let left = self.create_image_cell(&images[0].thumb, 260);
+                Self::attach_image_click(&left, images, 0);
                 row.append(&left);
 
                 // Right column with two stacked images
                 let right_col = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
                 let top_right = self.create_image_cell(&images[1].thumb, 128);
                 let bot_right = self.create_image_cell(&images[2].thumb, 128);
+                Self::attach_image_click(&top_right, images, 1);
+                Self::attach_image_click(&bot_right, images, 2);
                 right_col.append(&top_right);
                 right_col.append(&bot_right);
                 row.append(&right_col);
@@ -1151,6 +1155,7 @@ impl PostRow {
 
                 for (i, img) in images.iter().take(4).enumerate() {
                     let cell = self.create_image_cell(&img.thumb, 150);
+                    Self::attach_image_click(&cell, images, i);
                     if i < 2 {
                         top_row.append(&cell);
                     } else {
@@ -1168,6 +1173,26 @@ impl PostRow {
     }
 
     /// Create an image cell that fills a fixed height container
+    /// Make an embedded image open the full-size viewer when clicked.
+    ///
+    /// The gesture claims the event so it does not also reach the row body,
+    /// which would open the thread instead of the image.
+    fn attach_image_click(widget: &impl IsA<gtk4::Widget>, images: &[ImageEmbed], index: usize) {
+        let widget = widget.as_ref();
+        widget.set_cursor_from_name(Some("pointer"));
+
+        let gesture = gtk4::GestureClick::new();
+        let images = images.to_vec();
+        let widget_weak = widget.downgrade();
+        gesture.connect_released(move |gesture, _, _, _| {
+            gesture.set_state(gtk4::EventSequenceState::Claimed);
+            if let Some(widget) = widget_weak.upgrade() {
+                crate::ui::media_viewer::show_images(&widget, images.clone(), index);
+            }
+        });
+        widget.add_controller(gesture);
+    }
+
     fn create_image_cell(&self, url: &str, height: i32) -> gtk4::Frame {
         // Frame acts as the clipping container
         let frame = gtk4::Frame::new(None);

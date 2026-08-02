@@ -3,6 +3,7 @@
 pub mod avatar_cache;
 mod compose_dialog;
 mod login_dialog;
+pub mod media_viewer;
 pub mod post_row;
 pub mod sidebar;
 mod window;
