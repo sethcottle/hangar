@@ -93,6 +93,12 @@ impl LoginDialog {
         // Description
         let desc = gtk4::Label::new(Some("Enter your Bluesky handle to sign in."));
         desc.set_wrap(true);
+        // `Word` is the Pango default and makes a wrapping label's minimum
+        // width its longest unbreakable token, which the timeline scroller no
+        // longer has a horizontal scrollbar to absorb. Nothing here is long
+        // today, but a label that cannot be made to blow a window out is one
+        // less thing to remember when the text changes.
+        desc.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
         desc.set_justify(gtk4::Justification::Center);
         desc.add_css_class("dim-label");
         content.append(&desc);
@@ -149,6 +155,11 @@ impl LoginDialog {
         error_label.add_css_class("error");
         error_label.set_visible(false);
         error_label.set_wrap(true);
+        // Unlike the description above, this one is not ours: it carries
+        // whatever the PDS or the OAuth server said, which routinely means a
+        // URL, a DID or a token fragment with no space in it anywhere.
+        error_label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+        error_label.set_max_width_chars(48);
         content.append(&error_label);
 
         // App Password fallback (collapsible)
@@ -181,8 +192,12 @@ impl LoginDialog {
         app_password_link.update_property(&[gtk4::accessible::Property::Label(
             "Create an App Password (opens in browser)",
         )]);
-        app_password_link.connect_clicked(|_| {
-            let _ = open::that("https://bsky.app/settings/app-passwords");
+        app_password_link.connect_clicked(|btn| {
+            crate::ui::external::open_url(
+                btn,
+                "https://bsky.app/settings/app-passwords",
+                "app passwords",
+            );
         });
         password_box.append(&app_password_link);
 
@@ -197,8 +212,12 @@ impl LoginDialog {
         privacy_link.update_property(&[gtk4::accessible::Property::Label(
             "Privacy & Security (opens in browser)",
         )]);
-        privacy_link.connect_clicked(|_| {
-            let _ = open::that("https://hangar.blue/privacy/");
+        privacy_link.connect_clicked(|btn| {
+            crate::ui::external::open_url(
+                btn,
+                "https://hangar.blue/privacy/",
+                "the privacy policy",
+            );
         });
         content.append(&privacy_link);
 
@@ -265,7 +284,12 @@ impl LoginDialog {
         imp.app_password_expander.replace(Some(expander));
         imp.main_content.replace(Some(content));
 
-        self.set_child(Some(&toolbar));
+        // The dialog draws over the window, so the window's toast overlay is not
+        // reachable from in here -- the links below report themselves through
+        // this one instead.
+        let toasts = adw::ToastOverlay::new();
+        toasts.set_child(Some(&toolbar));
+        self.set_child(Some(&toasts));
     }
 
     pub fn handle(&self) -> String {

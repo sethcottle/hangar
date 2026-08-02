@@ -2,6 +2,7 @@
 
 pub mod avatar_cache;
 mod compose_dialog;
+pub mod external;
 mod login_dialog;
 pub mod media_viewer;
 pub mod post_row;

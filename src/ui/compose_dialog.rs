@@ -385,6 +385,12 @@ impl ComposeDialog {
 
             let header = gtk4::Label::new(Some(&format!("@{}", context.author_handle)));
             header.set_halign(gtk4::Align::Start);
+            // A handle is a domain name off the wire and Pango does not break
+            // on the dots, so without this the quote preview's minimum width is
+            // the whole handle. Same treatment, and the same measure, as the
+            // handle label in the mention picker above.
+            header.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+            header.set_max_width_chars(22);
             header.add_css_class("dim-label");
             header.add_css_class("caption");
             preview.append(&header);
@@ -1627,6 +1633,11 @@ impl ComposeDialog {
             "Help the blind and vision impaired to understand your posts by adding descriptive text to your images.",
         ));
         desc_label.set_wrap(true);
+        // Pango's default `Word` mode makes a wrapping label's minimum width
+        // its longest unbreakable token. Static text today, but the rule the
+        // rest of the tree follows is that no label gets to set a window's
+        // minimum width, and the exceptions are how it stopped being followed.
+        desc_label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
         desc_label.set_halign(gtk4::Align::Start);
         desc_label.add_css_class("dim-label");
         content.append(&desc_label);
@@ -1723,6 +1734,7 @@ impl ComposeDialog {
             "Pick the appropriate language for your post so it can appear in community-created feeds that filter by language.",
         ));
         desc_label.set_wrap(true);
+        desc_label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
         desc_label.set_xalign(0.0);
         desc_label.add_css_class("dim-label");
         content.append(&desc_label);
@@ -2060,6 +2072,7 @@ impl ComposeDialog {
             "These settings only apply to other people\u{2014}you can always reply to and quote your own posts.",
         ));
         note.set_wrap(true);
+        note.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
         note.set_xalign(0.0);
         note.add_css_class("dim-label");
         note.add_css_class("caption");

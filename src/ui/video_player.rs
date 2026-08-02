@@ -233,6 +233,15 @@ impl VideoPlayer {
         error_detail.add_css_class("monospace");
         error_detail.add_css_class("caption");
         error_detail.set_wrap(true);
+        // GStreamer's debug string is one long run of element paths joined by
+        // ":" and "_", and Pango's default `Word` mode has nowhere to break in
+        // that — the label's minimum width becomes the width of the whole run,
+        // and past about 84 characters it drags the dialog wider than the
+        // window it is presented over. `WordChar` breaks mid-token when a token
+        // cannot fit; the character cap keeps the natural width to a readable
+        // monospace measure so the details do not stretch the dialog either.
+        error_detail.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+        error_detail.set_max_width_chars(64);
         error_detail.set_selectable(true);
         error_detail.set_xalign(0.0);
         error_detail.set_margin_top(8);
@@ -244,8 +253,8 @@ impl VideoPlayer {
         open_btn.add_css_class("pill");
         open_btn.set_halign(gtk4::Align::Center);
         if let Some(url) = source.fallback_url.clone() {
-            open_btn.connect_clicked(move |_| {
-                let _ = open::that(&url);
+            open_btn.connect_clicked(move |btn| {
+                crate::ui::external::open_url(btn, &url, "post");
             });
         } else {
             // Nothing worth opening, so do not offer to open anything.

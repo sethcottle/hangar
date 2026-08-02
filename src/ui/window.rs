@@ -619,6 +619,12 @@ impl HangarWindow {
 
         let scrolled = gtk4::ScrolledWindow::new();
         scrolled.set_vexpand(true);
+        // Belt and braces behind the ellipsized labels in PostRow, and what the
+        // thread page has always done. A horizontal scrollbar on a feed is a bug
+        // report rather than a feature. It is a backstop and not the fix though:
+        // Never hands the rows' minimum width to the window instead of scrolling
+        // it, so the labels are what keep that minimum small.
+        scrolled.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
         scrolled.set_child(Some(&clamp));
         overlay.set_child(Some(&scrolled));
 
@@ -728,6 +734,18 @@ impl HangarWindow {
         self.imp()
             .refresh_callback
             .replace(Some(Box::new(callback)));
+    }
+
+    /// Refetch the timeline, exactly as the refresh button does.
+    ///
+    /// For settings that change what a feed batch is allowed to contain: the
+    /// filter runs as posts go into the model, so the posts already in it were
+    /// filtered under the old setting and cannot be re-filtered in place —
+    /// switching replies back on has nothing to switch them back on from.
+    pub fn refresh_feed(&self) {
+        if let Some(callback) = self.imp().refresh_callback.borrow().as_ref() {
+            callback();
+        }
     }
 
     pub fn set_like_callback<F: Fn(Post, glib::WeakRef<PostRow>) + 'static>(&self, callback: F) {
@@ -1192,6 +1210,8 @@ impl HangarWindow {
             "profile" => Some("own-profile"),
             "likes" => Some("likes"),
             "search" => Some("search"),
+            // Settings has no NavigationView of its own, and `nav_view_named`
+            // falls back to Home's, so a tag here would unwind Home instead.
             _ => None,
         }
     }
@@ -1202,6 +1222,17 @@ impl HangarWindow {
         let stack = stack.as_ref()?;
         let visible_name = stack.visible_child_name()?;
         self.nav_view_named(visible_name.as_str())
+    }
+
+    /// Make a top-level page visible without touching its navigation stack.
+    ///
+    /// For moves that are not a section switch -- entering and leaving settings
+    /// -- where whatever the user had drilled into has to still be there when
+    /// they come back.
+    fn show_page(&self, page_name: &str) {
+        if let Some(stack) = self.imp().main_stack.borrow().as_ref() {
+            stack.set_visible_child_name(page_name);
+        }
     }
 
     /// Switch to a top-level page (Home, Mentions, etc.) - no animation
@@ -1219,9 +1250,7 @@ impl HangarWindow {
             nav_view.pop_to_tag(root_tag);
         }
 
-        if let Some(stack) = self.imp().main_stack.borrow().as_ref() {
-            stack.set_visible_child_name(page_name);
-        }
+        self.show_page(page_name);
     }
 
     /// Build a thread view page
@@ -1460,6 +1489,10 @@ impl HangarWindow {
         let display_name = profile.display_name.as_deref().unwrap_or(&profile.handle);
         let title = gtk4::Label::new(Some(display_name));
         title.add_css_class("title");
+        // Display names are arbitrary length and a bare label's minimum width is
+        // its full text, which would push the page -- and so the window -- wider
+        // than the screen for a long enough name.
+        title.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         header.set_title_widget(Some(&title));
 
         // Add window controls (close button) to the end
@@ -1485,11 +1518,13 @@ impl HangarWindow {
         let name_label = gtk4::Label::new(Some(display_name));
         name_label.add_css_class("title-1");
         name_label.set_halign(gtk4::Align::Center);
+        name_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         profile_header.append(&name_label);
 
         let handle_label = gtk4::Label::new(Some(&format!("@{}", profile.handle)));
         handle_label.add_css_class("dim-label");
         handle_label.set_halign(gtk4::Align::Center);
+        handle_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         profile_header.append(&handle_label);
 
         content_box.append(&profile_header);
@@ -1589,6 +1624,7 @@ impl HangarWindow {
 
         let scrolled = gtk4::ScrolledWindow::new();
         scrolled.set_vexpand(true);
+        scrolled.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
         scrolled.set_child(Some(&clamp));
         content_box.append(&scrolled);
 
@@ -1684,6 +1720,7 @@ impl HangarWindow {
 
         let scrolled = gtk4::ScrolledWindow::new();
         scrolled.set_vexpand(true);
+        scrolled.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
         scrolled.set_child(Some(&clamp));
         overlay.set_child(Some(&scrolled));
 
@@ -1853,6 +1890,7 @@ impl HangarWindow {
 
         let scrolled = gtk4::ScrolledWindow::new();
         scrolled.set_vexpand(true);
+        scrolled.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
         scrolled.set_child(Some(&clamp));
         overlay.set_child(Some(&scrolled));
 
@@ -2007,6 +2045,7 @@ impl HangarWindow {
 
         let scrolled = gtk4::ScrolledWindow::new();
         scrolled.set_vexpand(true);
+        scrolled.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
         scrolled.set_child(Some(&clamp));
         overlay.set_child(Some(&scrolled));
 
@@ -2178,6 +2217,7 @@ impl HangarWindow {
         // Scrollable content for entire profile
         let scrolled = gtk4::ScrolledWindow::new();
         scrolled.set_vexpand(true);
+        scrolled.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
 
         let scroll_content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
 
@@ -2347,12 +2387,14 @@ impl HangarWindow {
         let name_label = gtk4::Label::new(None);
         name_label.add_css_class("title-1");
         name_label.set_halign(gtk4::Align::Start);
+        name_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         info_box.append(&name_label);
 
         // Handle
         let handle_label = gtk4::Label::new(None);
         handle_label.add_css_class("dim-label");
         handle_label.set_halign(gtk4::Align::Start);
+        handle_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         info_box.append(&handle_label);
 
         // Bio/description
@@ -2631,6 +2673,7 @@ impl HangarWindow {
 
         let scrolled = gtk4::ScrolledWindow::new();
         scrolled.set_vexpand(true);
+        scrolled.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
         scrolled.set_child(Some(&clamp));
         overlay.set_child(Some(&scrolled));
 
@@ -2849,6 +2892,7 @@ impl HangarWindow {
 
         let scrolled = gtk4::ScrolledWindow::new();
         scrolled.set_vexpand(true);
+        scrolled.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
         scrolled.set_child(Some(&clamp));
         overlay.set_child(Some(&scrolled));
 
@@ -2972,20 +3016,14 @@ impl HangarWindow {
 
     // ======== Settings Page ========
 
-    fn build_settings_page(&self) -> gtk4::Box {
+    fn build_settings_page(&self) -> adw::ToolbarView {
         use crate::state::AppSettings;
-
-        let outer_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-        outer_box.set_hexpand(true);
-        outer_box.set_vexpand(true);
 
         // Header bar with back button and "Settings" title
         let header = adw::HeaderBar::new();
         header.set_show_start_title_buttons(false);
         header.set_show_end_title_buttons(false);
-        let title = gtk4::Label::new(Some("Settings"));
-        title.add_css_class("title");
-        header.set_title_widget(Some(&title));
+        header.set_title_widget(Some(&adw::WindowTitle::new("Settings", "")));
 
         // Back button
         let back_btn = gtk4::Button::from_icon_name("go-previous-symbolic");
@@ -3002,9 +3040,8 @@ impl HangarWindow {
 
         let window_controls = gtk4::WindowControls::new(gtk4::PackType::End);
         header.pack_end(&window_controls);
-        outer_box.append(&header);
 
-        // Split layout: sidebar list on the left, content stack on the right
+        // Split layout: category list on the left, one page per category right
         let split_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
         split_box.set_vexpand(true);
 
@@ -3023,37 +3060,65 @@ impl HangarWindow {
         sidebar_list.add_css_class("navigation-sidebar");
         sidebar_list.update_property(&[gtk4::accessible::Property::Label("Settings categories")]);
 
-        // Category entries: (id, label, icon)
-        let categories: &[(&str, &str, &str)] = &[
-            (
-                "display",
-                "Display",
-                "preferences-desktop-appearance-symbolic",
-            ),
-            (
-                "accessibility",
-                "Accessibility",
-                "preferences-desktop-accessibility-symbolic",
-            ),
-            ("account", "Account", "avatar-default-symbolic"),
+        // ---- Content stack ----
+        let content_stack = adw::ViewStack::new();
+        content_stack.set_hexpand(true);
+        content_stack.set_vexpand(true);
+
+        // Load current settings once
+        let current_settings = AppSettings::load();
+
+        // Sidebar order. Feed leads because the timeline is what the app mostly
+        // is, and Account trails because it is mostly links out to the website.
+        let pages = [
+            self.build_settings_feed_page(&current_settings),
+            self.build_settings_display_page(&current_settings),
+            self.build_settings_accessibility_page(&current_settings),
+            self.build_settings_account_page(),
         ];
 
-        for &(id, label, icon_name) in categories {
+        for page in &pages {
+            // An AdwPreferencesPage carries its own name, title and icon, so the
+            // sidebar row and the stack page it selects are built from one
+            // source and cannot drift apart the way two parallel arrays would.
+            //
+            // The cost of that is that a `build_settings_*_page` which forgets
+            // `set_name` or `set_icon_name` compiles, runs, and quietly drops
+            // its whole category out of both the sidebar and the stack. Skipping
+            // it silently is precisely how the next reshuffle of this page loses
+            // a setting, so say so instead — loudly in a debug build, and in the
+            // log in a release one, where the category is still missing but at
+            // least leaves a trace.
+            let (Some(name), Some(icon_name)) = (page.name(), page.icon_name()) else {
+                debug_assert!(
+                    false,
+                    "settings page \"{}\" has no name or no icon and cannot be shown",
+                    page.title()
+                );
+                eprintln!(
+                    "hangar: settings page \"{}\" has no name or no icon and was not added",
+                    page.title()
+                );
+                continue;
+            };
+            let label = page.title();
+            content_stack.add_titled_with_icon(page, Some(&name), &label, &icon_name);
+
             let row = gtk4::ListBoxRow::new();
-            row.set_widget_name(id);
+            row.set_widget_name(&name);
             let row_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
             row_box.set_margin_top(8);
             row_box.set_margin_bottom(8);
             row_box.set_margin_start(12);
             row_box.set_margin_end(12);
-            let icon = gtk4::Image::from_icon_name(icon_name);
+            let icon = gtk4::Image::from_icon_name(&icon_name);
             icon.set_pixel_size(18);
             row_box.append(&icon);
-            let lbl = gtk4::Label::new(Some(label));
+            let lbl = gtk4::Label::new(Some(&label));
             lbl.set_halign(gtk4::Align::Start);
             row_box.append(&lbl);
             row.set_child(Some(&row_box));
-            row.update_property(&[gtk4::accessible::Property::Label(label)]);
+            row.update_property(&[gtk4::accessible::Property::Label(&label)]);
             sidebar_list.append(&row);
         }
 
@@ -3063,38 +3128,8 @@ impl HangarWindow {
         // Separator between sidebar and content
         let separator = gtk4::Separator::new(gtk4::Orientation::Vertical);
 
-        // ---- Content stack ----
-        let content_stack = gtk4::Stack::new();
-        content_stack.set_transition_type(gtk4::StackTransitionType::Crossfade);
-        content_stack.set_transition_duration(150);
-        content_stack.set_hexpand(true);
-        content_stack.set_vexpand(true);
-
-        // Load current settings once
-        let current_settings = AppSettings::load();
-
-        // Display page (in a ScrolledWindow)
-        let display_scrolled = gtk4::ScrolledWindow::new();
-        display_scrolled.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
-        let display_page = self.build_settings_display_tab(&current_settings);
-        display_scrolled.set_child(Some(&display_page));
-        content_stack.add_named(&display_scrolled, Some("display"));
-
-        // Accessibility page (in a ScrolledWindow)
-        let a11y_scrolled = gtk4::ScrolledWindow::new();
-        a11y_scrolled.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
-        let a11y_page = self.build_settings_accessibility_tab(&current_settings);
-        a11y_scrolled.set_child(Some(&a11y_page));
-        content_stack.add_named(&a11y_scrolled, Some("accessibility"));
-
-        // Account page (in a ScrolledWindow)
-        let account_scrolled = gtk4::ScrolledWindow::new();
-        account_scrolled.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
-        let account_page = self.build_settings_account_tab();
-        account_scrolled.set_child(Some(&account_page));
-        content_stack.add_named(&account_scrolled, Some("account"));
-
-        // Wire sidebar selection to content stack
+        // Selection rather than activation, so arrowing through the categories
+        // shows each one without needing a second keypress.
         let stack_ref = content_stack.clone();
         sidebar_list.connect_row_selected(move |_, row| {
             if let Some(row) = row {
@@ -3111,30 +3146,82 @@ impl HangarWindow {
         split_box.append(&sidebar_scrolled);
         split_box.append(&separator);
         split_box.append(&content_stack);
-        outer_box.append(&split_box);
 
-        outer_box
+        // ToolbarView rather than a plain Box, so the header picks up the
+        // shading that says the page under it has scrolled.
+        let toolbar = adw::ToolbarView::new();
+        toolbar.add_top_bar(&header);
+        toolbar.set_content(Some(&split_box));
+        toolbar
     }
 
-    /// Build the Display tab contents for the settings page
-    fn build_settings_display_tab(
+    /// Build the Feed category of the settings page
+    fn build_settings_feed_page(
         &self,
         current_settings: &crate::state::AppSettings,
-    ) -> gtk4::Box {
+    ) -> adw::PreferencesPage {
+        let page = adw::PreferencesPage::new();
+        page.set_name(Some("feed"));
+        page.set_title("Feed");
+        page.set_icon_name(Some("view-list-symbolic"));
+
+        let feed_group = adw::PreferencesGroup::new();
+        feed_group.set_title("Timeline");
+        feed_group.set_description(Some(
+            "Controls what appears in your main timeline. Threads, profiles and likes are unaffected.",
+        ));
+
+        let hide_replies_row = adw::ActionRow::builder()
+            .title("Hide Replies")
+            .subtitle("Show only top-level posts, the way bsky.app does")
+            .build();
+
+        let hide_replies_switch = gtk4::Switch::new();
+        hide_replies_switch.set_valign(gtk4::Align::Center);
+        hide_replies_switch.set_active(current_settings.hide_replies_in_feed);
+        hide_replies_switch.set_tooltip_text(Some("Toggle replies in the main feed"));
+        hide_replies_switch
+            .update_property(&[gtk4::accessible::Property::Label("Hide replies in feed")]);
+
+        let window_weak = self.downgrade();
+        hide_replies_switch.connect_state_set(move |_switch, state| {
+            let mut settings = crate::state::AppSettings::load();
+            settings.hide_replies_in_feed = state;
+            if let Err(e) = settings.save() {
+                eprintln!("Failed to save settings: {e}");
+            }
+
+            // Every other switch on these pages applies as you flip it. This
+            // one used to only write the file: `filter_feed_posts` runs as a
+            // batch goes into the model, so the timeline kept whatever it was
+            // built with until the next fetch, and turning replies back on did
+            // nothing visible at all. Refetch so the setting means something
+            // before the user has left the page.
+            if let Some(window) = window_weak.upgrade() {
+                window.refresh_feed();
+            }
+            glib::Propagation::Proceed
+        });
+
+        hide_replies_row.add_suffix(&hide_replies_switch);
+        hide_replies_row.set_activatable_widget(Some(&hide_replies_switch));
+        feed_group.add(&hide_replies_row);
+
+        page.add(&feed_group);
+        page
+    }
+
+    /// Build the Display category of the settings page
+    fn build_settings_display_page(
+        &self,
+        current_settings: &crate::state::AppSettings,
+    ) -> adw::PreferencesPage {
         use crate::state::FontSize;
 
-        let page_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-        page_box.set_vexpand(true);
-
-        // Settings content with clamp for proper width
-        let clamp = adw::Clamp::new();
-        clamp.set_maximum_size(600);
-        clamp.set_margin_top(16);
-        clamp.set_margin_bottom(16);
-        clamp.set_margin_start(16);
-        clamp.set_margin_end(16);
-
-        let settings_box = gtk4::Box::new(gtk4::Orientation::Vertical, 24);
+        let page = adw::PreferencesPage::new();
+        page.set_name(Some("display"));
+        page.set_title("Display");
+        page.set_icon_name(Some("preferences-desktop-appearance-symbolic"));
 
         // ---- Appearance section ----
         let appearance_group = adw::PreferencesGroup::new();
@@ -3175,7 +3262,7 @@ impl HangarWindow {
         });
 
         appearance_group.add(&scheme_row);
-        settings_box.append(&appearance_group);
+        page.add(&appearance_group);
 
         // ---- Post Text Size section ----
         let display_group = adw::PreferencesGroup::new();
@@ -3304,7 +3391,7 @@ impl HangarWindow {
         display_box.append(&scale);
         display_box.append(&preview_frame);
         display_group.add(&display_box);
-        settings_box.append(&display_group);
+        page.add(&display_group);
 
         // Handle slider value changes
         let window_weak = self.downgrade();
@@ -3330,60 +3417,20 @@ impl HangarWindow {
             }
         });
 
-        clamp.set_child(Some(&settings_box));
-        page_box.append(&clamp);
-        page_box
+        page
     }
 
-    /// Build the Accessibility tab contents for the settings page
-    fn build_settings_accessibility_tab(
+    /// Build the Accessibility category of the settings page
+    fn build_settings_accessibility_page(
         &self,
         current_settings: &crate::state::AppSettings,
-    ) -> gtk4::Box {
-        let page_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-        page_box.set_vexpand(true);
-
-        let clamp = adw::Clamp::new();
-        clamp.set_maximum_size(600);
-        clamp.set_margin_top(16);
-        clamp.set_margin_bottom(16);
-        clamp.set_margin_start(16);
-        clamp.set_margin_end(16);
-
-        let settings_box = gtk4::Box::new(gtk4::Orientation::Vertical, 24);
+    ) -> adw::PreferencesPage {
+        let page = adw::PreferencesPage::new();
+        page.set_name(Some("accessibility"));
+        page.set_title("Accessibility");
+        page.set_icon_name(Some("preferences-desktop-accessibility-symbolic"));
 
         // ---- Motion section ----
-        let feed_group = adw::PreferencesGroup::new();
-        feed_group.set_title("Feed");
-        feed_group.set_description(Some(
-            "Controls what appears in your main timeline. Threads, profiles and likes are unaffected.",
-        ));
-
-        let hide_replies_row = adw::ActionRow::builder()
-            .title("Hide Replies")
-            .subtitle("Show only top-level posts, the way bsky.app does")
-            .build();
-
-        let hide_replies_switch = gtk4::Switch::new();
-        hide_replies_switch.set_valign(gtk4::Align::Center);
-        hide_replies_switch.set_active(current_settings.hide_replies_in_feed);
-        hide_replies_switch.set_tooltip_text(Some("Toggle replies in the main feed"));
-        hide_replies_switch
-            .update_property(&[gtk4::accessible::Property::Label("Hide replies in feed")]);
-
-        hide_replies_switch.connect_state_set(move |_switch, state| {
-            let mut settings = crate::state::AppSettings::load();
-            settings.hide_replies_in_feed = state;
-            if let Err(e) = settings.save() {
-                eprintln!("Failed to save settings: {e}");
-            }
-            glib::Propagation::Proceed
-        });
-
-        hide_replies_row.add_suffix(&hide_replies_switch);
-        hide_replies_row.set_activatable_widget(Some(&hide_replies_switch));
-        feed_group.add(&hide_replies_row);
-
         let motion_group = adw::PreferencesGroup::new();
         motion_group.set_title("Motion");
         motion_group.set_description(Some(
@@ -3419,27 +3466,17 @@ impl HangarWindow {
         reduce_motion_row.add_suffix(&reduce_motion_switch);
         reduce_motion_row.set_activatable_widget(Some(&reduce_motion_switch));
         motion_group.add(&reduce_motion_row);
-        settings_box.append(&feed_group);
-        settings_box.append(&motion_group);
+        page.add(&motion_group);
 
-        clamp.set_child(Some(&settings_box));
-        page_box.append(&clamp);
-        page_box
+        page
     }
 
-    /// Build the Account tab contents for the settings page
-    fn build_settings_account_tab(&self) -> gtk4::Box {
-        let page_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-        page_box.set_vexpand(true);
-
-        let clamp = adw::Clamp::new();
-        clamp.set_maximum_size(600);
-        clamp.set_margin_top(16);
-        clamp.set_margin_bottom(16);
-        clamp.set_margin_start(16);
-        clamp.set_margin_end(16);
-
-        let settings_box = gtk4::Box::new(gtk4::Orientation::Vertical, 24);
+    /// Build the Account category of the settings page
+    fn build_settings_account_page(&self) -> adw::PreferencesPage {
+        let page = adw::PreferencesPage::new();
+        page.set_name(Some("account"));
+        page.set_title("Account");
+        page.set_icon_name(Some("avatar-default-symbolic"));
 
         // ---- Content & Safety section ----
         let safety_group = adw::PreferencesGroup::new();
@@ -3455,8 +3492,12 @@ impl HangarWindow {
         safety_row.update_property(&[gtk4::accessible::Property::Label(
             "Content Filtering (opens in browser)",
         )]);
-        safety_row.connect_activated(|_| {
-            let _ = open::that("https://bsky.app/settings/content-and-media");
+        safety_row.connect_activated(|row| {
+            crate::ui::external::open_url(
+                row,
+                "https://bsky.app/settings/content-and-media",
+                "content filtering",
+            );
         });
         safety_group.add(&safety_row);
 
@@ -3469,12 +3510,15 @@ impl HangarWindow {
         moderation_row.update_property(&[gtk4::accessible::Property::Label(
             "Moderation (opens in browser)",
         )]);
-        moderation_row.connect_activated(|_| {
-            let _ = open::that("https://bsky.app/moderation");
+        moderation_row.connect_activated(|row| {
+            crate::ui::external::open_url(
+                row,
+                "https://bsky.app/moderation",
+                "moderation settings",
+            );
         });
         safety_group.add(&moderation_row);
-
-        settings_box.append(&safety_group);
+        page.add(&safety_group);
 
         // ---- Data section ----
         let data_group = adw::PreferencesGroup::new();
@@ -3510,18 +3554,24 @@ impl HangarWindow {
 
         cache_row.add_suffix(&cache_btn);
         data_group.add(&cache_row);
-        settings_box.append(&data_group);
+        page.add(&data_group);
 
-        clamp.set_child(Some(&settings_box));
-        page_box.append(&clamp);
-        page_box
+        page
     }
 
     /// Show the settings page (top-level navigation, instant switch)
     pub fn show_settings_page(&self) {
-        // Remember current page so back button can return to it
+        // Remember current page so back button can return to it.
+        //
+        // Unless settings is already what is showing: the Settings item lives in
+        // the sidebar's account popover, which stays clickable while the page is
+        // up, and picking it a second time used to record "settings" as the page
+        // to go back to. The back arrow then returned to settings, which reads
+        // as a dead button.
         if let Some(stack) = self.imp().main_stack.borrow().as_ref() {
-            if let Some(name) = stack.visible_child_name() {
+            if let Some(name) = stack.visible_child_name()
+                && name != "settings"
+            {
                 self.imp().previous_page.replace(Some(name.to_string()));
             }
         }
@@ -3533,7 +3583,9 @@ impl HangarWindow {
             }
         }
 
-        self.switch_to_page("settings");
+        // Not a section switch: whatever the user was reading has to be there
+        // still when they come back out.
+        self.show_page("settings");
     }
 
     /// Leave settings and return to the previous page
@@ -3557,12 +3609,18 @@ impl HangarWindow {
                 "search" => Some(crate::ui::sidebar::NavItem::Search),
                 _ => Some(crate::ui::sidebar::NavItem::Home),
             };
+            // Selecting a row programmatically does not emit `row-activated`,
+            // which is what `connect_nav_changed` listens on, so this does not
+            // loop back round into a section switch that would pop the stack.
             if let Some(item) = nav_item {
                 sidebar.select_nav_item(item);
             }
         }
 
-        self.switch_to_page(&previous);
+        // `show_page`, not `switch_to_page`: returning from settings is not a
+        // section switch, so a thread or profile the user opened settings from
+        // has to survive the trip.
+        self.show_page(&previous);
     }
 
     /// Apply a font size setting by updating the dynamic CSS provider
@@ -3778,6 +3836,9 @@ mod mention_row {
             let reason_label = gtk4::Label::new(None);
             reason_label.add_css_class("dim-label");
             reason_label.add_css_class("caption");
+            // Unrecognised reasons fall through to the raw string off the wire,
+            // so this is not a closed set of short words we control.
+            reason_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
             header_box.append(&reason_label);
 
             let name_label = gtk4::Label::new(None);

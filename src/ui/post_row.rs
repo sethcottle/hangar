@@ -177,6 +177,14 @@ impl PostRow {
         let repost_label = gtk4::Label::new(None);
         repost_label.add_css_class("dim-label");
         repost_label.add_css_class("caption");
+        // A label with neither wrap nor ellipsize reports the full pixel width
+        // of its text as its *minimum*, and a minimum travels out through
+        // ListView, AdwClamp and Viewport untouched -- the clamp caps natural
+        // width only. So one long display name, in any row the ListView has
+        // bound rather than any row on screen, widens the entire feed past the
+        // window. Every label in this file carrying text off the wire is
+        // ellipsized for that reason.
+        repost_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         repost_btn_content.append(&repost_label);
         repost_btn.set_child(Some(&repost_btn_content));
         repost_row.append(&repost_btn);
@@ -256,6 +264,7 @@ impl PostRow {
         let reply_handle_label = gtk4::Label::new(None);
         reply_handle_label.add_css_class("caption");
         reply_handle_label.add_css_class("link-label");
+        reply_handle_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         reply_indicator.set_child(Some(&reply_handle_label));
         reply_indicator_box.append(&reply_indicator);
 
@@ -278,7 +287,7 @@ impl PostRow {
 
         // Handle link clicks (URLs, @mentions, #hashtags)
         let post_row_for_links = self.clone();
-        content.connect_activate_link(move |_, uri| {
+        content.connect_activate_link(move |label, uri| {
             if uri.starts_with("bsky-mention://") {
                 // Handle @mention click - navigate to profile
                 let handle = uri.strip_prefix("bsky-mention://").unwrap_or("");
@@ -294,7 +303,7 @@ impl PostRow {
                 glib::Propagation::Stop
             } else {
                 // Regular URL - open in browser
-                let _ = open::that(uri);
+                crate::ui::external::open_url(label, uri, "link");
                 glib::Propagation::Stop
             }
         });
@@ -1001,9 +1010,7 @@ impl PostRow {
                 if let Some(p) = &popover_clone {
                     p.popdown();
                 }
-                // Copy to clipboard
-                let display = btn.display();
-                display.clipboard().set_text(&url);
+                crate::ui::external::copy_text(btn, &url, "Link to post");
             });
         }
 
@@ -1011,11 +1018,11 @@ impl PostRow {
         if let Some(open_item) = imp.open_link_item.borrow().as_ref() {
             let url = post_url;
             let popover_clone = popover;
-            open_item.connect_clicked(move |_| {
+            open_item.connect_clicked(move |btn| {
                 if let Some(p) = &popover_clone {
                     p.popdown();
                 }
-                let _ = open::that(&url);
+                crate::ui::external::open_url(btn, &url, "post");
             });
         }
     }
@@ -1280,6 +1287,9 @@ impl PostRow {
                 domain_label.set_halign(gtk4::Align::Start);
                 domain_label.add_css_class("dim-label");
                 domain_label.add_css_class("caption");
+                // The card's title and description already ellipsize, so an
+                // unconstrained domain is the whole card's minimum width.
+                domain_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
                 domain_row.append(&domain_label);
                 text_box.append(&domain_row);
             }
@@ -1290,8 +1300,8 @@ impl PostRow {
 
         // Open link in browser when clicked
         let url = ext.uri.clone();
-        card_btn.connect_clicked(move |_| {
-            let _ = open::that(&url);
+        card_btn.connect_clicked(move |btn| {
+            crate::ui::external::open_url(btn, &url, "link");
         });
 
         container.append(&card_btn);
@@ -1377,11 +1387,13 @@ impl PostRow {
         let name_label = gtk4::Label::new(Some(author_name));
         name_label.add_css_class("heading");
         name_label.add_css_class("caption");
+        name_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         author_row.append(&name_label);
 
         let handle_label = gtk4::Label::new(Some(&format!("@{}", quote.author.handle)));
         handle_label.add_css_class("dim-label");
         handle_label.add_css_class("caption");
+        handle_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         author_row.append(&handle_label);
 
         let dot = gtk4::Label::new(Some("·"));

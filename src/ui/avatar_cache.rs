@@ -9,11 +9,21 @@ use gtk4::gdk;
 use gtk4::glib;
 use libadwaita as adw;
 use once_cell::sync::Lazy;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 /// Maximum concurrent downloads
 const MAX_CONCURRENT: usize = 8;
+
+/// How often a waiting widget looks to see whether its bytes have landed.
+///
+/// The fetch happens on another runtime and has no way to reach into GTK, so
+/// the main thread asks. One frame at 60Hz is fast enough that an image out of
+/// the memory cache still looks instant.
+const POLL_INTERVAL: Duration = Duration::from_millis(16);
 
 /// In-memory cache for loaded images (URL → bytes)
 static AVATAR_CACHE: Lazy<Arc<RwLock<HashMap<String, Vec<u8>>>>> =
@@ -51,14 +61,22 @@ fn apply_avatar_bytes(avatar: &adw::Avatar, bytes: &[u8]) {
     }
 }
 
-fn apply_bytes_to_picture(picture: &gtk4::Picture, bytes: &[u8]) {
+/// Decode `bytes` onto `picture`, reporting whether anything was drawn.
+///
+/// Bytes that arrived intact but are in a format this system has no loader for
+/// are a failed load, not a successful one: callers that go on to act on "the
+/// image on screen" have to be able to tell the difference.
+fn apply_bytes_to_picture(picture: &gtk4::Picture, bytes: &[u8]) -> bool {
     let glib_bytes = glib::Bytes::from(bytes);
     let stream = gtk4::gio::MemoryInputStream::from_bytes(&glib_bytes);
 
-    if let Ok(pixbuf) = gdk::gdk_pixbuf::Pixbuf::from_stream(&stream, gtk4::gio::Cancellable::NONE)
-    {
-        let texture = gdk::Texture::for_pixbuf(&pixbuf);
-        picture.set_paintable(Some(&texture));
+    match gdk::gdk_pixbuf::Pixbuf::from_stream(&stream, gtk4::gio::Cancellable::NONE) {
+        Ok(pixbuf) => {
+            let texture = gdk::Texture::for_pixbuf(&pixbuf);
+            picture.set_paintable(Some(&texture));
+            true
+        }
+        Err(_) => false,
     }
 }
 
@@ -131,6 +149,19 @@ fn spawn_fetch_if_needed(url: &str) -> bool {
     true
 }
 
+/// The bytes fetched for `url`, if its fetch has already finished.
+///
+/// Callers hand over the same URL they gave `load_image_into_picture`: the JPEG
+/// normalisation that decides the cache key happens in here, so a caller that
+/// looked up the raw URL itself would miss every CDN image.
+pub fn cached_bytes(url: &str) -> Option<Vec<u8>> {
+    AVATAR_CACHE
+        .read()
+        .unwrap()
+        .get(&ensure_jpeg_format(url))
+        .cloned()
+}
+
 /// Load an avatar image from URL
 pub fn load_avatar(avatar: adw::Avatar, url: String) {
     let url = ensure_jpeg_format(&url);
@@ -163,32 +194,150 @@ pub fn load_avatar(avatar: adw::Avatar, url: String) {
     });
 }
 
-/// Load an image into a Picture widget
+/// How a load into a `Picture` ended.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ImageLoadResult {
+    /// The bytes arrived, decoded, and are on the widget now.
+    Shown,
+    /// The fetch failed, or what came back was not an image this system can
+    /// decode. The widget was not touched.
+    Failed,
+}
+
+/// Shared between the handle and the poll it owns.
+#[derive(Default)]
+struct LoadState {
+    cancelled: Cell<bool>,
+    /// `Some` only while the poll is installed. The poll clears it before it
+    /// finishes so [`ImageLoad::drop`] never removes a source that is already
+    /// on its way out.
+    source: RefCell<Option<glib::SourceId>>,
+}
+
+/// A load that is still running.
+///
+/// Dropping it abandons the load: the poll is removed, the widget is left
+/// exactly as its owner last set it, and the completion callback never runs.
+///
+/// That is what makes one `Picture` safe to reuse for several images. Without
+/// it, paging through a gallery leaves one poll per image alive, each holding a
+/// strong reference to the same widget and each calling `set_paintable`
+/// whenever its own bytes happen to land — so the picture ends up showing
+/// whichever image was slowest, regardless of which one the reader is on. It is
+/// also what stops a poll outliving the dialog whose picture it holds.
+#[must_use = "the load is cancelled the moment this handle is dropped"]
+pub struct ImageLoad {
+    state: Rc<LoadState>,
+    cancel_on_drop: bool,
+}
+
+impl ImageLoad {
+    /// Let the load finish on its own.
+    ///
+    /// For a widget that is only ever asked to show one image and lives at
+    /// least as long as it is worth waiting for -- a feed thumbnail -- where
+    /// there is nothing a handle could usefully be cancelled against.
+    pub fn detach(mut self) {
+        self.cancel_on_drop = false;
+    }
+}
+
+impl Drop for ImageLoad {
+    fn drop(&mut self) {
+        if !self.cancel_on_drop {
+            return;
+        }
+        self.state.cancelled.set(true);
+        if let Some(id) = self.state.source.borrow_mut().take() {
+            id.remove();
+        }
+    }
+}
+
+/// Load an image into a Picture widget.
+///
+/// Fire and forget: use [`load_image_into_picture_tracked`] where the same
+/// widget can be asked for a different image before this one arrives.
 pub fn load_image_into_picture(picture: gtk4::Picture, url: String) {
+    start_picture_load(picture, url, None).detach();
+}
+
+/// Load an image into a Picture widget, keeping hold of the load.
+///
+/// `on_done` is called exactly once unless the returned handle is dropped
+/// first. It runs inline when the bytes are already in the memory cache, so a
+/// caller must have the widget in the state it wants before it calls this.
+pub fn load_image_into_picture_tracked(
+    picture: gtk4::Picture,
+    url: String,
+    on_done: impl Fn(ImageLoadResult) + 'static,
+) -> ImageLoad {
+    start_picture_load(picture, url, Some(Box::new(on_done)))
+}
+
+type DoneCallback = Box<dyn Fn(ImageLoadResult)>;
+
+fn start_picture_load(
+    picture: gtk4::Picture,
+    url: String,
+    on_done: Option<DoneCallback>,
+) -> ImageLoad {
     let url = ensure_jpeg_format(&url);
+    let state = Rc::new(LoadState::default());
+    let handle = ImageLoad {
+        state: Rc::clone(&state),
+        cancel_on_drop: true,
+    };
 
     // Check memory cache first — instant hit
     if let Some(cached) = AVATAR_CACHE.read().unwrap().get(&url).cloned() {
-        apply_bytes_to_picture(&picture, &cached);
-        return;
+        let result = decode_result(&picture, &cached);
+        if let Some(done) = &on_done {
+            done(result);
+        }
+        return handle;
     }
 
     // Kick off a fetch if not already in progress (deduplicates)
     spawn_fetch_if_needed(&url);
 
     // Poll the cache on the GTK main thread until the image arrives
-    let poll_url = url.clone();
-    glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
-        if let Some(bytes) = AVATAR_CACHE.read().unwrap().get(&poll_url).cloned() {
-            apply_bytes_to_picture(&picture, &bytes);
-            glib::ControlFlow::Break
-        } else {
-            let still_in_flight = IN_FLIGHT.read().unwrap().contains(&poll_url);
-            if still_in_flight {
-                glib::ControlFlow::Continue
-            } else {
-                glib::ControlFlow::Break
-            }
+    let poll_state = Rc::clone(&state);
+    let id = glib::timeout_add_local(POLL_INTERVAL, move || {
+        if poll_state.cancelled.get() {
+            return glib::ControlFlow::Break;
         }
+
+        let cached = AVATAR_CACHE.read().unwrap().get(&url).cloned();
+        let result = match cached {
+            Some(bytes) => decode_result(&picture, &bytes),
+            // The fetch inserts into the cache before it clears the in-flight
+            // mark, so "not cached and not in flight" is a fetch that finished
+            // with nothing — a 404, a timeout, a refused connection.
+            None if IN_FLIGHT.read().unwrap().contains(&url) => {
+                return glib::ControlFlow::Continue;
+            }
+            None => ImageLoadResult::Failed,
+        };
+
+        // Retire the source before the callback runs: `on_done` is allowed to
+        // drop the handle, and `Drop` must not try to remove a source that is
+        // finishing anyway.
+        poll_state.source.borrow_mut().take();
+        if let Some(done) = &on_done {
+            done(result);
+        }
+        glib::ControlFlow::Break
     });
+    state.source.replace(Some(id));
+
+    handle
+}
+
+fn decode_result(picture: &gtk4::Picture, bytes: &[u8]) -> ImageLoadResult {
+    if apply_bytes_to_picture(picture, bytes) {
+        ImageLoadResult::Shown
+    } else {
+        ImageLoadResult::Failed
+    }
 }
