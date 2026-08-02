@@ -46,7 +46,7 @@ impl FileSessionStore {
     fn store_path() -> PathBuf {
         let config_dir = dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
-            .join("io.github.sethcottle.Hangar");
+            .join(crate::config::APP_ID);
         let _ = std::fs::create_dir_all(&config_dir);
         config_dir.join("oauth-sessions.json")
     }

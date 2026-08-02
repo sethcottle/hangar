@@ -276,7 +276,7 @@ glib::wrapper! {
 impl HangarApplication {
     pub fn new() -> Self {
         glib::Object::builder()
-            .property("application-id", "io.github.sethcottle.Hangar")
+            .property("application-id", config::APP_ID)
             .property("flags", gio::ApplicationFlags::FLAGS_NONE)
             .build()
     }

@@ -112,7 +112,7 @@ pub struct AppSettings {
 }
 
 impl AppSettings {
-    /// Get the settings file path (~/.config/io.github.sethcottle.Hangar/settings.json)
+    /// Get the settings file path (~/.config/<APP_ID>/settings.json)
     fn settings_path() -> Option<PathBuf> {
         dirs::config_dir().map(|mut p| {
             p.push(APP_ID);

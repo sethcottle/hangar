@@ -30,13 +30,9 @@ jobs:
           curl -sSL https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/master/cargo/flatpak-cargo-generator.py -o flatpak-cargo-generator.py
           python3 flatpak-cargo-generator.py Cargo.lock -o cargo-sources.json
 
-      - name: Patch manifest for nightly
+      - name: Apply nightly identity
         if: inputs.version == ''
-        run: |
-          # Build with devel feature for nightly
-          sed -i 's/cargo --offline build --release/cargo --offline build --release --features devel/' io.github.sethcottle.Hangar.yml
-          # Use devel icon for nightly
-          sed -i 's|assets/icons/io.github.sethcottle.Hangar.svg|assets/icons/io.github.sethcottle.Hangar.Devel.svg|' io.github.sethcottle.Hangar.yml
+        run: ./scripts/devel-identity.sh
 
       - name: Build Flatpak
         uses: flatpak/flatpak-github-actions/flatpak-builder@v6.7
@@ -87,23 +83,28 @@ jobs:
           curl -sSL https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh -o linuxdeploy-plugin-gtk.sh
           chmod +x linuxdeploy linuxdeploy-plugin-gtk.sh
 
+      - name: Determine app identity
+        id: identity
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            echo "app_id=io.github.sethcottle.Hangar" >> $GITHUB_OUTPUT
+          else
+            ./scripts/devel-identity.sh
+            echo "app_id=io.github.sethcottle.Hangar.Devel" >> $GITHUB_OUTPUT
+          fi
+
       - name: Create AppDir structure
         run: |
+          APP_ID="${{ steps.identity.outputs.app_id }}"
           mkdir -p AppDir/usr/bin
           mkdir -p AppDir/usr/share/applications
           mkdir -p AppDir/usr/share/icons/hicolor/scalable/apps
           mkdir -p AppDir/usr/share/metainfo
 
           cp target/release/hangar AppDir/usr/bin/
-          cp data/io.github.sethcottle.Hangar.desktop AppDir/usr/share/applications/
-          cp data/io.github.sethcottle.Hangar.metainfo.xml AppDir/usr/share/metainfo/
-
-          # Use devel icon for nightly builds
-          if [ -n "${{ inputs.version }}" ]; then
-            cp assets/icons/io.github.sethcottle.Hangar.svg AppDir/usr/share/icons/hicolor/scalable/apps/
-          else
-            cp assets/icons/io.github.sethcottle.Hangar.Devel.svg AppDir/usr/share/icons/hicolor/scalable/apps/io.github.sethcottle.Hangar.svg
-          fi
+          cp "data/${APP_ID}.desktop" AppDir/usr/share/applications/
+          cp "data/${APP_ID}.metainfo.xml" AppDir/usr/share/metainfo/
+          cp "assets/icons/${APP_ID}.svg" AppDir/usr/share/icons/hicolor/scalable/apps/
 
       - name: Determine update channel
         id: update-channel
@@ -116,12 +117,13 @@ jobs:
 
       - name: Build AppImage
         run: |
+          APP_ID="${{ steps.identity.outputs.app_id }}"
           export DEPLOY_GTK_VERSION=4
           export UPDATE_INFORMATION="${{ steps.update-channel.outputs.update_info }}"
           ./linuxdeploy --appdir AppDir \
             --plugin gtk \
-            --desktop-file AppDir/usr/share/applications/io.github.sethcottle.Hangar.desktop \
-            --icon-file AppDir/usr/share/icons/hicolor/scalable/apps/io.github.sethcottle.Hangar.svg \
+            --desktop-file "AppDir/usr/share/applications/${APP_ID}.desktop" \
+            --icon-file "AppDir/usr/share/icons/hicolor/scalable/apps/${APP_ID}.svg" \
             --output appimage
 
       - name: Upload AppImage artifact
