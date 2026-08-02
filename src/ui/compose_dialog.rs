@@ -1295,29 +1295,48 @@ impl ComposeDialog {
         filter.add_mime_type("image/gif");
         filter.add_mime_type("image/webp");
 
-        let window = self.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
-
-        let chooser = gtk4::FileChooserNative::new(
-            Some("Select Image"),
-            window.as_ref(),
-            gtk4::FileChooserAction::Open,
-            Some("Open"),
-            Some("Cancel"),
-        );
-        chooser.add_filter(&filter);
-
-        let dialog_weak = self.downgrade();
-        chooser.connect_response(move |chooser, response| {
-            if response == gtk4::ResponseType::Accept
-                && let Some(file) = chooser.file()
-                && let Some(path) = file.path()
-                && let Some(dialog) = dialog_weak.upgrade()
-            {
-                dialog.load_image_from_path(&path);
-            }
+        self.choose_image(filter, |dialog, path| {
+            dialog.load_image_from_path(path);
         });
+    }
 
-        chooser.show();
+    /// Present the image picker and hand the chosen path to `on_chosen`.
+    ///
+    /// GtkFileDialog replaced GtkFileChooserNative in GTK 4.10. It reports the
+    /// outcome through a callback rather than a response signal, and closing
+    /// the picker without choosing arrives as DialogError::Dismissed, which is
+    /// ordinary user behaviour rather than something worth logging.
+    fn choose_image<F>(&self, filter: gtk4::FileFilter, on_chosen: F)
+    where
+        F: Fn(&ComposeDialog, &std::path::Path) + 'static,
+    {
+        let filters = gtk4::gio::ListStore::new::<gtk4::FileFilter>();
+        filters.append(&filter);
+
+        let file_dialog = gtk4::FileDialog::builder()
+            .title("Select Image")
+            .accept_label("Open")
+            .filters(&filters)
+            .default_filter(&filter)
+            .modal(true)
+            .build();
+
+        let window = self.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
+        let dialog_weak = self.downgrade();
+
+        file_dialog.open(
+            window.as_ref(),
+            gtk4::gio::Cancellable::NONE,
+            move |result| match result {
+                Ok(file) => {
+                    if let (Some(path), Some(dialog)) = (file.path(), dialog_weak.upgrade()) {
+                        on_chosen(&dialog, &path);
+                    }
+                }
+                Err(e) if e.matches(gtk4::DialogError::Dismissed) => {}
+                Err(e) => eprintln!("Image picker failed: {}", e),
+            },
+        );
     }
 
     /// Load an image file and add it to the compose image strip.
@@ -2505,29 +2524,9 @@ impl ComposeDialog {
         filter.add_mime_type("image/gif");
         filter.add_mime_type("image/webp");
 
-        let window = self.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
-
-        let chooser = gtk4::FileChooserNative::new(
-            Some("Select Image"),
-            window.as_ref(),
-            gtk4::FileChooserAction::Open,
-            Some("Open"),
-            Some("Cancel"),
-        );
-        chooser.add_filter(&filter);
-
-        let dialog_weak = self.downgrade();
-        chooser.connect_response(move |chooser, response| {
-            if response == gtk4::ResponseType::Accept
-                && let Some(file) = chooser.file()
-                && let Some(path) = file.path()
-                && let Some(dialog) = dialog_weak.upgrade()
-            {
-                dialog.load_thread_image(post_index, &path);
-            }
+        self.choose_image(filter, move |dialog, path| {
+            dialog.load_thread_image(post_index, path);
         });
-
-        chooser.show();
     }
 
     /// Load an image for a thread post.
