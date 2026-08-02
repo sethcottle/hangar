@@ -222,6 +222,17 @@ impl HangarClient {
             .map_err(|e| ClientError::Auth(format!("invalid DID: {e}")))?;
 
         let store = FileSessionStore::new();
+
+        // OAuthClient::restore reads the stored session without refreshing, so
+        // whatever token is on disk is what the first request goes out with.
+        // If the server has stopped honouring it the retry path will only
+        // refresh once our recorded expiry has passed, which can leave the
+        // session permanently broken across restarts. Drop the cached expiry
+        // so a rejected token can actually be replaced.
+        if let Err(e) = store.invalidate_cached_expiry(&did) {
+            eprintln!("hangar: could not reset stored token expiry: {e}");
+        }
+
         let oauth_client = OAuthManager::build_restore_client(store)
             .map_err(|e| ClientError::Auth(format!("failed to build OAuth client: {e}")))?;
 

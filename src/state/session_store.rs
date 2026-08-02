@@ -69,6 +69,36 @@ impl FileSessionStore {
         }
     }
 
+    /// Backdate a stored session's expiry so the next refresh actually runs.
+    ///
+    /// atrium-oauth refreshes lazily: on a DPoP `invalid_token` response it
+    /// calls into the session registry, which returns the cached session
+    /// untouched if `expires_at` is still in the future and only performs a
+    /// real refresh once the clock has passed it.
+    ///
+    /// That leaves no way out when the server rejects a token that has not
+    /// expired by our clock -- revoked, rotated, or bound to a DPoP key the
+    /// server no longer honours. The refresh is skipped, the retry replays the
+    /// same dead token, and restarting does not help because the session is
+    /// restored from this file without a refresh either. The app is stuck with
+    /// every authenticated call failing until the recorded expiry passes.
+    ///
+    /// Treating our cached expiry as untrustworthy costs nothing when the
+    /// token is good: no request fails, so no refresh is ever attempted. It
+    /// only matters when a call does come back rejected, and then it lets the
+    /// refresh do real work instead of short-circuiting.
+    pub fn invalidate_cached_expiry(&self, did: &Did) -> Result<(), StoreError> {
+        let mut guard = self.inner.lock().map_err(|_| StoreError::Lock)?;
+        let Some(session) = guard.get_mut(did) else {
+            return Ok(());
+        };
+        let past = chrono::Utc::now() - chrono::Duration::hours(1);
+        session.token_set.expires_at = Some(atrium_api::types::string::Datetime::new(
+            past.fixed_offset(),
+        ));
+        self.save_to_disk(&guard)
+    }
+
     fn save_to_disk(&self, sessions: &HashMap<Did, Session>) -> Result<(), StoreError> {
         // Convert Did keys to String for JSON serialization
         let string_map: HashMap<String, &Session> =
