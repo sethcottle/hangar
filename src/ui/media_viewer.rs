@@ -15,17 +15,16 @@ use libadwaita::prelude::*;
 use std::cell::Cell;
 use std::rc::Rc;
 
-/// Whether GTK has a media backend that can actually decode anything.
+/// How long to wait for a stream to become prepared before giving up on it.
 ///
-/// GtkMediaFile is backed by a loadable extension (libgtk-4-media-gstreamer on
-/// Debian and Ubuntu, gtk4-media-gstreamer on Fedora). It is a runtime
-/// dependency, not a build one, so it can be absent on a perfectly normal
-/// desktop. When it is, GTK falls back to GtkNothingMediaFile, which reports
-/// no error and simply shows black -- the type name is the only reliable
-/// signal that playback will not work.
-fn media_backend_available() -> bool {
-    gtk4::MediaFile::new().type_().name() != "GtkNothingMediaFile"
-}
+/// Nothing about a missing decoder is reported synchronously, and GTK 4.22
+/// ships a built-in GStreamer backend, so the media file type is always a real
+/// one even when the pipeline cannot handle the format. Bluesky serves HLS,
+/// whose demuxer lives in gst-plugins-bad and is frequently absent, and the
+/// resulting failure shows up as a stream that simply never prepares. Waiting
+/// on that is the only signal that covers both a missing demuxer and a stalled
+/// fetch.
+const PREPARE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
 
 /// Play a video embed in a dialog.
 ///
@@ -45,20 +44,6 @@ pub fn show_video(parent: &impl IsA<gtk4::Widget>, playlist_url: String, fallbac
         None => return,
     };
 
-    // Without a media backend GtkMediaFile silently becomes GTK's do-nothing
-    // implementation: it renders black and never reports an error, so waiting
-    // for a failure signal would leave the user staring at an empty dialog.
-    // Ask first instead.
-    if !media_backend_available() {
-        eprintln!(
-            "hangar: no GTK media backend, so video cannot play in app; opening in browser.\n  \
-             Install libgtk-4-media-gstreamer (Debian/Ubuntu) or gtk4-media-gstreamer \
-             (Fedora), plus gstreamer1.0-plugins-bad for HLS."
-        );
-        let _ = open::that(&fallback_url);
-        return;
-    }
-
     let dialog = adw::Dialog::new();
     dialog.set_title("Video");
     dialog.set_content_width(900);
@@ -76,14 +61,48 @@ pub fn show_video(parent: &impl IsA<gtk4::Widget>, playlist_url: String, fallbac
 
     // MediaStream reports failures through the error property rather than by
     // returning one, so watch it and fall back to the browser.
-    media.connect_error_notify({
+    // Guard against reporting failure twice: the error signal and the prepare
+    // timeout can both fire for the same stream.
+    let gave_up = Rc::new(Cell::new(false));
+
+    let fall_back = {
         let dialog = dialog.clone();
+        let media = media.clone();
         let fallback_url = fallback_url.clone();
+        let gave_up = gave_up.clone();
+        move |reason: String| {
+            if gave_up.replace(true) {
+                return;
+            }
+            eprintln!(
+                "hangar: {reason}; opening the post in your browser instead.\n  \
+                 In-app playback needs GStreamer with HLS support -- install \
+                 gstreamer1.0-plugins-bad (Debian/Ubuntu) or \
+                 gstreamer1-plugins-bad-free (Fedora)."
+            );
+            media.set_playing(false);
+            dialog.close();
+            let _ = open::that(&fallback_url);
+        }
+    };
+
+    media.connect_error_notify({
+        let fall_back = fall_back.clone();
         move |media| {
             if let Some(e) = media.error() {
-                eprintln!("hangar: could not play video in app ({e}); opening in browser");
-                dialog.close();
-                let _ = open::that(&fallback_url);
+                fall_back(format!("video playback failed ({e})"));
+            }
+        }
+    });
+
+    // A missing demuxer produces no error, just a stream that never prepares.
+    glib::timeout_add_local_once(PREPARE_TIMEOUT, {
+        let media = media.clone();
+        let gave_up = gave_up.clone();
+        let fall_back = fall_back.clone();
+        move || {
+            if !gave_up.get() && !media.is_prepared() {
+                fall_back("video could not be decoded".to_string());
             }
         }
     });

@@ -1092,7 +1092,21 @@ impl HangarWindow {
         // Save current scroll position before navigating
         self.save_scroll_position();
 
+        // Tag pages by what they show so revisiting one returns to it instead
+        // of stacking a second copy. A thread legitimately contains posts whose
+        // own threads are worth opening -- a quote with its own replies, say --
+        // but the same post should never appear twice in one stack. Suppressing
+        // the click on the focused row alone was not enough: the same post also
+        // renders as a parent row once you are inside a reply's thread, and
+        // that row is a perfectly ordinary link.
+        let tag = format!("thread:{}", post.uri);
+        if nav_view.find_page(&tag).is_some() {
+            nav_view.pop_to_tag(&tag);
+            return;
+        }
+
         let page = self.build_thread_page(post, thread_posts);
+        page.set_tag(Some(&tag));
         nav_view.push(&page);
     }
 
@@ -1106,7 +1120,17 @@ impl HangarWindow {
         // Save current scroll position before navigating
         self.save_scroll_position();
 
+        // Same treatment as threads. build_profile_page tagged every profile
+        // "profile", so opening a second one put two identically tagged pages
+        // in the stack, which AdwNavigationView does not allow.
+        let tag = format!("profile:{}", profile.did);
+        if nav_view.find_page(&tag).is_some() {
+            nav_view.pop_to_tag(&tag);
+            return;
+        }
+
         let page = self.build_profile_page(profile, posts);
+        page.set_tag(Some(&tag));
         nav_view.push(&page);
     }
 
@@ -1568,9 +1592,9 @@ impl HangarWindow {
         scrolled.set_child(Some(&clamp));
         content_box.append(&scrolled);
 
-        let page = adw::NavigationPage::new(&content_box, display_name);
-        page.set_tag(Some("profile"));
-        page
+        // The tag is set by push_profile_page, which derives it from the DID so
+        // two different profiles cannot collide.
+        adw::NavigationPage::new(&content_box, display_name)
     }
 
     /// Build the mentions page
