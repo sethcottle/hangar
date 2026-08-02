@@ -15,6 +15,65 @@ use libadwaita::prelude::*;
 use std::cell::Cell;
 use std::rc::Rc;
 
+/// Play a video embed in a dialog.
+///
+/// Bluesky serves video as an HLS playlist. Handing that URL to the browser is
+/// what produced a page of raw playlist text rather than a video, so play it
+/// here instead. GStreamer does the decoding, and HLS support lives in
+/// gst-plugins-bad, which is not guaranteed to be installed. When the pipeline
+/// reports an error the dialog closes and the post opens on the web, so the
+/// video is still reachable rather than silently doing nothing.
+pub fn show_video(parent: &impl IsA<gtk4::Widget>, playlist_url: String, fallback_url: String) {
+    let root = match parent
+        .as_ref()
+        .root()
+        .and_then(|r| r.downcast::<gtk4::Window>().ok())
+    {
+        Some(w) => w,
+        None => return,
+    };
+
+    let dialog = adw::Dialog::new();
+    dialog.set_title("Video");
+    dialog.set_content_width(900);
+    dialog.set_content_height(620);
+
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&adw::HeaderBar::new());
+
+    let media = gtk4::MediaFile::for_file(&gtk4::gio::File::for_uri(&playlist_url));
+    let video = gtk4::Video::new();
+    video.set_hexpand(true);
+    video.set_vexpand(true);
+    video.set_autoplay(true);
+    video.set_media_stream(Some(&media));
+
+    // MediaStream reports failures through the error property rather than by
+    // returning one, so watch it and fall back to the browser.
+    media.connect_error_notify({
+        let dialog = dialog.clone();
+        let fallback_url = fallback_url.clone();
+        move |media| {
+            if let Some(e) = media.error() {
+                eprintln!("hangar: could not play video in app ({e}); opening in browser");
+                dialog.close();
+                let _ = open::that(&fallback_url);
+            }
+        }
+    });
+
+    toolbar.set_content(Some(&video));
+    dialog.set_child(Some(&toolbar));
+
+    // Stop decoding when the dialog goes away, otherwise audio keeps playing.
+    dialog.connect_closed({
+        let media = media.clone();
+        move |_| media.set_playing(false)
+    });
+
+    dialog.present(Some(&root));
+}
+
 /// Present `images` at full size, starting on `start`.
 ///
 /// `parent` only needs to be some widget inside the window; the dialog finds

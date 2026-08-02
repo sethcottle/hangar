@@ -39,7 +39,6 @@ mod imp {
         /// The URI of the newest post we've shown the user (anchor for new posts detection)
         pub newest_post_uri: RefCell<Option<String>>,
         /// Pending new posts that arrived while user was scrolled away
-        pub pending_new_posts: RefCell<Vec<Post>>,
         /// Whether we're currently checking for new posts
         pub checking_new_posts: RefCell<bool>,
         /// The currently selected feed
@@ -718,7 +717,6 @@ impl HangarApplication {
                         app.imp().newest_post_uri.replace(Some(first.uri.clone()));
                     }
                     // Clear any pending new posts since we just refreshed
-                    app.imp().pending_new_posts.replace(Vec::new());
 
                     // Store in cache
                     if let Some(cache) = app.imp().cache.borrow().as_ref() {
@@ -1551,7 +1549,6 @@ impl HangarApplication {
         // Clear state
         self.imp().timeline_cursor.replace(None);
         self.imp().newest_post_uri.replace(None);
-        self.imp().pending_new_posts.replace(Vec::new());
 
         // Fetch the new feed
         self.fetch_current_feed();
@@ -1622,7 +1619,6 @@ impl HangarApplication {
                     if let Some(first) = posts.first() {
                         app.imp().newest_post_uri.replace(Some(first.uri.clone()));
                     }
-                    app.imp().pending_new_posts.replace(Vec::new());
 
                     // Store in cache
                     if let Some(cache) = app.imp().cache.borrow().as_ref() {

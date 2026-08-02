@@ -1323,10 +1323,19 @@ impl PostRow {
         play_btn.set_halign(gtk4::Align::Center);
         play_btn.set_valign(gtk4::Align::Center);
 
-        // Open video in browser when clicked
+        // Play in app, falling back to the post on the web if GStreamer cannot
+        // handle the HLS stream.
         let playlist_url = video.playlist.clone();
-        play_btn.connect_clicked(move |_| {
-            let _ = open::that(&playlist_url);
+        let post_row = self.clone();
+        play_btn.connect_clicked(move |btn| {
+            let fallback = post_row
+                .imp()
+                .post
+                .borrow()
+                .as_ref()
+                .map(|p| Self::get_post_url(&p.author.handle, &p.uri))
+                .unwrap_or_else(|| playlist_url.clone());
+            crate::ui::media_viewer::show_video(btn, playlist_url.clone(), fallback);
         });
 
         overlay.add_overlay(&play_btn);
