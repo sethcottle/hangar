@@ -13,11 +13,15 @@ use crate::atproto::Profile;
 
 mod imp {
     use super::*;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
 
     #[derive(Default)]
     pub struct PostRow {
         pub post: RefCell<Option<Post>>,
+        /// Set on the post a thread view is already focused on. Suppresses the
+        /// row-body click without touching post_clicked_callback, which
+        /// embedded quote cards still need in order to navigate.
+        pub is_focused_post: Cell<bool>,
         pub avatar: RefCell<Option<adw::Avatar>>,
         pub display_name_label: RefCell<Option<gtk4::Label>>,
         pub handle_label: RefCell<Option<gtk4::Label>>,
@@ -354,6 +358,12 @@ impl PostRow {
         let post_row = self.clone();
         gesture.connect_released(move |_, _, _, _| {
             let imp = post_row.imp();
+            // The focused post of a thread is the subject of the page already;
+            // letting the body navigate would push an identical thread page,
+            // repeatable without limit.
+            if imp.is_focused_post.get() {
+                return;
+            }
             if let Some(post) = imp.post.borrow().as_ref() {
                 if let Some(cb) = imp.post_clicked_callback.borrow().as_ref() {
                     cb(post.clone());
@@ -730,6 +740,7 @@ impl PostRow {
         self.imp().post_clicked_callback.replace(Some(Box::new(f)));
     }
 
+
     /// Set callback for when the avatar/profile is clicked (to open profile)
     pub fn set_profile_clicked_callback<F: Fn(Profile) + 'static>(&self, f: F) {
         self.imp()
@@ -744,10 +755,16 @@ impl PostRow {
             .replace(Some(Box::new(f)));
     }
 
-    /// Disable the clickable appearance (removes pointer cursor)
-    /// Used for the main post in thread view that shouldn't re-open
+    /// Stop the row body from opening its own thread.
+    ///
+    /// Used for the main post in a thread view. This previously only cleared
+    /// the pointer cursor, so the post still navigated on click and you could
+    /// descend into the same thread indefinitely. The click callback stays in
+    /// place because embedded quote cards depend on it.
     pub fn set_not_clickable(&self) {
-        if let Some(main_box) = self.imp().main_box.borrow().as_ref() {
+        let imp = self.imp();
+        imp.is_focused_post.set(true);
+        if let Some(main_box) = imp.main_box.borrow().as_ref() {
             main_box.set_cursor_from_name(None::<&str>);
         }
     }

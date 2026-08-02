@@ -1126,13 +1126,9 @@ impl HangarWindow {
         }
     }
 
-    /// Get the NavigationView for the currently visible stack page
-    fn current_nav_view(&self) -> Option<adw::NavigationView> {
-        let stack = self.imp().main_stack.borrow();
-        let stack = stack.as_ref()?;
-        let visible_name = stack.visible_child_name()?;
-
-        match visible_name.as_str() {
+    /// Get the NavigationView backing a top-level stack page
+    fn nav_view_named(&self, page_name: &str) -> Option<adw::NavigationView> {
+        match page_name {
             "home" => self.imp().home_nav_view.borrow().clone(),
             "mentions" => self.imp().mentions_nav_view.borrow().clone(),
             "activity" => self.imp().activity_nav_view.borrow().clone(),
@@ -1144,8 +1140,43 @@ impl HangarWindow {
         }
     }
 
+    /// Tag of the root NavigationPage for a top-level stack page
+    fn root_tag_for(page_name: &str) -> Option<&'static str> {
+        match page_name {
+            "home" => Some("timeline"),
+            "mentions" => Some("mentions"),
+            "activity" => Some("activity"),
+            "chat" => Some("chat"),
+            "profile" => Some("own-profile"),
+            "likes" => Some("likes"),
+            "search" => Some("search"),
+            _ => None,
+        }
+    }
+
+    /// Get the NavigationView for the currently visible stack page
+    fn current_nav_view(&self) -> Option<adw::NavigationView> {
+        let stack = self.imp().main_stack.borrow();
+        let stack = stack.as_ref()?;
+        let visible_name = stack.visible_child_name()?;
+        self.nav_view_named(visible_name.as_str())
+    }
+
     /// Switch to a top-level page (Home, Mentions, etc.) - no animation
+    ///
+    /// Each section keeps its own NavigationView, so drilling into a thread or
+    /// profile leaves that page on the section's stack. Selecting the section
+    /// again has to unwind it, otherwise switching the GtkStack is a no-op --
+    /// the section was already visible -- and the drilled-in page stays on
+    /// screen looking like the click did nothing.
     pub fn switch_to_page(&self, page_name: &str) {
+        if let (Some(nav_view), Some(root_tag)) = (
+            self.nav_view_named(page_name),
+            Self::root_tag_for(page_name),
+        ) {
+            nav_view.pop_to_tag(root_tag);
+        }
+
         if let Some(stack) = self.imp().main_stack.borrow().as_ref() {
             stack.set_visible_child_name(page_name);
         }
