@@ -204,22 +204,6 @@ impl ImageViewer {
         let header = adw::HeaderBar::new();
         header.set_title_widget(Some(&self.title));
 
-        // Only paginate when there is somewhere to paginate to.
-        if total > 1 {
-            let prev_btn = gtk4::Button::from_icon_name("go-previous-symbolic");
-            prev_btn.set_tooltip_text(Some("Previous image"));
-            prev_btn.update_property(&[gtk4::accessible::Property::Label("Previous image")]);
-            prev_btn.connect_clicked({
-                let weak = Rc::downgrade(self);
-                move |_| {
-                    if let Some(viewer) = weak.upgrade() {
-                        viewer.go(-1);
-                    }
-                }
-            });
-            header.pack_start(&prev_btn);
-        }
-
         let zoom_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
         zoom_box.add_css_class("linked");
         zoom_box.append(
@@ -238,6 +222,24 @@ impl ImageViewer {
             viewer.zoom_by(ZOOM_STEP)
         }));
         header.pack_start(&zoom_box);
+
+        // Both arrows sit on the innermost side of their group, flanking the
+        // title: previous goes in after the zoom cluster so it ends up nearest
+        // the title, mirroring next on the other side.
+        if total > 1 {
+            let prev_btn = gtk4::Button::from_icon_name("go-previous-symbolic");
+            prev_btn.set_tooltip_text(Some("Previous image"));
+            prev_btn.update_property(&[gtk4::accessible::Property::Label("Previous image")]);
+            prev_btn.connect_clicked({
+                let weak = Rc::downgrade(self);
+                move |_| {
+                    if let Some(viewer) = weak.upgrade() {
+                        viewer.go(-1);
+                    }
+                }
+            });
+            header.pack_start(&prev_btn);
+        }
 
         header.pack_end(&self.build_menu());
 

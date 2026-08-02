@@ -223,13 +223,19 @@ popover.menu > contents {
     background-color: alpha(@card_bg_color, 0.6);
     border: 1px solid alpha(@borders, 0.5);
     border-radius: 12px;
+    /* No padding: the thumbnail runs edge to edge across the top. The text
+       block below it carries the padding instead. */
+    padding: 0;
+}
+
+.external-card .external-card-text {
     padding: 12px;
 }
 
-.external-card .external-thumb {
-    border-radius: 8px;
-    min-width: 72px;
-    min-height: 72px;
+/* Thumbnail across the top of the card. No min-width: the timeline's
+   ScrolledWindow has no horizontal valve, so a width floor here would be a
+   width floor for the whole window. */
+.external-card .external-thumb-top {
     border: none;
     background: transparent;
 }
@@ -264,7 +270,9 @@ popover.menu > contents {
     padding: 6px 12px;
 }
 
-/* Quote post card */
+/* Quote post card. The clickable wrapper is a plain box, not a button, so
+   interactive controls inside the card can claim their own clicks - which
+   means it also needs its own focus ring. */
 .quote-card-button {
     padding: 0;
     border-radius: 12px;
@@ -272,6 +280,11 @@ popover.menu > contents {
 
 .quote-card-button:hover .quote-card {
     background-color: alpha(@card_bg_color, 0.6);
+}
+
+.quote-card-button:focus-visible {
+    outline: 2px solid @accent_color;
+    outline-offset: -2px;
 }
 
 .quote-card {

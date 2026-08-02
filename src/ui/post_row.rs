@@ -4,12 +4,29 @@
 
 use crate::atproto::{Embed, ImageEmbed, Post};
 use crate::ui::avatar_cache;
+use gtk4::gdk;
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
 use libadwaita as adw;
 
 use crate::atproto::Profile;
+
+/// Width of the post content column at the timeline's 800px `AdwClamp`.
+///
+/// Media embeds derive their height from this and their own aspect ratio. The
+/// timeline's rows are allocated their *minimum* height, so a height request on
+/// a media widget is not a floor, it is the height - which means an embed sized
+/// independently of its aspect ratio ends up with slack that GtkPicture always
+/// centres, and centred media next to left-aligned text reads as misaligned.
+///
+/// An estimate, unavoidably: the real column measures 495px in a 700px window
+/// with the sidebar, 633 at 820, and settles near 684 once the clamp binds, and
+/// the height has to be requested before any of that is known. Tuned toward the
+/// narrow end, because guessing high costs visible dead space above and below
+/// an embed while guessing low only means the image stops short of the column
+/// edge. The clamp in [`PostRow::embed_height`] bounds the error either way.
+const CONTENT_WIDTH: f64 = 540.0;
 
 mod imp {
     use super::*;
@@ -1096,23 +1113,34 @@ impl PostRow {
         match images.len() {
             0 => return,
             1 => {
-                // Single image - preserve aspect ratio with max height constraint
+                // Single image - height follows the image's own aspect ratio so
+                // it fills the content column edge to edge instead of sitting
+                // letterboxed and centred inside a fixed 400px box.
                 let img = &images[0];
 
-                // Use a frame with overflow hidden and max height to constrain tall images
                 let frame = gtk4::Frame::new(None);
                 frame.set_hexpand(true);
                 frame.set_overflow(gtk4::Overflow::Hidden);
                 frame.add_css_class("post-embed-image");
-                // Max height of 400px for single images - prevents tall images from dominating
-                frame.set_size_request(-1, -1);
+                // Clamped so a panorama is not a sliver and a tall portrait
+                // does not take over the row.
+                frame.set_size_request(-1, Self::embed_height(img.aspect_ratio, 180, 430));
 
                 let picture = gtk4::Picture::new();
                 picture.set_hexpand(true);
+                picture.set_vexpand(true);
+                // The only reason a Picture's minimum width is 0. Without it the
+                // minimum is the image's intrinsic width and, with no horizontal
+                // scroll valve on the timeline, that widens the whole window.
                 picture.set_can_shrink(true);
+                // Contain, so a lone image is shown whole. Cover crops to fill,
+                // which is right for a grid cell where the neighbours have to
+                // line up, but a single image has nothing to line up with and
+                // cropping it is just losing the picture: measured at a 700px
+                // window, Cover discarded 57% of a 2:3 portrait and 27% of a
+                // 16:9 landscape. The height clamp below is an upper bound, so
+                // whatever slack Contain leaves is at most a few pixels.
                 picture.set_content_fit(gtk4::ContentFit::Contain);
-                // Set a reasonable max height via widget height request
-                picture.set_size_request(-1, 400);
 
                 frame.set_child(Some(&picture));
                 avatar_cache::load_image_into_picture(picture, img.thumb.clone());
@@ -1125,7 +1153,7 @@ impl PostRow {
                 row.set_homogeneous(true);
 
                 for (i, img) in images.iter().enumerate() {
-                    let cell = self.create_image_cell(&img.thumb, 200);
+                    let cell = self.create_image_cell(&img.thumb, 240);
                     Self::attach_image_click(&cell, images, i);
                     row.append(&cell);
                 }
@@ -1137,14 +1165,15 @@ impl PostRow {
                 row.set_homogeneous(true);
 
                 // Left image - tall (spans both rows visually)
-                let left = self.create_image_cell(&images[0].thumb, 260);
+                let left = self.create_image_cell(&images[0].thumb, 300);
                 Self::attach_image_click(&left, images, 0);
                 row.append(&left);
 
-                // Right column with two stacked images
+                // Right column with two stacked images. 148 * 2 + 4 spacing
+                // matches the left cell exactly.
                 let right_col = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
-                let top_right = self.create_image_cell(&images[1].thumb, 128);
-                let bot_right = self.create_image_cell(&images[2].thumb, 128);
+                let top_right = self.create_image_cell(&images[1].thumb, 148);
+                let bot_right = self.create_image_cell(&images[2].thumb, 148);
                 Self::attach_image_click(&top_right, images, 1);
                 Self::attach_image_click(&bot_right, images, 2);
                 right_col.append(&top_right);
@@ -1161,7 +1190,7 @@ impl PostRow {
                 bot_row.set_homogeneous(true);
 
                 for (i, img) in images.iter().take(4).enumerate() {
-                    let cell = self.create_image_cell(&img.thumb, 150);
+                    let cell = self.create_image_cell(&img.thumb, 180);
                     Self::attach_image_click(&cell, images, i);
                     if i < 2 {
                         top_row.append(&cell);
@@ -1208,12 +1237,14 @@ impl PostRow {
         frame.set_overflow(gtk4::Overflow::Hidden);
         frame.add_css_class("post-embed-image");
 
-        // Create picture - stretch to fill (no aspect ratio preservation for "cover" effect)
+        // Cover fills the cell and crops the overflow. Fill, which this used to
+        // use, ignores the intrinsic aspect ratio and maps the image onto the
+        // allocation - a 2:3 portrait in a 338x240 cell came out 2.4x too wide.
         let picture = gtk4::Picture::new();
         picture.set_hexpand(true);
         picture.set_vexpand(true);
         picture.set_can_shrink(true);
-        picture.set_content_fit(gtk4::ContentFit::Fill); // Stretch to fill the cell
+        picture.set_content_fit(gtk4::ContentFit::Cover);
 
         frame.set_child(Some(&picture));
         avatar_cache::load_image_into_picture(picture, url.to_string());
@@ -1229,31 +1260,41 @@ impl PostRow {
         card_btn.add_css_class("external-card-button");
         card_btn.set_cursor_from_name(Some("pointer"));
 
-        let card = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
+        // Vertical, matching the platform convention: thumbnail across the top,
+        // then title, a two-line description and the domain.
+        let card = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         card.add_css_class("external-card");
+        // Lets the card's border-radius clip the thumbnail's top corners.
+        card.set_overflow(gtk4::Overflow::Hidden);
 
-        // Thumbnail (if available) - smaller for compact layout
+        // Thumbnail (if available) - full card width, capped height
         if let Some(thumb_url) = &ext.thumb {
             let thumb_frame = gtk4::Frame::new(None);
+            thumb_frame.set_hexpand(true);
             thumb_frame.set_overflow(gtk4::Overflow::Hidden);
-            thumb_frame.add_css_class("external-thumb");
+            thumb_frame.add_css_class("external-thumb-top");
+            // Height only. A width request here would become the card's - and
+            // so the feed's - minimum width.
+            thumb_frame.set_size_request(-1, 180);
 
             let thumb = gtk4::Picture::new();
-            thumb.set_content_fit(gtk4::ContentFit::Contain);
+            thumb.set_hexpand(true);
+            thumb.set_vexpand(true);
             thumb.set_can_shrink(true);
-            thumb.set_size_request(72, 72); // Smaller thumbnail for compact window
+            thumb.set_content_fit(gtk4::ContentFit::Cover);
             avatar_cache::load_image_into_picture(thumb.clone(), thumb_url.clone());
             thumb_frame.set_child(Some(&thumb));
             card.append(&thumb_frame);
         }
 
         // Text content
-        let text_box = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+        let text_box = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
         text_box.set_hexpand(true);
-        text_box.set_valign(gtk4::Align::Center);
+        text_box.add_css_class("external-card-text");
 
-        let title = gtk4::Label::new(Some(&ext.title));
+        let title = gtk4::Label::new(Some(&Self::collapse_whitespace(&ext.title)));
         title.set_halign(gtk4::Align::Start);
+        title.set_xalign(0.0);
         title.add_css_class("external-title");
         title.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         title.set_wrap(true);
@@ -1263,16 +1304,19 @@ impl PostRow {
 
         if !ext.description.is_empty() {
             // Strip any HTML tags that might be in the description from Open Graph metadata
-            let clean_desc = Self::strip_html_tags(&ext.description);
-            let desc = gtk4::Label::new(Some(&clean_desc));
-            desc.set_halign(gtk4::Align::Start);
-            desc.add_css_class("dim-label");
-            desc.add_css_class("caption");
-            desc.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-            desc.set_wrap(true);
-            desc.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
-            desc.set_lines(2);
-            text_box.append(&desc);
+            let clean_desc = Self::collapse_whitespace(&Self::strip_html_tags(&ext.description));
+            if !clean_desc.is_empty() {
+                let desc = gtk4::Label::new(Some(&clean_desc));
+                desc.set_halign(gtk4::Align::Start);
+                desc.set_xalign(0.0);
+                desc.add_css_class("dim-label");
+                desc.add_css_class("caption");
+                desc.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+                desc.set_wrap(true);
+                desc.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+                desc.set_lines(2);
+                text_box.append(&desc);
+            }
         }
 
         // Extract domain from URI and show with web browser icon
@@ -1313,18 +1357,27 @@ impl PostRow {
         overlay.add_css_class("video-embed");
         overlay.set_hexpand(true);
 
-        // Thumbnail - responsive width, constrained height
+        // Thumbnail - fills the content column at the video's own aspect ratio.
+        // The height goes on a clipping frame rather than the Picture: a
+        // Picture given more width than its Contain-scaled image needs centres
+        // the result, and there is no property to align it left.
+        let frame = gtk4::Frame::new(None);
+        frame.set_hexpand(true);
+        frame.set_overflow(gtk4::Overflow::Hidden);
+        frame.add_css_class("post-embed-image");
+        frame.set_size_request(-1, Self::embed_height(video.aspect_ratio, 200, 400));
+
         let thumb = gtk4::Picture::new();
         thumb.set_hexpand(true);
-        thumb.set_content_fit(gtk4::ContentFit::Contain);
+        thumb.set_vexpand(true);
         thumb.set_can_shrink(true);
-        thumb.set_size_request(-1, 200); // Only constrain height, let width be flexible
-        thumb.add_css_class("post-embed-image");
+        thumb.set_content_fit(gtk4::ContentFit::Cover);
 
         if let Some(thumb_url) = &video.thumbnail {
             avatar_cache::load_image_into_picture(thumb.clone(), thumb_url.clone());
         }
-        overlay.set_child(Some(&thumb));
+        frame.set_child(Some(&thumb));
+        overlay.set_child(Some(&frame));
 
         // Play button overlay
         let play_btn = gtk4::Button::from_icon_name("media-playback-start-symbolic");
@@ -1360,11 +1413,26 @@ impl PostRow {
 
     /// Render a quote post card (clickable to open quoted post)
     fn render_quote(&self, container: &gtk4::Box, quote: &crate::atproto::QuoteEmbed) {
-        // Wrap card in a button for clickability
-        let card_btn = gtk4::Button::new();
-        card_btn.add_css_class("flat");
+        // Deliberately a Box and not a Button. A GtkButton runs its click
+        // gesture in the CAPTURE phase and claims the sequence on release, and
+        // capture is walked ancestors-first - so a button wrapping the whole
+        // card claims the release before any control *inside* the card can see
+        // it, cancels their gestures, and stops propagation. That is why the
+        // play button, images and link card in a quoted post navigated instead
+        // of activating. A bubble-phase gesture on a plain Box is walked
+        // descendants-first, so every interactive child gets first refusal and
+        // this only fires for the parts of the card that nothing else claimed.
+        //
+        // The accessible role has to be set at construction: GTK documents that
+        // it cannot be changed once set.
+        let card_btn = glib::Object::builder::<gtk4::Box>()
+            .property("orientation", gtk4::Orientation::Vertical)
+            .property("accessible-role", gtk4::AccessibleRole::Button)
+            .build();
         card_btn.add_css_class("quote-card-button");
         card_btn.set_cursor_from_name(Some("pointer"));
+        // A Box is not focusable or key-activatable the way the Button was.
+        card_btn.set_focusable(true);
 
         let card = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
         card.add_css_class("quote-card");
@@ -1426,7 +1494,10 @@ impl PostRow {
             card.append(&nested_container);
         }
 
-        card_btn.set_child(Some(&card));
+        card_btn.append(&card);
+        card_btn.update_property(&[gtk4::accessible::Property::Label(&format!(
+            "Quoted post by {author_name}"
+        ))]);
 
         // Navigate to quoted post in-app
         let quoted_post = Post {
@@ -1446,15 +1517,51 @@ impl PostRow {
             reply_context: None,
         };
         let imp = self.imp();
-        card_btn.connect_clicked(glib::clone!(
+
+        let gesture = gtk4::GestureClick::new();
+        // Claim on RELEASE, never on press. Claiming on press would deny every
+        // descendant before they are given the release and reproduce the bug
+        // this replaced. Claiming at all is still required: without it the row
+        // body's own gesture also fires and one click opens both the quoted
+        // post and the parent thread.
+        gesture.connect_released(glib::clone!(
             #[weak]
             imp,
-            move |_| {
+            #[strong]
+            quoted_post,
+            move |gesture, _, _, _| {
+                gesture.set_state(gtk4::EventSequenceState::Claimed);
                 if let Some(cb) = imp.post_clicked_callback.borrow().as_ref() {
                     cb(quoted_post.clone());
                 }
             }
         ));
+        card_btn.add_controller(gesture);
+
+        let key = gtk4::EventControllerKey::new();
+        key.connect_key_pressed(glib::clone!(
+            #[weak]
+            imp,
+            #[strong]
+            quoted_post,
+            #[upgrade_or]
+            glib::Propagation::Proceed,
+            move |_, keyval, _, _| {
+                match keyval {
+                    gdk::Key::Return
+                    | gdk::Key::KP_Enter
+                    | gdk::Key::space
+                    | gdk::Key::KP_Space => {
+                        if let Some(cb) = imp.post_clicked_callback.borrow().as_ref() {
+                            cb(quoted_post.clone());
+                        }
+                        glib::Propagation::Stop
+                    }
+                    _ => glib::Propagation::Proceed,
+                }
+            }
+        ));
+        card_btn.add_controller(key);
 
         container.append(&card_btn);
     }
@@ -1472,6 +1579,32 @@ impl PostRow {
     fn strip_html_tags(text: &str) -> String {
         let tag_pattern = regex::Regex::new(r"<[^>]*>").unwrap();
         tag_pattern.replace_all(text, "").to_string()
+    }
+
+    /// Fold every run of whitespace, newlines included, into a single space.
+    ///
+    /// `gtk_label_set_lines` is implemented as a negative Pango layout height,
+    /// which means "N lines *per paragraph*". An App Store description is
+    /// thirty newline-separated bullets, so a two-line clamp allows sixty
+    /// lines - and because that is the label's *minimum* height, nothing
+    /// downstream can take it back. Collapsing to one paragraph is what makes
+    /// the clamp bind.
+    fn collapse_whitespace(text: &str) -> String {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// Pixel height for a media embed of `aspect_ratio`, clamped to `[min, max]`.
+    ///
+    /// Sized so the embed fills [`CONTENT_WIDTH`] exactly at the timeline's
+    /// clamp width. Narrower windows crop rather than reintroduce dead space,
+    /// which is deliberate: the height cannot track the width without a tick
+    /// callback or a custom layout manager, and a repeating callback outliving
+    /// its row is a bug this codebase has already had three times.
+    fn embed_height(aspect_ratio: Option<(u32, u32)>, min: i32, max: i32) -> i32 {
+        let (w, h) = aspect_ratio
+            .filter(|(w, h)| *w > 0 && *h > 0)
+            .unwrap_or((16, 9));
+        ((CONTENT_WIDTH * f64::from(h) / f64::from(w)).round() as i32).clamp(min, max)
     }
 
     /// Format post text with clickable links, mentions, and hashtags using Pango markup
@@ -1599,5 +1732,332 @@ impl PostRow {
 impl Default for PostRow {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::atproto::{ExternalEmbed, QuoteEmbed, VideoEmbed};
+
+    #[test]
+    fn collapse_whitespace_folds_paragraphs_so_the_line_clamp_binds() {
+        // `Label::set_lines` is a negative Pango layout height, which means
+        // N lines *per paragraph*. A thirty-bullet App Store description was
+        // therefore allowed sixty lines, as the label's *minimum* height, and
+        // one post filled the window.
+        let bullets = (1..=30)
+            .map(|i| format!("• Feature bullet {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let collapsed = PostRow::collapse_whitespace(&bullets);
+        assert!(!collapsed.contains('\n'), "no paragraph breaks survive");
+        assert!(collapsed.starts_with("• Feature bullet 1 • Feature bullet 2"));
+
+        // Every flavour of wire whitespace, not just \n.
+        assert_eq!(
+            PostRow::collapse_whitespace("a\r\nb\tc\u{2028}d  e\n\n\nf"),
+            "a b c d e f"
+        );
+        assert_eq!(PostRow::collapse_whitespace("  \n\t "), "");
+        assert_eq!(PostRow::collapse_whitespace(""), "");
+    }
+
+    #[test]
+    fn embed_height_tracks_the_aspect_ratio_and_clamps() {
+        // Derived from CONTENT_WIDTH rather than written out, so tuning that
+        // estimate does not turn this into a failing test about a number
+        // nobody chose deliberately.
+        let expect = |w: f64, h: f64| (CONTENT_WIDTH * h / w).round() as i32;
+
+        let sixteen_nine = expect(16.0, 9.0);
+        assert_eq!(PostRow::embed_height(Some((16, 9)), 180, 430), sixteen_nine);
+        assert_eq!(
+            PostRow::embed_height(Some((3, 1)), 180, 430),
+            expect(3.0, 1.0)
+        );
+        // A tall portrait hits the cap rather than taking over the row.
+        assert_eq!(PostRow::embed_height(Some((2, 3)), 180, 430), 430);
+        // A very wide panorama hits the floor rather than becoming a sliver.
+        assert_eq!(PostRow::embed_height(Some((10, 1)), 180, 430), 180);
+        // Missing or nonsense ratios fall back to 16:9 instead of dividing by
+        // zero. The API makes aspectRatio optional and does not promise > 0.
+        assert_eq!(PostRow::embed_height(None, 180, 430), sixteen_nine);
+        assert_eq!(PostRow::embed_height(Some((0, 9)), 180, 430), sixteen_nine);
+        assert_eq!(PostRow::embed_height(Some((16, 0)), 180, 430), sixteen_nine);
+        // Whatever the estimate, the clamp is what actually bounds the row.
+        assert!((180..=430).contains(&sixteen_nine));
+    }
+
+    fn profile() -> Profile {
+        Profile {
+            did: "did:plc:test".into(),
+            handle: "someone.bsky.social".into(),
+            display_name: Some("Someone".into()),
+            avatar: None,
+            banner: None,
+            description: None,
+            followers_count: None,
+            following_count: None,
+            posts_count: None,
+            viewer_following: None,
+            viewer_followed_by: None,
+        }
+    }
+
+    /// A URL that fails to connect immediately, so nothing in the test waits on
+    /// a network that may not be there.
+    fn dead_url() -> String {
+        "http://127.0.0.1:1/x.jpg".into()
+    }
+
+    fn quote_with(embed: Option<Embed>) -> QuoteEmbed {
+        QuoteEmbed {
+            uri: "at://did:plc:test/app.bsky.feed.post/quoted".into(),
+            cid: "cid".into(),
+            author: profile(),
+            text: "the quoted text".into(),
+            indexed_at: "2026-01-01T00:00:00Z".into(),
+            embed: embed.map(Box::new),
+        }
+    }
+
+    /// Every controller on `widget`, as (type name, propagation phase).
+    fn controllers(widget: &gtk4::Widget) -> Vec<(String, gtk4::PropagationPhase)> {
+        let list = widget.observe_controllers();
+        (0..list.n_items())
+            .filter_map(|i| list.item(i))
+            .filter_map(|obj| obj.downcast::<gtk4::EventController>().ok())
+            .map(|c| (c.type_().name().to_string(), c.propagation_phase()))
+            .collect()
+    }
+
+    fn walk(widget: &gtk4::Widget, depth: usize, out: &mut Vec<(usize, gtk4::Widget)>) {
+        out.push((depth, widget.clone()));
+        let mut child = widget.first_child();
+        while let Some(c) = child {
+            walk(&c, depth + 1, out);
+            child = c.next_sibling();
+        }
+    }
+
+    /// A quote card must not out-rank the controls inside it.
+    ///
+    /// A `GtkButton` runs its click gesture in the CAPTURE phase and claims the
+    /// sequence on release. Capture is walked ancestors-first, so a button
+    /// wrapping the whole card answered the release before the play button, the
+    /// image cells or the link card ever saw it - it claimed, GTK cancelled
+    /// their gestures and stopped propagating, and the app navigated to the
+    /// quoted thread instead of activating what was clicked.
+    ///
+    /// GTK's ordering rules make this structural, so the test is structural:
+    /// nothing enclosing the card's interior may run a capture-phase gesture.
+    ///
+    /// Video, images, the link card and a nested quote share one test because
+    /// GTK may only be used from the thread that initialised it, and the test
+    /// harness gives each `#[test]` a thread of its own.
+    #[test]
+    fn quote_card_does_not_pre_empt_the_controls_inside_it() {
+        // Headless CI has no display, and a GTK widget cannot be built without
+        // one. Nothing to assert there rather than a failure to report.
+        if gtk4::init().is_err() {
+            eprintln!("skipping: no display available");
+            return;
+        }
+        adw::init().expect("libadwaita");
+
+        let row = PostRow::new();
+        let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+
+        // A quote carrying a video, so the card contains a real GtkButton (the
+        // play button) that the old wrapper used to steal the click from.
+        row.render_quote(
+            &container,
+            &quote_with(Some(Embed::Video(VideoEmbed {
+                playlist: dead_url(),
+                thumbnail: Some(dead_url()),
+                alt: None,
+                aspect_ratio: Some((16, 9)),
+            }))),
+        );
+
+        let card = container.first_child().expect("quote card was rendered");
+
+        assert!(
+            !card.is::<gtk4::Button>(),
+            "the quote card wrapper must not be a GtkButton: its internal \
+             gesture is capture-phase and claims on release, which pre-empts \
+             every control inside the card"
+        );
+
+        let card_controllers = controllers(&card);
+        let clicks: Vec<_> = card_controllers
+            .iter()
+            .filter(|(name, _)| name == "GtkGestureClick")
+            .collect();
+        assert_eq!(clicks.len(), 1, "exactly one click gesture on the card");
+        assert_eq!(
+            clicks[0].1,
+            gtk4::PropagationPhase::Bubble,
+            "the card's gesture must bubble: bubble is walked descendants-first, \
+             so interactive children get first refusal"
+        );
+
+        // The Button we replaced was focusable, key-activatable and announced as
+        // a button. A plain Box is none of those unless we say so.
+        assert!(card.is_focusable(), "keyboard can still reach the card");
+        assert_eq!(card.accessible_role(), gtk4::AccessibleRole::Button);
+        assert!(
+            card_controllers
+                .iter()
+                .any(|(name, _)| name == "GtkEventControllerKey"),
+            "Enter/Space still activate the card"
+        );
+
+        // Nothing between the card and its interior may capture, either.
+        let mut widgets = Vec::new();
+        walk(&card, 0, &mut widgets);
+        let play_depth = widgets
+            .iter()
+            .find(|(_, w)| w.is::<gtk4::Button>())
+            .map(|(d, _)| *d)
+            .expect("the nested video's play button");
+        for (depth, widget) in &widgets {
+            if *depth >= play_depth {
+                continue;
+            }
+            for (name, phase) in controllers(widget) {
+                assert_ne!(
+                    phase,
+                    gtk4::PropagationPhase::Capture,
+                    "{name} on an ancestor of the play button captures, which \
+                     is exactly the bug: capture runs ancestors-first"
+                );
+            }
+        }
+
+        // The play button keeps its own capture-phase gesture, which is what
+        // lets it out-rank the card's bubble gesture and activate on its own.
+        let play = widgets
+            .iter()
+            .find(|(_, w)| w.is::<gtk4::Button>())
+            .map(|(_, w)| w.clone())
+            .expect("the nested video's play button");
+        assert!(
+            controllers(&play)
+                .iter()
+                .any(|(name, phase)| name == "GtkGestureClick"
+                    && *phase == gtk4::PropagationPhase::Capture),
+            "GtkButton's own gesture still captures and claims on release"
+        );
+
+        // ---- Images and the external link card ----
+        //
+        // Images: the frame carries a bubble GestureClick that claims, and it
+        // sits deeper than the card, so the bubble walk reaches it first.
+        let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        row.render_quote(
+            &container,
+            &quote_with(Some(Embed::Images(vec![
+                ImageEmbed {
+                    thumb: dead_url(),
+                    fullsize: dead_url(),
+                    alt: String::new(),
+                    aspect_ratio: Some((4, 3)),
+                };
+                4
+            ]))),
+        );
+        let card = container.first_child().expect("quote card");
+        let mut widgets = Vec::new();
+        walk(&card, 0, &mut widgets);
+        let cells: Vec<_> = widgets
+            .iter()
+            .filter(|(_, w)| {
+                w.is::<gtk4::Frame>()
+                    && controllers(w).iter().any(|(name, phase)| {
+                        name == "GtkGestureClick" && *phase == gtk4::PropagationPhase::Bubble
+                    })
+            })
+            .collect();
+        assert_eq!(
+            cells.len(),
+            4,
+            "every image cell is independently clickable"
+        );
+        for (depth, _) in &cells {
+            assert!(
+                *depth > 0,
+                "cells are descendants of the card, so bubble first"
+            );
+        }
+
+        // External link card: still a GtkButton, so it captures and claims on
+        // release, out-ranking the card's bubble gesture.
+        let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        row.render_quote(
+            &container,
+            &quote_with(Some(Embed::External(ExternalEmbed {
+                uri: "https://apps.apple.com/app/id1".into(),
+                title: "A title\nwith a newline".into(),
+                description: "line one\nline two\nline three".into(),
+                thumb: Some(dead_url()),
+            }))),
+        );
+        let card = container.first_child().expect("quote card");
+        let mut widgets = Vec::new();
+        walk(&card, 0, &mut widgets);
+        let link_btn = widgets
+            .iter()
+            .find(|(_, w)| w.is::<gtk4::Button>())
+            .map(|(_, w)| w.clone())
+            .expect("the external link card button");
+        assert!(
+            controllers(&link_btn)
+                .iter()
+                .any(|(name, phase)| name == "GtkGestureClick"
+                    && *phase == gtk4::PropagationPhase::Capture),
+            "the link card captures and claims, so it opens the link rather \
+             than letting the quote card navigate"
+        );
+
+        // And its wire text reached the labels as a single paragraph, so the
+        // two-line clamp actually clamps.
+        for (_, widget) in &widgets {
+            if let Some(label) = widget.downcast_ref::<gtk4::Label>() {
+                assert!(
+                    !label.text().contains('\n'),
+                    "label text {:?} still has a paragraph break, so set_lines \
+                     will not bind",
+                    label.text()
+                );
+            }
+        }
+
+        // ---- A nested quote (a quote of a quote) navigates to the INNER post.
+        let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        row.render_quote(
+            &container,
+            &quote_with(Some(Embed::Quote(quote_with(None)))),
+        );
+
+        let outer = container.first_child().expect("outer quote card");
+        let mut widgets = Vec::new();
+        walk(&outer, 0, &mut widgets);
+        let cards: Vec<_> = widgets
+            .iter()
+            .filter(|(_, w)| w.has_css_class("quote-card-button"))
+            .collect();
+        assert_eq!(cards.len(), 2, "outer card plus the nested one");
+        // Both bubble, so the deeper one is reached first and claims.
+        for (_, widget) in &cards {
+            assert!(
+                controllers(widget)
+                    .iter()
+                    .any(|(name, phase)| name == "GtkGestureClick"
+                        && *phase == gtk4::PropagationPhase::Bubble)
+            );
+        }
+        assert!(cards[1].0 > cards[0].0, "the nested card is the deeper one");
     }
 }
