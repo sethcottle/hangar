@@ -9,12 +9,32 @@ const SECRET_LABEL: &str = "Hangar Bluesky Session";
 
 #[derive(Error, Debug)]
 pub enum SessionError {
+    /// Nothing on the session bus implements org.freedesktop.secrets.
+    ///
+    /// Worth separating from other failures: it is not a bug or a transient
+    /// problem, it means the desktop has no keyring and the user has to
+    /// install one. Common on Xfce, and on tiling or minimal setups that
+    /// ship no keyring by default.
+    #[error(
+        "no keyring service is running, so the sign-in could not be saved. \
+         Hangar stores credentials in the system keyring over D-Bus. Install and \
+         start one of: gnome-keyring (GNOME, Cinnamon, Xfce, most minimal setups), \
+         KWallet with Secret Service integration enabled (KDE Plasma), or KeePassXC \
+         with Freedesktop.org Secret Service integration turned on. ({0})"
+    )]
+    NoKeyring(String),
     #[error("secret service unavailable: {0}")]
     SecretService(String),
     #[error("session not found")]
     NotFound,
     #[error("invalid session data: {0}")]
     InvalidData(String),
+}
+
+/// Failure to reach the Secret Service at all means no provider is running.
+/// Failures after connecting are ordinary errors and keep SecretService.
+fn no_keyring(e: impl std::fmt::Display) -> SessionError {
+    SessionError::NoKeyring(e.to_string())
 }
 
 /// Persists session credentials via libsecret.
@@ -24,7 +44,7 @@ impl SessionManager {
     pub async fn store(session: &Session) -> Result<(), SessionError> {
         let ss = SecretService::connect(EncryptionType::Dh)
             .await
-            .map_err(|e| SessionError::SecretService(e.to_string()))?;
+            .map_err(no_keyring)?;
 
         let collection = ss
             .get_default_collection()
@@ -60,7 +80,7 @@ impl SessionManager {
     pub async fn load() -> Result<Session, SessionError> {
         let ss = SecretService::connect(EncryptionType::Dh)
             .await
-            .map_err(|e| SessionError::SecretService(e.to_string()))?;
+            .map_err(no_keyring)?;
 
         let collection = ss
             .get_default_collection()
@@ -97,7 +117,7 @@ impl SessionManager {
     pub async fn clear() -> Result<(), SessionError> {
         let ss = SecretService::connect(EncryptionType::Dh)
             .await
-            .map_err(|e| SessionError::SecretService(e.to_string()))?;
+            .map_err(no_keyring)?;
 
         let collection = ss
             .get_default_collection()

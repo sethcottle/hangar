@@ -401,7 +401,14 @@ impl HangarApplication {
                     let session_for_store = session.clone();
                     tokio::spawn(async move {
                         if let Err(e) = SessionManager::store(&session_for_store).await {
-                            eprintln!("Failed to persist session: {}", e);
+                            // Sign-in itself succeeded, so the window opens as
+                            // normal and the failure only shows up as being
+                            // logged out on next launch. Say so plainly.
+                            eprintln!(
+                                "hangar: signed in, but the session could not be saved \
+                                 and you will have to sign in again next launch.\n  {}",
+                                e
+                            );
                         }
                     });
                     Ok(session)
@@ -518,7 +525,14 @@ impl HangarApplication {
                     let session_for_store = session.clone();
                     tokio::spawn(async move {
                         if let Err(e) = SessionManager::store(&session_for_store).await {
-                            eprintln!("Failed to persist session: {}", e);
+                            // Sign-in itself succeeded, so the window opens as
+                            // normal and the failure only shows up as being
+                            // logged out on next launch. Say so plainly.
+                            eprintln!(
+                                "hangar: signed in, but the session could not be saved \
+                                 and you will have to sign in again next launch.\n  {}",
+                                e
+                            );
                         }
                     });
 
