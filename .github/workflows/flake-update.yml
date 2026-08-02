@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: MPL-2.0
+
+name: Update flake.lock
+
+# flake.nix tracks nixpkgs-unstable, so the lock goes stale on its own and
+# nobody notices until a Nix build breaks. Refresh it on a schedule and let
+# the CI Nix job decide whether the new pin is good.
+#
+# Note: pull requests opened with the default GITHUB_TOKEN do not trigger
+# other workflows, so CI will not run on these automatically. Swap in a PAT
+# via the `token` input if you want the Nix job to gate them.
+
+on:
+  schedule:
+    # Mondays, 04:00 UTC
+    - cron: '0 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update:
+    name: Refresh flake.lock
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v22
+
+      - name: Update flake.lock
+        uses: DeterminateSystems/update-flake-lock@v28
+        with:
+          commit-msg: 'chore: update flake.lock'
+          pr-title: 'chore: update flake.lock'
+          pr-labels: dependencies

@@ -38,3 +38,28 @@ jobs:
 
       - name: Check
         run: cargo check
+
+  nix:
+    name: Nix
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v22
+
+      # Free, zero-config binary cache. Without it every run rebuilds the
+      # whole GTK4 closure from source.
+      - name: Set up Nix cache
+        uses: DeterminateSystems/magic-nix-cache-action@v14
+
+      # flake.nix maintains its own dependency list separate from the apt
+      # packages the cargo job installs, so it drifts silently unless
+      # something builds it.
+      - name: Build the flake package
+        run: nix build .#hangar --print-build-logs
+
+      - name: Check the dev shell evaluates
+        run: nix develop --command true
