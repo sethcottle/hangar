@@ -39,7 +39,8 @@ This is a **technical preview**. The app is functional but incomplete. Developme
 - **Timeline**: Home feed with infinite scroll, cursor-based pagination, pull-to-refresh
 - **Custom Feeds**: Feed selector with Following, Discover, and pinned feeds
 - **Live Updates**: Background polling with seamless new post insertion
-- **Rich Embeds**: Image grids (1–4+), external link cards, video thumbnails, quote posts
+- **Rich Embeds**: Image grids (1–4+), external link cards, quote posts
+- **Video**: In-app HLS playback (GStreamer `playbin3`) with seek, mute, and a persistent volume level
 - **Interactions**: Like/unlike, repost/unrepost, quote, reply
 - **Compose**: Rich text highlighting (mentions, hashtags, URLs), mention autocomplete, image attachments (up to 4 with alt text), link card preview (Open Graph), language selection, per-post content warnings, interaction settings, thread composer
 - **Navigation**: Home, Mentions, Activity, Chat, Profile, Likes, Search tabs with drill-down views
@@ -59,6 +60,7 @@ This is a **technical preview**. The app is functional but incomplete. Developme
 - Keyboard shortcuts for navigation and post actions
 - Enhanced screen reader support (composite labels, live regions, focus management)
 - Image lightbox, loading skeletons
+- Inline video playback in the timeline, with an autoplay preference
 - Full profile view on drill-down, profile editing
 - Internationalization (i18n) and Flatpak distribution
 - Bookmarks, moderation tools, desktop notifications, multi-account support
@@ -94,6 +96,14 @@ chmod +x Hangar-x86_64.AppImage
 ./Hangar-x86_64.AppImage
 ```
 
+The AppImage bundles no libraries. Besides GTK 4.12+ and libadwaita 1.5+, it
+now needs the host's GStreamer 1.20+ — `libgstreamer1.0-0`,
+`libgstreamer-plugins-base1.0-0` and `libgstreamer-gl1.0-0` on Debian/Ubuntu,
+`gstreamer1` and `gstreamer1-plugins-base` on Fedora — plus the playback
+plugins listed under [Dependencies](#dependencies) for video. These are linked
+in rather than loaded on demand, so the AppImage refuses to start without them
+instead of merely losing video.
+
 The AppImage supports delta updates via zsync and is also available through the [AM](https://github.com/ivan-hc/AM) AppImage package manager:
 
 ```bash
@@ -108,6 +118,11 @@ Download the `.flatpak` bundle from the [Releases](https://github.com/sethcottle
 flatpak install hangar.flatpak
 ```
 
+Video decoding relies on `org.freedesktop.Platform.codecs-extra`, which flatpak
+installs alongside `org.gnome.Platform` by default. The base runtime's
+libavcodec has no H.264 decoder, so a runtime installed with `--no-related`
+plays audio and shows nothing.
+
 Flathub submission is planned but not yet available.
 
 ### Build from Source
@@ -121,18 +136,34 @@ the build host requires.
 
 **Fedora/RHEL:**
 ```bash
-sudo dnf install gtk4-devel libadwaita-devel gcc pkg-config
+sudo dnf install gtk4-devel libadwaita-devel gstreamer1-devel \
+  gstreamer1-plugins-base-devel gcc pkg-config
 ```
 
 **Ubuntu/Debian:**
 ```bash
-sudo apt install libgtk-4-dev libadwaita-1-dev build-essential pkg-config
+sudo apt install libgtk-4-dev libadwaita-1-dev libgstreamer1.0-dev \
+  libgstreamer-plugins-base1.0-dev build-essential pkg-config
 ```
 
 **Arch:**
 ```bash
-sudo pacman -S gtk4 libadwaita base-devel
+sudo pacman -S gtk4 libadwaita gstreamer gst-plugins-base base-devel
 ```
+
+#### Runtime plugins for video
+
+Playing Bluesky video needs GStreamer 1.20+ with these plugin sets installed at
+runtime. `-good` carries `souphttpsrc` and `hlsdemux2`, `-bad` carries
+`tsdemux`, and `gst-libav` carries `avdec_h264`.
+
+- **Ubuntu/Debian:** `gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav`
+- **Fedora:** `gstreamer1-plugins-good gstreamer1-plugins-bad-free gstreamer1-libav`
+- **Arch:** `gst-plugins-good gst-plugins-bad gst-libav`
+
+The GTK video sink is compiled into Hangar, so `gstreamer1.0-gtk4` is not
+needed. When a stream cannot be played the viewer says so and offers to open
+the post in a browser; it never does that on its own.
 
 #### Build & Run
 
@@ -185,6 +216,7 @@ GTK runs on the main thread. Network I/O runs on background threads with a share
 | HTTP Client | [reqwest](https://github.com/seanmonstar/reqwest) (rustls-tls) |
 | Async Runtime | [Tokio](https://tokio.rs/) |
 | Cache | [rusqlite](https://github.com/rusqlite/rusqlite) (SQLite, bundled) |
+| Media | [gstreamer-rs](https://gitlab.freedesktop.org/gstreamer/gstreamer-rs) + [gst-plugin-gtk4](https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs) (`playbin3`, `gtk4paintablesink` registered statically) |
 | Secrets | [secret-service](https://crates.io/crates/secret-service) (libsecret bindings) |
 | Serialization | [serde](https://serde.rs/) |
 
@@ -196,6 +228,8 @@ src/
 ├── app.rs               # Application lifecycle, data fetching, navigation
 ├── config.rs            # Constants (APP_ID, PDS URL)
 ├── runtime.rs           # Shared Tokio runtime
+├── media/
+│   └── mod.rs           # GStreamer init + playbin3 pipeline construction
 ├── atproto/
 │   ├── client.rs        # HangarClient — AT Protocol wrapper
 │   ├── facets.rs        # Rich text facet parsing (mentions, links, hashtags)
@@ -217,6 +251,8 @@ src/
     ├── post_row.rs      # Post widget with embeds and actions
     ├── compose_dialog.rs # Rich compose (posts, replies, quotes, threads)
     ├── login_dialog.rs  # Sign-in dialog
+    ├── media_viewer.rs  # Full-size image and video dialogs
+    ├── video_player.rs  # Video widget: picture, transport controls, error page
     ├── avatar_cache.rs  # Image loading with LRU + SQLite caching
     └── style.css        # Custom CSS styles
 ```

@@ -254,6 +254,16 @@ popover.menu > contents {
     background-color: alpha(black, 0.8);
 }
 
+/* Video player: letterbox against black so a portrait clip does not sit on a
+   bright dialog background. */
+.video-surface {
+    background-color: black;
+}
+
+.video-controls {
+    padding: 6px 12px;
+}
+
 /* Quote post card */
 .quote-card-button {
     padding: 0;

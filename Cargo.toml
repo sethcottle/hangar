@@ -10,10 +10,22 @@ description = "A native Bluesky client for Linux"
 repository = "https://github.com/sethcottle/hangar"
 keywords = ["bluesky", "atproto", "gtk", "gnome", "social"]
 categories = ["gui"]
+# Set by gst-plugin-gtk4 0.15, which is the highest MSRV in the tree.
+rust-version = "1.92"
 
 [dependencies]
 gtk4 = { version = "0.11", features = ["v4_14"] }
 libadwaita = { version = "0.9", features = ["v1_5", "gtk_v4_10"] }
+gstreamer = "0.25"
+# gtk4paintablesink, registered statically at startup so users do not have to
+# install gstreamer1.0-gtk4 separately. gtk_v4_14 replaces the crate's
+# gtk_v4_10 default to match this crate's own gtk4 feature.
+#
+# The GL features (waylandegl/x11egl/x11glx) and dmabuf are deliberately left
+# off: they add pkg-config modules to every packaging target, and dmabuf would
+# raise the runtime GStreamer floor from 1.20 to 1.24. The sink falls back to a
+# videoconvert path, which renders correctly.
+gst-plugin-gtk4 = { version = "0.15", default-features = false, features = ["gtk_v4_14"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 atrium-api = { version = "0.25", features = ["agent", "namespace-chatbsky"] }
 atrium-common = "0.1"

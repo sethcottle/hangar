@@ -23,7 +23,9 @@ jobs:
           sudo apt-get install -y \
             libgtk-4-dev \
             libadwaita-1-dev \
-            libsecret-1-dev
+            libsecret-1-dev \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable

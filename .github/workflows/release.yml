@@ -64,7 +64,9 @@ jobs:
             libadwaita-1-dev \
             libsecret-1-dev \
             librsvg2-dev \
-            libfuse2
+            libfuse2 \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -123,12 +125,36 @@ jobs:
           printf '%s\n' '# This is intentional: bundling GTK4/libadwaita from the build' >> AppDir/AppRun
           printf '%s\n' '# environment (Ubuntu 24.04) causes theme/rendering failures on' >> AppDir/AppRun
           printf '%s\n' '# newer distros due to library version mismatches.' >> AppDir/AppRun
+          printf '%s\n' '#' >> AppDir/AppRun
+          printf '%s\n' '# Video also needs the host GStreamer 1.20+. Unlike the media' >> AppDir/AppRun
+          printf '%s\n' '# backend GTK used to dlopen, this one is linked in, so its' >> AppDir/AppRun
+          printf '%s\n' '# absence stops the binary from starting at all rather than' >> AppDir/AppRun
+          printf '%s\n' '# just disabling video. Hence the check below.' >> AppDir/AppRun
           printf '%s\n' '' >> AppDir/AppRun
           printf '%s\n' 'HERE="$(dirname "$(readlink -f "$0")")"' >> AppDir/AppRun
           printf '%s\n' '' >> AppDir/AppRun
           printf '%s\n' '# Make system data dirs available for icon and GSettings schema lookup,' >> AppDir/AppRun
           printf '%s\n' '# while also including our own data dir for the app icon and metainfo.' >> AppDir/AppRun
           printf '%s\n' 'export XDG_DATA_DIRS="${HERE}/usr/share:/usr/share:/usr/local/share:${XDG_DATA_DIRS:-/usr/share}"' >> AppDir/AppRun
+          printf '%s\n' '' >> AppDir/AppRun
+          printf '%s\n' '# Probe for it with ldconfig, which lives in /usr/sbin and is therefore NOT' >> AppDir/AppRun
+          printf '%s\n' '# on the PATH a desktop launcher hands us -- hence the absolute fallbacks.' >> AppDir/AppRun
+          printf '%s\n' '# If no ldconfig can be found at all the probe proves nothing, and a probe' >> AppDir/AppRun
+          printf '%s\n' '# that proves nothing must never be the reason the app refuses to start.' >> AppDir/AppRun
+          printf '%s\n' 'LDCONFIG=""' >> AppDir/AppRun
+          printf '%s\n' 'for candidate in ldconfig /sbin/ldconfig /usr/sbin/ldconfig; do' >> AppDir/AppRun
+          printf '%s\n' '  if command -v "$candidate" >/dev/null 2>&1; then' >> AppDir/AppRun
+          printf '%s\n' '    LDCONFIG="$candidate"' >> AppDir/AppRun
+          printf '%s\n' '    break' >> AppDir/AppRun
+          printf '%s\n' '  fi' >> AppDir/AppRun
+          printf '%s\n' 'done' >> AppDir/AppRun
+          printf '%s\n' '' >> AppDir/AppRun
+          printf '%s\n' 'if [ -n "$LDCONFIG" ] && ! "$LDCONFIG" -p 2>/dev/null | grep -q "libgstgl-1\.0\.so\.0"; then' >> AppDir/AppRun
+          printf '%s\n' '  echo "Hangar: the host GStreamer libraries are missing." >&2' >> AppDir/AppRun
+          printf '%s\n' '  echo "  Debian/Ubuntu: sudo apt install libgstreamer1.0-0 libgstreamer-plugins-base1.0-0 libgstreamer-gl1.0-0 gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav" >&2' >> AppDir/AppRun
+          printf '%s\n' '  echo "  Fedora: sudo dnf install gstreamer1 gstreamer1-plugins-base gstreamer1-plugins-good gstreamer1-plugins-bad-free gstreamer1-libav" >&2' >> AppDir/AppRun
+          printf '%s\n' '  exit 1' >> AppDir/AppRun
+          printf '%s\n' 'fi' >> AppDir/AppRun
           printf '%s\n' '' >> AppDir/AppRun
           printf '%s\n' 'exec "${HERE}/usr/bin/hangar" "$@"' >> AppDir/AppRun
           chmod +x AppDir/AppRun

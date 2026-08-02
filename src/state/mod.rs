@@ -6,4 +6,4 @@ pub mod session_store;
 pub mod settings;
 
 pub use session::SessionManager;
-pub use settings::{AppSettings, ColorScheme, FontSize};
+pub use settings::{AppSettings, ColorScheme, FontSize, VideoVolume};

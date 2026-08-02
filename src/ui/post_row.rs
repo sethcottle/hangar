@@ -1323,19 +1323,24 @@ impl PostRow {
         play_btn.set_halign(gtk4::Align::Center);
         play_btn.set_valign(gtk4::Align::Center);
 
-        // Play in app, falling back to the post on the web if GStreamer cannot
-        // handle the HLS stream.
-        let playlist_url = video.playlist.clone();
+        // Play in app. If the pipeline fails the viewer offers the post on the
+        // web rather than opening it unasked.
+        let video = video.clone();
         let post_row = self.clone();
         play_btn.connect_clicked(move |btn| {
+            // The post on the web, or nothing. Falling back to the playlist
+            // would hand a browser the page of raw text this player exists to
+            // avoid, so the viewer drops the button instead.
             let fallback = post_row
                 .imp()
                 .post
                 .borrow()
                 .as_ref()
-                .map(|p| Self::get_post_url(&p.author.handle, &p.uri))
-                .unwrap_or_else(|| playlist_url.clone());
-            crate::ui::media_viewer::show_video(btn, playlist_url.clone(), fallback);
+                .map(|p| Self::get_post_url(&p.author.handle, &p.uri));
+            crate::ui::media_viewer::show_video(
+                btn,
+                crate::ui::video_player::VideoSource::from_embed(&video, fallback),
+            );
         });
 
         overlay.add_overlay(&play_btn);

@@ -71,6 +71,34 @@ impl Default for FontSize {
 
 impl Eq for FontSize {}
 
+/// Video playback volume, 0.0..=1.0 on a perceptual scale.
+///
+/// A newtype for the same reason `FontSize` is one: a bare `f64` field would
+/// take `f64`'s `Default` of 0.0 both from `AppSettings::default()` and from
+/// serde's missing-field path, so every existing settings file would silently
+/// mean silence. The hand-written `Default` below is what both use.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct VideoVolume(pub f64);
+
+impl VideoVolume {
+    pub const MIN: f64 = 0.0;
+    pub const MAX: f64 = 1.0;
+    pub const STEP: f64 = 0.05;
+    pub const DEFAULT: f64 = 1.0;
+
+    pub fn value(self) -> f64 {
+        self.0.clamp(Self::MIN, Self::MAX)
+    }
+}
+
+impl Default for VideoVolume {
+    fn default() -> Self {
+        Self(Self::DEFAULT)
+    }
+}
+
+impl Eq for VideoVolume {}
+
 /// User-preferred color scheme
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ColorScheme {
@@ -118,6 +146,10 @@ pub struct AppSettings {
     /// needing a hand-written Default impl.
     #[serde(default)]
     pub hide_replies_in_feed: bool,
+    /// Volume for in-app video, shared by every video rather than reset each
+    /// time a viewer opens.
+    #[serde(default)]
+    pub video_volume: VideoVolume,
 }
 
 impl AppSettings {

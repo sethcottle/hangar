@@ -4,6 +4,7 @@ mod app;
 mod atproto;
 mod cache;
 mod config;
+mod media;
 mod runtime;
 mod state;
 mod ui;

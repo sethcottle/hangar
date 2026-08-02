@@ -7,12 +7,48 @@ sdk: org.gnome.Sdk
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
 
+# No ffmpeg extension is declared here, and that is deliberate: on this runtime
+# there is nothing for an app manifest to declare, and the extension people
+# reach for first does not exist.
+#
+# org.freedesktop.Platform.ffmpeg-full stops at 24.08. `flatpak remote-info
+# flathub org.freedesktop.Platform.ffmpeg-full//25.08` answers "Can't find ref",
+# and the newest branch Flathub carries is 24.08, so naming it here would name
+# nothing. freedesktop-sdk 25.08 replaced it with codecs-extra, and
+# org.gnome.Platform//50 -- which is built on 25.08 -- declares that extension
+# point itself:
+#
+#   [Extension org.freedesktop.Platform.codecs-extra]
+#   directory = lib/x86_64-linux-gnu/codecs-extra
+#   version = 25.08-extra
+#   add-ld-path = lib
+#   autodelete = true
+#
+# It carries no no-autodownload, so flatpak installs it alongside the runtime:
+# resolving `flatpak install org.gnome.Platform//50` for an architecture with
+# nothing installed lists org.freedesktop.Platform.codecs-extra 25.08-extra in
+# the transaction. The runtime also already has it on the plugin path, so
+# GST_PLUGIN_SYSTEM_PATH needs no extending either -- the runtime sets it to
+# /app/lib/gstreamer-1.0:/usr/lib/extensions/gstreamer-1.0:/usr/lib/$arch/codecs-extra/lib/gstreamer-1.0:/usr/lib/$arch/gstreamer-1.0
+#
+# That extension is what gives Bluesky's H.264 + AAC HLS somewhere to decode.
+# The base runtime does ship gst-libav, but its ffmpeg is built
+# --disable-decoder='h264,hevc,vc1,vvc'; codecs-extra ships a full one, and its
+# own add-ld-path puts it ahead in the sandbox's ld cache, so libgstlibav.so
+# resolves libavcodec.so.61 to the codecs-extra copy. Measured inside a
+# freedesktop 25.08 sandbox: avdec_h264 and avdec_aac are both present, forcing
+# the base libavcodec back in makes both disappear, and gst-discoverer-1.0 walks
+# a real H.264-High/AAC HLS master playlist end to end.
+
 command: hangar
 
 finish-args:
   - --share=ipc
   - --socket=fallback-x11
   - --socket=wayland
+  # Without an audio socket autoaudiosink cannot link, and playbin3 fails the
+  # whole pipeline rather than playing silently.
+  - --socket=pulseaudio
   - --share=network
   - --device=dri
   - --talk-name=org.freedesktop.secrets
@@ -27,6 +63,18 @@ modules:
   - name: hangar
     buildsystem: simple
     build-commands:
+      # Fail here, with a name, rather than a hundred lines into a build script
+      # that cannot find gstreamer-gl-1.0.
+      #
+      # One invocation per module, because --atleast-version only applies to the
+      # first name on the line: measured on pkgconf 2.5.1, a module that does not
+      # exist at all still exits 0 from the second position onwards. And
+      # --print-errors is no help either, printing nothing when the failure is a
+      # version mismatch, so each check says out loud what it wanted.
+      - 'pkg-config --atleast-version=1.18 gstreamer-1.0 || { echo "hangar: gstreamer-1.0 >= 1.18 is required" >&2; exit 1; }'
+      - 'pkg-config --atleast-version=1.18 gstreamer-base-1.0 || { echo "hangar: gstreamer-base-1.0 >= 1.18 is required" >&2; exit 1; }'
+      - 'pkg-config --atleast-version=1.18 gstreamer-video-1.0 || { echo "hangar: gstreamer-video-1.0 >= 1.18 is required" >&2; exit 1; }'
+      - 'pkg-config --atleast-version=1.18 gstreamer-gl-1.0 || { echo "hangar: gstreamer-gl-1.0 >= 1.18 is required" >&2; exit 1; }'
       - cargo --offline fetch --manifest-path Cargo.toml --verbose
       - cargo --offline build --release --verbose
       - install -Dm755 target/release/hangar /app/bin/hangar

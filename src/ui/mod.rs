@@ -6,6 +6,7 @@ mod login_dialog;
 pub mod media_viewer;
 pub mod post_row;
 pub mod sidebar;
+pub mod video_player;
 mod window;
 
 pub use compose_dialog::{ComposeDialog, QuoteContext, ReplyContext};

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Full-size image viewer.
+//! Full-size image and video viewers.
 //!
 //! Post embeds render thumbnails, which are small and often cropped. This
 //! presents the fullsize variant in a dialog so a post's images can actually
@@ -8,6 +8,7 @@
 
 use crate::atproto::ImageEmbed;
 use crate::ui::avatar_cache;
+use crate::ui::video_player::{VideoPlayer, VideoSource};
 use gtk4::glib;
 use gtk4::prelude::*;
 use libadwaita as adw;
@@ -15,26 +16,17 @@ use libadwaita::prelude::*;
 use std::cell::Cell;
 use std::rc::Rc;
 
-/// How long to wait for a stream to become prepared before giving up on it.
-///
-/// Nothing about a missing decoder is reported synchronously, and GTK 4.22
-/// ships a built-in GStreamer backend, so the media file type is always a real
-/// one even when the pipeline cannot handle the format. Bluesky serves HLS,
-/// whose demuxer lives in gst-plugins-bad and is frequently absent, and the
-/// resulting failure shows up as a stream that simply never prepares. Waiting
-/// on that is the only signal that covers both a missing demuxer and a stalled
-/// fetch.
-const PREPARE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
-
 /// Play a video embed in a dialog.
 ///
 /// Bluesky serves video as an HLS playlist. Handing that URL to the browser is
 /// what produced a page of raw playlist text rather than a video, so play it
-/// here instead. GStreamer does the decoding, and HLS support lives in
-/// gst-plugins-bad, which is not guaranteed to be installed. When the pipeline
-/// reports an error the dialog closes and the post opens on the web, so the
-/// video is still reachable rather than silently doing nothing.
-pub fn show_video(parent: &impl IsA<gtk4::Widget>, playlist_url: String, fallback_url: String) {
+/// here instead, through Hangar's own GStreamer pipeline rather than
+/// `GtkMediaFile`, which cannot decode these streams.
+///
+/// A failure keeps the dialog open and offers the post on the web behind a
+/// button. Opening a browser without being asked is what the old code did, from
+/// a timer that could not tell a slow stream from a broken one.
+pub fn show_video(parent: &impl IsA<gtk4::Widget>, source: VideoSource) {
     let root = match parent
         .as_ref()
         .root()
@@ -52,77 +44,17 @@ pub fn show_video(parent: &impl IsA<gtk4::Widget>, playlist_url: String, fallbac
     let toolbar = adw::ToolbarView::new();
     toolbar.add_top_bar(&adw::HeaderBar::new());
 
-    let media = gtk4::MediaFile::for_file(&gtk4::gio::File::for_uri(&playlist_url));
-    let video = gtk4::Video::new();
-    video.set_hexpand(true);
-    video.set_vexpand(true);
-    video.set_autoplay(true);
-    video.set_media_stream(Some(&media));
+    let player = VideoPlayer::new(source);
+    player.install_shortcuts(&dialog);
 
-    // MediaStream reports failures through the error property rather than by
-    // returning one, so watch it and fall back to the browser.
-    // Guard against reporting failure twice: the error signal and the prepare
-    // timeout can both fire for the same stream.
-    let gave_up = Rc::new(Cell::new(false));
-
-    let fall_back = {
-        let dialog = dialog.clone();
-        let media = media.clone();
-        let fallback_url = fallback_url.clone();
-        let gave_up = gave_up.clone();
-        move |reason: String| {
-            if gave_up.replace(true) {
-                return;
-            }
-            eprintln!(
-                "hangar: {reason}; opening the post in your browser instead.\n  \
-                 In-app playback needs GStreamer with HLS support -- install \
-                 gstreamer1.0-plugins-bad (Debian/Ubuntu) or \
-                 gstreamer1-plugins-bad-free (Fedora)."
-            );
-            media.set_playing(false);
-            dialog.close();
-            let _ = open::that(&fallback_url);
-        }
-    };
-
-    media.connect_error_notify({
-        let fall_back = fall_back.clone();
-        move |media| {
-            if let Some(e) = media.error() {
-                fall_back(format!("video playback failed ({e})"));
-            }
-        }
-    });
-
-    // A missing demuxer produces no error, just a stream that never prepares.
-    glib::timeout_add_local_once(PREPARE_TIMEOUT, {
-        let media = media.clone();
-        let gave_up = gave_up.clone();
-        let fall_back = fall_back.clone();
-        move || {
-            if !gave_up.get() && !media.is_prepared() {
-                fall_back("video could not be decoded".to_string());
-            }
-        }
-    });
-
-    toolbar.set_content(Some(&video));
+    toolbar.set_content(Some(player.widget()));
     dialog.set_child(Some(&toolbar));
 
-    // Stop decoding when the dialog goes away, otherwise audio keeps playing.
-    //
-    // Closing also cancels the prepare timeout. Without this, dismissing a
-    // video that had not started yet left the timer armed, and it fired later
-    // against a dialog that was already gone -- opening a browser tab the user
-    // had not asked for and warning about closing an unpresented AdwDialog.
+    // Tear the pipeline down with the dialog, otherwise it keeps fetching
+    // segments and playing audio into a window nobody can see.
     dialog.connect_closed({
-        let media = media.clone();
-        let gave_up = gave_up.clone();
-        move |_| {
-            gave_up.set(true);
-            media.set_playing(false);
-        }
+        let player = player.clone();
+        move |_| player.stop()
     });
 
     dialog.present(Some(&root));
