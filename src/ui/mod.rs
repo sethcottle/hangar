@@ -7,6 +7,8 @@ pub mod inline_video;
 mod login_dialog;
 pub mod media_viewer;
 pub mod post_row;
+#[cfg(test)]
+mod rebind_audit;
 pub mod sidebar;
 pub mod video_player;
 mod window;

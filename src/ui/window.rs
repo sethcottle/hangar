@@ -661,8 +661,25 @@ impl HangarWindow {
         let list_view = gtk4::ListView::new(Some(selection), Some(factory));
         list_view.add_css_class("background");
 
-        // Wrap in AdwClamp for proper content width
-        let clamp = adw::Clamp::new();
+        // AdwClampScrollable. Same AdwClampLayout and the same content width
+        // as AdwClamp (800 max, tightening from 600); the difference is that it
+        // implements GtkScrollable.
+        //
+        // A GtkScrolledWindow handed a non-scrollable child interposes a
+        // GtkViewport, and a viewport allocates its child the child's natural
+        // height. The GtkListView was told it had 1,254,000px to fill inside a
+        // 900px window, so it never virtualized: 205 rows realized, nothing
+        // painted past them, and `unbind` never fired, so
+        // `release_video_on_unbind` never ran.
+        //
+        // AdwClampScrollable forwards its adjustments and scroll policies
+        // straight through to its child, which makes the chain rigid. The list
+        // has to be this widget's direct child and this widget the scroller's.
+        // A GtkBox or GtkOverlay in between has no such properties to bind, so
+        // GLib warns, `upper` stays 0 and the page stops scrolling. Hence the
+        // spinner overlays outside the scroller, and the plain AdwClamp on the
+        // thread page and the settings sidebar, whose children are boxes.
+        let clamp = adw::ClampScrollable::new();
         clamp.set_maximum_size(800);
         clamp.set_tightening_threshold(600);
         clamp.set_child(Some(&list_view));
@@ -806,14 +823,38 @@ impl HangarWindow {
     /// started on the Likes page and scrolled past would otherwise keep its
     /// decoder and bus watch bound to a rebound row. `release_video` is
     /// idempotent.
+    ///
+    /// Fires constantly now that the lists virtualize. The own profile page
+    /// wraps its rows, so the row is looked up with [`Self::post_row_of`].
     pub(crate) fn release_video_on_unbind(factory: &gtk4::SignalListItemFactory) {
         factory.connect_unbind(|_, item| {
             if let Some(list_item) = item.downcast_ref::<gtk4::ListItem>()
-                && let Some(post_row) = list_item.child().and_downcast::<PostRow>()
+                && let Some(post_row) = Self::post_row_of(list_item)
             {
                 post_row.release_video();
             }
         });
+    }
+
+    /// The `PostRow` a list slot is showing.
+    ///
+    /// Most feeds set a bare `PostRow` as the slot child. The own profile page
+    /// sets a box holding a `PostRow` plus a host for the page header, so there
+    /// the row is one level down. One level only; this is a lookup for a known
+    /// shape.
+    fn post_row_of(list_item: &gtk4::ListItem) -> Option<PostRow> {
+        let child = list_item.child()?;
+        if let Ok(post_row) = child.clone().downcast::<PostRow>() {
+            return Some(post_row);
+        }
+        let mut candidate = child.first_child();
+        while let Some(widget) = candidate {
+            if let Ok(post_row) = widget.clone().downcast::<PostRow>() {
+                return Some(post_row);
+            }
+            candidate = widget.next_sibling();
+        }
+        None
     }
 
     /// Re-arm the election timer if a director exists.
@@ -1538,7 +1579,14 @@ impl HangarWindow {
         bottom_spacer.set_height_request(24);
         scroll_content.append(&bottom_spacer);
 
-        // Wrap in AdwClamp for proper content width (matching timeline)
+        // Plain AdwClamp, where the feeds use AdwClampScrollable.
+        //
+        // `scroll_content` is a hand-built GtkBox of PostRows, so there is
+        // nothing to virtualize and no GtkScrollable to forward to.
+        // AdwClampScrollable would bind its adjustments onto a GtkBox that has
+        // no such properties and the page would stop scrolling: measured
+        // `upper` 0 against 16,720. Virtualizing a thread means converting this
+        // box to a list first.
         let clamp = adw::Clamp::new();
         clamp.set_maximum_size(800);
         clamp.set_tightening_threshold(600);
@@ -1732,8 +1780,11 @@ impl HangarWindow {
         let list_view = gtk4::ListView::new(Some(selection), Some(factory));
         list_view.add_css_class("background");
 
-        // Wrap in AdwClamp for proper content width
-        let clamp = adw::Clamp::new();
+        // Content width, and the scrollability the list needs to virtualize.
+        // See `build_timeline`. The list has to be this widget's direct child
+        // and this widget the scroller's; a box or overlay between them breaks
+        // scrolling.
+        let clamp = adw::ClampScrollable::new();
         clamp.set_maximum_size(800);
         clamp.set_tightening_threshold(600);
         clamp.set_child(Some(&list_view));
@@ -1842,8 +1893,11 @@ impl HangarWindow {
         let list_view = gtk4::ListView::new(Some(selection), Some(factory));
         list_view.add_css_class("background");
 
-        // Wrap in AdwClamp for proper content width
-        let clamp = adw::Clamp::new();
+        // Content width, and the scrollability the list needs to virtualize.
+        // See `build_timeline`. The list has to be this widget's direct child
+        // and this widget the scroller's; a box or overlay between them breaks
+        // scrolling.
+        let clamp = adw::ClampScrollable::new();
         clamp.set_maximum_size(800);
         clamp.set_tightening_threshold(600);
         clamp.set_child(Some(&list_view));
@@ -2026,8 +2080,11 @@ impl HangarWindow {
         let list_view = gtk4::ListView::new(Some(selection), Some(factory));
         list_view.add_css_class("background");
 
-        // Wrap in AdwClamp for proper content width
-        let clamp = adw::Clamp::new();
+        // Content width, and the scrollability the list needs to virtualize.
+        // See `build_timeline`. The list has to be this widget's direct child
+        // and this widget the scroller's; a box or overlay between them breaks
+        // scrolling.
+        let clamp = adw::ClampScrollable::new();
         clamp.set_maximum_size(800);
         clamp.set_tightening_threshold(600);
         clamp.set_child(Some(&list_view));
@@ -2187,8 +2244,11 @@ impl HangarWindow {
         let list_view = gtk4::ListView::new(Some(selection), Some(factory));
         list_view.add_css_class("background");
 
-        // Wrap in AdwClamp for proper content width
-        let clamp = adw::Clamp::new();
+        // Content width, and the scrollability the list needs to virtualize.
+        // See `build_timeline`. The list has to be this widget's direct child
+        // and this widget the scroller's; a box or overlay between them breaks
+        // scrolling.
+        let clamp = adw::ClampScrollable::new();
         clamp.set_maximum_size(800);
         clamp.set_tightening_threshold(600);
         clamp.set_child(Some(&list_view));
@@ -2366,24 +2426,46 @@ impl HangarWindow {
     }
 
     /// Build the own profile content (header + tabs + posts)
+    ///
+    /// The banner/avatar/bio block still scrolls away with the posts, but it is
+    /// row 0 of the list now instead of a sibling above it.
+    ///
+    /// The old shape was scroller, box, overlay, list. Two non-scrollable
+    /// widgets in the way, so the list was handed its full natural height and
+    /// stopped realizing rows a couple of hundred posts in. Nothing can sit
+    /// between the scroller and the list, so the spinner overlay moved outside
+    /// the scroller (matching Mentions, Activity, Likes and Search) and the
+    /// header became a row.
+    ///
+    /// `GtkListView::set_header_factory` was measured and rejected. A section
+    /// header stays pinned to the top of the viewport and drags the first post
+    /// with it, which spends most of the page on content already scrolled past.
     fn build_own_profile_content(&self) -> gtk4::Box {
         let profile_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         profile_box.set_vexpand(true);
 
-        // Scrollable content for entire profile
+        // The spinner overlay wraps the scroller now. An overlay between the
+        // scroller and the list breaks scrolling.
+        let overlay = gtk4::Overlay::new();
+        overlay.set_vexpand(true);
+
         let scrolled = gtk4::ScrolledWindow::new();
         scrolled.set_vexpand(true);
         scrolled.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
 
-        let scroll_content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        // Everything above the posts, built once and kept. The imp references
+        // the profile-load path writes into (banner, avatar, counts) point into
+        // this tree, so it cannot be rebuilt per bind. The factory moves this
+        // one instance between slots.
+        let header_block = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
 
         // Profile header section (banner, avatar, info, stats)
         let header_section = self.build_profile_header_section();
-        scroll_content.append(&header_section);
+        header_block.append(&header_section);
 
         // Separator
         let sep = gtk4::Separator::new(gtk4::Orientation::Horizontal);
-        scroll_content.append(&sep);
+        header_block.append(&sep);
 
         // Posts label
         let posts_label = gtk4::Label::new(Some("Posts"));
@@ -2392,33 +2474,117 @@ impl HangarWindow {
         posts_label.set_margin_start(16);
         posts_label.set_margin_top(12);
         posts_label.set_margin_bottom(8);
-        scroll_content.append(&posts_label);
+        header_block.append(&posts_label);
 
-        // Posts list
-        let overlay = gtk4::Overlay::new();
-        overlay.set_vexpand(true);
-
+        // Posts list. A GtkFlattenListModel over two stores: a one-item store
+        // for the header, then the posts. `profile_page_model` stays the posts
+        // store, so `set_profile_posts` and `append_profile_posts` are
+        // unchanged and cannot clear the header.
         let model = gio::ListStore::new::<PostObject>();
+        let header_marker = gio::ListStore::new::<gtk4::StringObject>();
+        header_marker.append(&gtk4::StringObject::new("profile-header"));
+        let sections = gio::ListStore::new::<gio::ListStore>();
+        sections.append(&header_marker);
+        sections.append(&model);
+        let flattened = gtk4::FlattenListModel::new(Some(sections));
+
         let factory = gtk4::SignalListItemFactory::new();
 
+        // Each slot can be either row. Both children are built in setup and
+        // shown or hidden in bind. A hidden child adds nothing to a GtkBox's
+        // size, so a post row is never padded out to the header's height. A
+        // GtkStack is homogeneous by default and would do exactly that.
         factory.connect_setup(|_, item| {
+            let Some(list_item) = item.downcast_ref::<gtk4::ListItem>() else {
+                return;
+            };
+            let slot = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+            let header_host = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+            header_host.set_visible(false);
             let post_row = PostRow::new();
-            if let Some(list_item) = item.downcast_ref::<gtk4::ListItem>() {
-                list_item.set_child(Some(&post_row));
-            }
+            slot.append(&header_host);
+            slot.append(&post_row);
+            list_item.set_child(Some(&slot));
         });
         Self::release_video_on_unbind(&factory);
 
+        // Take the header back out of the slot that held it, so the slot can
+        // be recycled into a post row. Without this the header stays parented
+        // to a slot GTK has already reused.
+        //
+        // A second `connect_unbind`; `release_video_on_unbind` is shared by
+        // every feed and this is only this page's business. Both handlers run.
+        let header_for_unbind = header_block.clone();
+        factory.connect_unbind(move |_, item| {
+            let Some(list_item) = item.downcast_ref::<gtk4::ListItem>() else {
+                return;
+            };
+            let Some(host) = header_for_unbind.parent().and_downcast::<gtk4::Box>() else {
+                return;
+            };
+            // Only if it is *this* slot that is holding it.
+            if host.parent() != list_item.child() {
+                return;
+            }
+            host.remove(&header_for_unbind);
+            host.set_visible(false);
+        });
+
         let win = self.downgrade();
+        let header_for_bind = header_block.clone();
         factory.connect_bind(move |_, item| {
             let Some(win) = win.upgrade() else {
                 return;
             };
+
+            let slot = item
+                .downcast_ref::<gtk4::ListItem>()
+                .and_then(|list_item| list_item.child())
+                .and_downcast::<gtk4::Box>();
+            let host = slot
+                .as_ref()
+                .and_then(|slot| slot.first_child())
+                .and_downcast::<gtk4::Box>();
+
+            // Row 0 is the header marker. Give this slot the header widget and
+            // hide its post row.
+            if let Some(list_item) = item.downcast_ref::<gtk4::ListItem>()
+                && list_item
+                    .item()
+                    .and_downcast::<gtk4::StringObject>()
+                    .is_some()
+                && let Some(host) = host.as_ref()
+            {
+                // GTK may bind a slot before unbinding the one it replaces, so
+                // take the header off its previous host first. Reparenting a
+                // widget that still has a parent is a warning.
+                if let Some(previous) = header_for_bind.parent().and_downcast::<gtk4::Box>() {
+                    previous.remove(&header_for_bind);
+                    previous.set_visible(false);
+                }
+                host.append(&header_for_bind);
+                host.set_visible(true);
+                if let Some(post_row) = host.next_sibling() {
+                    post_row.set_visible(false);
+                }
+                return;
+            }
+
+            // An ordinary post. Reclaim the header here too if this slot was
+            // holding it; waiting on unbind would depend on GTK's ordering.
+            if let Some(host) = host.as_ref() {
+                if header_for_bind.parent().as_ref() == Some(host.upcast_ref::<gtk4::Widget>()) {
+                    host.remove(&header_for_bind);
+                }
+                host.set_visible(false);
+            }
+
             if let Some(list_item) = item.downcast_ref::<gtk4::ListItem>()
                 && let Some(post_object) = list_item.item().and_downcast::<PostObject>()
                 && let Some(post) = post_object.post()
-                && let Some(post_row) = list_item.child().and_downcast::<PostRow>()
+                && let Some(post_row) = Self::post_row_of(list_item)
             {
+                post_row.set_visible(true);
                 post_row.bind(&post);
                 let post_for_like = post.clone();
                 let w = win.downgrade();
@@ -2489,10 +2655,19 @@ impl HangarWindow {
             }
         });
 
-        let selection = gtk4::NoSelection::new(Some(model.clone()));
+        // Over the flattened model, so row 0 is the header and row n+1 is
+        // post n.
+        let selection = gtk4::NoSelection::new(Some(flattened));
         let list_view = gtk4::ListView::new(Some(selection), Some(factory));
         list_view.add_css_class("background");
-        overlay.set_child(Some(&list_view));
+
+        // The list is the scroller's direct child, with nothing in between.
+        // This page has never clamped its content width, and that is unchanged;
+        // the banner still runs the full width of the window. Clamping it to
+        // match the other-user profile would be an AdwClampScrollable in this
+        // one line.
+        scrolled.set_child(Some(&list_view));
+        overlay.set_child(Some(&scrolled));
 
         // Loading spinner
         let spinner = gtk4::Spinner::new();
@@ -2502,9 +2677,7 @@ impl HangarWindow {
         spinner.set_margin_bottom(16);
         overlay.add_overlay(&spinner);
 
-        scroll_content.append(&overlay);
-        scrolled.set_child(Some(&scroll_content));
-        profile_box.append(&scrolled);
+        profile_box.append(&overlay);
 
         // Store references
         let imp = self.imp();
@@ -2862,8 +3035,11 @@ impl HangarWindow {
         let list_view = gtk4::ListView::new(Some(selection), Some(factory));
         list_view.add_css_class("background");
 
-        // Wrap in AdwClamp for proper content width
-        let clamp = adw::Clamp::new();
+        // Content width, and the scrollability the list needs to virtualize.
+        // See `build_timeline`. The list has to be this widget's direct child
+        // and this widget the scroller's; a box or overlay between them breaks
+        // scrolling.
+        let clamp = adw::ClampScrollable::new();
         clamp.set_maximum_size(800);
         clamp.set_tightening_threshold(600);
         clamp.set_child(Some(&list_view));
@@ -3106,8 +3282,11 @@ impl HangarWindow {
         let list_view = gtk4::ListView::new(Some(selection), Some(factory));
         list_view.add_css_class("background");
 
-        // Wrap in AdwClamp for proper content width
-        let clamp = adw::Clamp::new();
+        // Content width, and the scrollability the list needs to virtualize.
+        // See `build_timeline`. The list has to be this widget's direct child
+        // and this widget the scroller's; a box or overlay between them breaks
+        // scrolling.
+        let clamp = adw::ClampScrollable::new();
         clamp.set_maximum_size(800);
         clamp.set_tightening_threshold(600);
         clamp.set_child(Some(&list_view));
@@ -4935,6 +5114,31 @@ mod tests {
         }
     }
 
+    /// The smallest `Post` that binds: no embed, no counts.
+    fn a_post(id: &str) -> Post {
+        Post {
+            uri: format!("at://did:plc:test/app.bsky.feed.post/{id}"),
+            cid: "cid".into(),
+            author: Profile::minimal(
+                "did:plc:test".into(),
+                "someone.bsky.social".into(),
+                Some("Someone".into()),
+                None,
+            ),
+            text: format!("post {id}"),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            indexed_at: "2026-01-01T00:00:00Z".into(),
+            like_count: None,
+            repost_count: None,
+            reply_count: None,
+            embed: None,
+            viewer_like: None,
+            viewer_repost: None,
+            repost_reason: None,
+            reply_context: None,
+        }
+    }
+
     /// Every click gesture on `widget`, as its propagation phase.
     fn click_phases(widget: &gtk4::Widget) -> Vec<gtk4::PropagationPhase> {
         let list = widget.observe_controllers();
@@ -5074,5 +5278,303 @@ mod tests {
             crate::ui::inline_video::director().is_none(),
             "the director outlived its window, so its election source did too"
         );
+    }
+
+    /// The own profile page's chain, and where its header lives.
+    ///
+    /// Two things, neither visible from outside once the page is built:
+    ///
+    /// 1. the `GtkListView` is the `GtkScrolledWindow`'s direct child. The page
+    ///    used to be scroller, box, overlay, list, and the scroller cannot
+    ///    forward scrolling through either of the middle two, so the list was
+    ///    allocated its full natural height and stopped virtualizing.
+    /// 2. the banner/avatar/bio block is row 0 of the list, which is what keeps
+    ///    it scrolling with the posts. `profile_page_model` stays the posts
+    ///    store, so post n is row n + 1 and `set_profile_posts` never has to
+    ///    know about the header.
+    #[test]
+    fn the_own_profile_header_is_the_first_row_of_a_directly_scrollable_list() {
+        crate::ui::with_gtk(
+            the_own_profile_header_is_the_first_row_of_a_directly_scrollable_list_body,
+        );
+    }
+
+    fn the_own_profile_header_is_the_first_row_of_a_directly_scrollable_list_body() {
+        let window: HangarWindow = glib::Object::builder().build();
+
+        let scrolled = window
+            .imp()
+            .profile_page_scrolled
+            .borrow()
+            .clone()
+            .expect("the own profile page built a scroller");
+
+        // 1. Nothing between the scroller and the list.
+        let child = scrolled.child().expect("the scroller has a child");
+        let list = child.downcast::<gtk4::ListView>().unwrap_or_else(|w| {
+            panic!(
+                "the own profile scroller's direct child is a {} — anything but the \
+                 GtkListView here stops the list virtualizing",
+                w.type_().name()
+            )
+        });
+
+        // The posts store is what the load path appends to. Starts empty.
+        let posts = window
+            .imp()
+            .profile_page_model
+            .borrow()
+            .clone()
+            .expect("the own profile page built a posts model");
+        assert_eq!(posts.n_items(), 0, "the posts store did not start empty");
+
+        let rows = list.model().expect("the list has a model");
+        assert_eq!(
+            rows.n_items(),
+            1,
+            "with no posts the list should still hold exactly one row: the header"
+        );
+
+        // 2. Row 0 is the header marker, and posts land after it.
+        assert!(
+            rows.item(0).and_downcast::<gtk4::StringObject>().is_some(),
+            "row 0 is not the header marker, so the page header is not in the list"
+        );
+
+        window.set_profile_posts(vec![a_post("one"), a_post("two"), a_post("three")]);
+        assert_eq!(
+            posts.n_items(),
+            3,
+            "set_profile_posts did not fill the posts store"
+        );
+        assert_eq!(
+            rows.n_items(),
+            4,
+            "the flattened model should be the header plus three posts"
+        );
+        assert!(
+            rows.item(0).and_downcast::<gtk4::StringObject>().is_some(),
+            "set_profile_posts clobbered the header row"
+        );
+        assert!(
+            rows.item(1).and_downcast::<PostObject>().is_some(),
+            "the first post is not directly after the header"
+        );
+
+        // Replacing the posts must not take the header with them.
+        window.set_profile_posts(vec![a_post("only")]);
+        assert_eq!(
+            rows.n_items(),
+            2,
+            "a reload left the model the wrong length"
+        );
+        assert!(
+            rows.item(0).and_downcast::<gtk4::StringObject>().is_some(),
+            "reloading the profile removed the header row"
+        );
+
+        window.destroy();
+    }
+
+    // ---------------------------------------------------------------------
+    // The scroller-to-list chain, on the pages this app actually builds
+    // ---------------------------------------------------------------------
+
+    /// The first `GtkListView` at or under `widget`.
+    fn find_list_view(widget: &gtk4::Widget) -> Option<gtk4::ListView> {
+        if let Ok(list) = widget.clone().downcast::<gtk4::ListView>() {
+            return Some(list);
+        }
+        let mut child = widget.first_child();
+        while let Some(current) = child {
+            if let Some(found) = find_list_view(&current) {
+                return Some(found);
+            }
+            child = current.next_sibling();
+        }
+        None
+    }
+
+    /// The first `GtkScrolledWindow` at or under `widget`.
+    fn find_scrolled_window(widget: &gtk4::Widget) -> Option<gtk4::ScrolledWindow> {
+        if let Ok(scrolled) = widget.clone().downcast::<gtk4::ScrolledWindow>() {
+            return Some(scrolled);
+        }
+        let mut child = widget.first_child();
+        while let Some(current) = child {
+            if let Some(found) = find_scrolled_window(&current) {
+                return Some(found);
+            }
+            child = current.next_sibling();
+        }
+        None
+    }
+
+    /// Assert that `scrolled` can drive the list underneath it.
+    ///
+    /// Two checks. First the shape: no `GtkViewport` between the scroller and
+    /// the list. `GtkScrolledWindow` interposes one for a child that is not a
+    /// `GtkScrollable`, and a viewport allocates its child the child's natural
+    /// height, so the list is sized as though it were fully on screen.
+    ///
+    /// Then the mechanism: the list's `vadjustment` has to be the scroller's
+    /// own `GtkAdjustment` object. `AdwClampScrollable` forwards its
+    /// adjustments to its child, so the one object reaches the list. With a
+    /// viewport interposed the viewport takes the scroller's adjustment and the
+    /// list keeps its default, and scrolling never reaches it.
+    ///
+    /// `child.is::<gtk4::Scrollable>()` would prove nothing here, since
+    /// `GtkViewport` is itself a `GtkScrollable`. Measured on this window: with
+    /// `AdwClampScrollable` the chain is scroller, clamp, list and the two
+    /// adjustments are one pointer; with `AdwClamp` it is scroller, viewport,
+    /// clamp, list and they are two.
+    fn assert_scroller_drives_its_list(page: &str, scrolled: &gtk4::ScrolledWindow) {
+        use gtk4::prelude::ScrollableExt;
+
+        let child = scrolled
+            .child()
+            .unwrap_or_else(|| panic!("{page}: the scroller has no child at all"));
+
+        assert!(
+            !child.is::<gtk4::Viewport>(),
+            "{page}: the scroller's direct child is a GtkViewport, which GTK only \
+             interposes when it is handed a child that is not a GtkScrollable. \
+             An AdwClamp does that; an AdwClampScrollable does not. The viewport \
+             allocates the list its full natural height, so the list believes it \
+             is entirely on screen and stops recycling rows — the feed goes blank \
+             a couple of hundred posts in and every realized row holds its video \
+             slot for the session."
+        );
+
+        let list = find_list_view(&child)
+            .unwrap_or_else(|| panic!("{page}: no GtkListView anywhere under the scroller"));
+
+        let list_adjustment = list
+            .vadjustment()
+            .unwrap_or_else(|| panic!("{page}: the list has no vadjustment"));
+
+        assert!(
+            list_adjustment == scrolled.vadjustment(),
+            "{page}: the list's vadjustment is not the scroller's — they are two \
+             different GtkAdjustment objects, so scrolling the page never reaches \
+             the list and the list never learns which rows to realize. This is \
+             what a non-scrollable widget between the scroller and the list does; \
+             the scroller's child here is a {}.",
+            child.type_().name()
+        );
+    }
+
+    /// Every feed page this window builds, and the one it builds on demand.
+    ///
+    /// The seven `AdwClamp` to `AdwClampScrollable` swaps only count at the
+    /// call sites, and a clamp built inside a test says nothing about what
+    /// `window.rs` uses. So this walks the trees the app constructs: six feeds
+    /// off the window's own fields, plus the other-user profile page, which is
+    /// built per profile. Reverting any one of the seven turns this red on that
+    /// page's name.
+    ///
+    /// The pages that keep a plain `AdwClamp` are covered by
+    /// [`the_thread_page_keeps_the_viewport_its_box_of_rows_needs`].
+    #[test]
+    fn every_feed_the_app_builds_hands_its_list_straight_to_the_scroller() {
+        crate::ui::with_gtk(every_feed_the_app_builds_hands_its_list_straight_to_the_scroller_body);
+    }
+
+    fn every_feed_the_app_builds_hands_its_list_straight_to_the_scroller_body() {
+        let window: HangarWindow = glib::Object::builder().build();
+        let imp = window.imp();
+
+        let mut feeds: Vec<(&str, gtk4::ScrolledWindow)> = Vec::new();
+        for (page, cell) in [
+            ("timeline", &imp.scrolled_window),
+            ("mentions", &imp.mentions_scrolled_window),
+            ("activity", &imp.activity_scrolled_window),
+            ("chat", &imp.chat_scrolled_window),
+            ("likes", &imp.likes_scrolled_window),
+            ("search", &imp.search_scrolled_window),
+        ] {
+            let scrolled = cell
+                .borrow()
+                .clone()
+                .unwrap_or_else(|| panic!("the {page} page did not build a scroller"));
+            feeds.push((page, scrolled));
+        }
+
+        // The other-user profile page is built per profile, so there is no
+        // field to read. Build one and walk it.
+        let profile = Profile::minimal(
+            "did:plc:other".into(),
+            "other.bsky.social".into(),
+            Some("Other".into()),
+            None,
+        );
+        let profile_page = window.build_profile_page(&profile, vec![a_post("one")]);
+        let profile_content = profile_page
+            .child()
+            .expect("the other-user profile page has content");
+        let profile_scrolled = find_scrolled_window(&profile_content)
+            .expect("the other-user profile page has a scroller");
+        feeds.push(("other-user profile", profile_scrolled));
+
+        assert_eq!(
+            feeds.len(),
+            7,
+            "this test is meant to cover all seven swapped feeds"
+        );
+
+        for (page, scrolled) in &feeds {
+            assert_scroller_drives_its_list(page, scrolled);
+        }
+
+        // The own profile page has no clamp; its list is the scroller's direct
+        // child. The same two properties still have to hold.
+        let own_profile = imp
+            .profile_page_scrolled
+            .borrow()
+            .clone()
+            .expect("the own profile page built a scroller");
+        assert_scroller_drives_its_list("own profile", &own_profile);
+
+        window.destroy();
+    }
+
+    /// The thread page keeps its `GtkViewport`.
+    ///
+    /// Its content is a hand-built `GtkBox` of `PostRow`s, so there is nothing
+    /// to virtualize and nothing to forward adjustments to. An
+    /// `AdwClampScrollable` would bind its adjustments onto a `GtkBox` that has
+    /// no such properties and the page would stop scrolling.
+    ///
+    /// Asserted so the exception stays deliberate. If the thread page ever
+    /// becomes a list, this is the test that says so.
+    #[test]
+    fn the_thread_page_keeps_the_viewport_its_box_of_rows_needs() {
+        crate::ui::with_gtk(the_thread_page_keeps_the_viewport_its_box_of_rows_needs_body);
+    }
+
+    fn the_thread_page_keeps_the_viewport_its_box_of_rows_needs_body() {
+        let window: HangarWindow = glib::Object::builder().build();
+
+        let page = window.build_thread_page(&a_post("main"), vec![a_post("reply")]);
+        let content = page.child().expect("the thread page has content");
+        let scrolled = find_scrolled_window(&content).expect("the thread page has a scroller");
+        let child = scrolled.child().expect("the thread scroller has a child");
+
+        assert!(
+            child.is::<gtk4::Viewport>(),
+            "the thread page's scroller child is a {} rather than the GtkViewport \
+             its GtkBox of rows needs. An AdwClampScrollable here binds its \
+             adjustments onto a widget that has none and the page stops scrolling; \
+             if this page has become a GtkListView, this test should be replaced \
+             by an entry in the feed table above, not deleted.",
+            child.type_().name()
+        );
+        assert!(
+            find_list_view(&child).is_none(),
+            "the thread page has become a GtkListView, so it should be virtualized \
+             and covered by the feed table above rather than kept on a viewport"
+        );
+
+        window.destroy();
     }
 }

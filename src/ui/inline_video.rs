@@ -1011,15 +1011,20 @@ mod tests {
     /// lands in the middle of it rather than at the end.
     const HARNESS_POSTS: u32 = 3000;
 
-    /// How a feed's list is put into its scroller.
+    /// How a feed's list is put into its scroller, for the director tests.
+    ///
+    /// Both variants virtualize. Built here, so neither says anything about
+    /// what `window.rs` uses; the call sites are pinned by
+    /// `every_feed_the_app_builds_hands_its_list_straight_to_the_scroller`
+    /// over there.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Layout {
-        /// What ships: the list inside an AdwClamp, which is not a
-        /// GtkScrollable, so nothing is recycled. See
-        /// `the_shipped_clamp_layout_never_recycles_a_row`.
+        /// Shaped like the timeline and the other clamped feeds: the list
+        /// inside an `AdwClampScrollable`, which caps width at 800 and passes
+        /// the scroller's adjustments through to the list.
         Clamped,
-        /// The list handed straight to the scroller, so GtkListView pools and
-        /// rebinds rows. What `release_video_on_unbind` is written for.
+        /// Shaped like the own profile page: the list handed straight to the
+        /// scroller, unclamped.
         Recycling,
     }
 
@@ -1061,6 +1066,24 @@ mod tests {
             repost_reason: None,
             reply_context: None,
         }
+    }
+
+    /// Count how many times a list's factory binds and unbinds a row.
+    ///
+    /// Whether `unbind` fires at all is what separates a recycling list from
+    /// one that is not, and it has to be counted as it happens. The counters go
+    /// on the factory the list already has, so this works on the app's timeline
+    /// as well as a harness one.
+    fn count_binds(list: &gtk4::ListView) -> (Rc<Cell<usize>>, Rc<Cell<usize>>) {
+        let binds = Rc::new(Cell::new(0usize));
+        let unbinds = Rc::new(Cell::new(0usize));
+        if let Some(factory) = list.factory().and_downcast::<gtk4::SignalListItemFactory>() {
+            let b = binds.clone();
+            factory.connect_bind(move |_, _| b.set(b.get() + 1));
+            let u = unbinds.clone();
+            factory.connect_unbind(move |_, _| u.set(u.get() + 1));
+        }
+        (binds, unbinds)
     }
 
     /// One page of the app: a scroller full of video posts, with the same
@@ -1107,7 +1130,9 @@ mod tests {
         scrolled.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
         match layout {
             Layout::Clamped => {
-                let clamp = libadwaita::Clamp::new();
+                // Same widget and numbers as the feeds, but built here, so it
+                // proves nothing about `window.rs`. See [`Layout`].
+                let clamp = libadwaita::ClampScrollable::new();
                 clamp.set_maximum_size(800);
                 clamp.set_tightening_threshold(600);
                 clamp.set_child(Some(&list));
@@ -1120,11 +1145,24 @@ mod tests {
 
     /// A window shaped like the app's: `AdwWindow`, so a dialog presented over
     /// it goes into its dialog host and can be counted where it lands.
+    /// The `GtkEntry` above the content is a focus sink, and it is load
+    /// bearing. A `GtkListView` holding the window focus keeps the focused row
+    /// realized and pinned to the top of the viewport at every scroll offset.
+    /// With the scroller as the whole content there is nothing else focusable,
+    /// so the election only ever sees post 0. Measured: without the sink every
+    /// offset from 20,000 to 480,000 reports `topmost post Some(0)`; with it
+    /// the same sweep reports 205, 820, 1025, 1230. The real window has a
+    /// sidebar and headerbar buttons to take that focus.
     fn harness_window(content: &impl IsA<gtk4::Widget>) -> libadwaita::Window {
         let window = libadwaita::Window::new();
         window.set_default_size(700, 900);
-        window.set_content(Some(content));
+        let outer = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        let focus_sink = gtk4::Entry::new();
+        outer.append(&focus_sink);
+        outer.append(content);
+        window.set_content(Some(&outer));
         window.present();
+        focus_sink.grab_focus();
         window
     }
 
@@ -1184,6 +1222,23 @@ mod tests {
             .ok()
     }
 
+    /// The post a row is showing.
+    ///
+    /// Harness rows carry the number in their widget name. The app's own rows
+    /// have no name, so the number comes off the text the row paints. Naming
+    /// production rows for the benefit of a test would put the test back to
+    /// measuring the harness.
+    fn row_post_number(row: &crate::ui::post_row::PostRow) -> Option<u32> {
+        if let Some(number) = post_number(&row.widget_name()) {
+            return Some(number);
+        }
+        let mut all = Vec::new();
+        descendants(row.upcast_ref(), &mut all);
+        all.into_iter()
+            .filter_map(|w| w.downcast::<gtk4::Label>().ok())
+            .find_map(|label| label.text().strip_prefix("post home:")?.parse().ok())
+    }
+
     fn slot_post_number(slot: &VideoSlot) -> Option<u32> {
         post_number(&slot.source.playlist_url)
     }
@@ -1200,7 +1255,7 @@ mod tests {
         let mut seen: Vec<(u32, f64, bool)> = rows_of(list)
             .iter()
             .filter_map(|row| {
-                let number = post_number(&row.widget_name())?;
+                let number = row_post_number(row)?;
                 let top = row
                     .compute_bounds(scrolled)
                     .map(|b| f64::from(b.y()))
@@ -1234,11 +1289,12 @@ mod tests {
             if let Some(hit) = scrolled.pick(width / 2.0, y, gtk4::PickFlags::DEFAULT) {
                 let mut cursor = Some(hit);
                 while let Some(widget) = cursor {
-                    if widget.is::<crate::ui::post_row::PostRow>()
-                        && let Some(number) = post_number(&widget.widget_name())
-                        && !seen.contains(&number)
-                    {
-                        seen.push(number);
+                    if let Ok(row) = widget.clone().downcast::<crate::ui::post_row::PostRow>() {
+                        if let Some(number) = row_post_number(&row)
+                            && !seen.contains(&number)
+                        {
+                            seen.push(number);
+                        }
                         break;
                     }
                     cursor = widget.parent();
@@ -1648,53 +1704,417 @@ mod tests {
         }
     }
 
-    /// AdwClamp is not a GtkScrollable, so the scroller wraps it in a
-    /// GtkViewport and the list is allocated its full height: no recycling, so
-    /// `release_video_on_unbind` never fires. Records the slot count a page
-    /// holds.
-    #[test]
-    fn the_shipped_clamp_layout_never_recycles_a_row() {
-        with_gtk(the_shipped_clamp_layout_never_recycles_a_row_body);
+    /// Posts for the deep-scroll proof. Big enough that the offsets below land
+    /// thousands of rows in.
+    const DEEP_POSTS: u32 = 5000;
+
+    /// One embed a row is painting: the widget's type, and its allocation.
+    type PaintedMedia = (String, i32, i32);
+
+    /// A row on screen: the post it is showing, and the media it is painting.
+    type PaintedRow = (u32, Vec<PaintedMedia>);
+
+    /// The media a row is painting.
+    ///
+    /// Filtered on the `video-embed` CSS class rather than widget type. A
+    /// `PostRow` is full of `GtkImage` icons (like, repost, overflow) and
+    /// counting those would pass on a row with no media at all.
+    fn media_on(row: &crate::ui::post_row::PostRow) -> Vec<PaintedMedia> {
+        let mut all = Vec::new();
+        descendants(row.upcast_ref(), &mut all);
+        all.into_iter()
+            .filter(|w| {
+                w.is_mapped()
+                    && w.width() > 0
+                    && w.height() > 0
+                    && w.css_classes().iter().any(|c| c == "video-embed")
+            })
+            .map(|w| (w.type_().name().to_string(), w.width(), w.height()))
+            .collect()
     }
 
-    fn the_shipped_clamp_layout_never_recycles_a_row_body() {
-        let director = VideoDirector::new(&crate::state::AppSettings::default());
-        set_director(&director);
+    /// The rows the real timeline is painting right now, with their media.
+    fn painted_rows(list: &gtk4::ListView, scrolled: &gtk4::ScrolledWindow) -> Vec<PaintedRow> {
+        let painted = posts_rendered_in(scrolled);
+        rows_of(list)
+            .into_iter()
+            .filter_map(|row| {
+                let number = row_post_number(&row)?;
+                painted.contains(&number).then(|| (number, media_on(&row)))
+            })
+            .collect()
+    }
 
-        let (scrolled, list) = harness_feed("home", HARNESS_POSTS, Layout::Clamped);
-        director.set_timeline_scroller(&scrolled);
-        let window = harness_window(&scrolled);
+    /// The migration, measured on the timeline the app builds, at five offsets
+    /// into a five thousand post feed.
+    ///
+    /// Five claims: the list is allocated the viewport rather than its whole
+    /// natural height; the realized row set stays bounded; `unbind` fires, so
+    /// `release_video_on_unbind` runs; GTK paints at every offset and what it
+    /// paints follows the scroll; every row on screen still has its media.
+    ///
+    /// The last one needs the `bind` fix. At these offsets every visible row
+    /// has been rebound hundreds of times, so a feed that virtualized without
+    /// an idempotent `bind` would pass the first four and fail here.
+    ///
+    /// Drives a real `HangarWindow`. A clamp built inside this file measures
+    /// libadwaita: an earlier version of this test stayed green after all seven
+    /// `window.rs` call sites were flipped back to `AdwClamp`.
+    #[test]
+    fn the_real_timeline_virtualizes_paints_and_keeps_its_media() {
+        with_gtk(the_real_timeline_virtualizes_paints_and_keeps_its_media_body);
+    }
+
+    fn the_real_timeline_virtualizes_paints_and_keeps_its_media_body() {
+        use gtk4::subclass::prelude::ObjectSubclassIsExt;
+
+        let window: crate::ui::HangarWindow = glib::Object::builder().build();
+        window.set_default_size(700, 900);
+
+        // The window's own director. `setup_ui` builds one and installs it as
+        // the process director before any page exists, so a director built here
+        // would be replaced before a single row bound and every slot would
+        // register with the window's. The first draft did that and reported
+        // zero live pipelines forever.
+        let director = window
+            .imp()
+            .video_director
+            .borrow()
+            .clone()
+            .expect("the window built a video director");
+
+        // Autoplay is off by default, and with nothing armed the pipeline
+        // bounds below hold on a build that leaks every one of them. Muted arms
+        // videos as they come on screen. Set here; `AppSettings::load()` reads
+        // the real settings file and would make coverage depend on the machine.
+        director.set_autoplay(VideoAutoplay::Muted);
+
+        let scrolled = window
+            .imp()
+            .scrolled_window
+            .borrow()
+            .clone()
+            .expect("the timeline built a scroller");
+        let list = window
+            .imp()
+            .timeline_list_view
+            .borrow()
+            .clone()
+            .expect("the timeline built a list");
+
+        // Counters on before the model is filled. `GtkListView` reacts to a
+        // model change straight away, so filling first hides the couple of
+        // hundred binds that happen before the window is mapped.
+        let (binds, unbinds) = count_binds(&list);
+        window.set_posts(
+            (0..DEEP_POSTS)
+                .map(|i| harness_post(&format!("home:{i}")))
+                .collect(),
+        );
+
+        window.present();
         settle(600);
-        if !window_is_usable(&window, &scrolled) {
+
+        if !window.is_mapped() || scrolled.height() <= 400 {
+            eprintln!(
+                "skipping: the window never mapped (mapped {}, viewport {}px), so there \
+                 is no geometry to measure",
+                window.is_mapped(),
+                scrolled.height()
+            );
             window.destroy();
             return;
         }
 
-        let realized = rows_of(&list).len();
-        let mut blank_from = None;
-        let mut offset = 0.0;
-        while offset <= 480_000.0 {
-            scrolled.vadjustment().set_value(offset);
-            settle(80);
-            if blank_from.is_none() && topmost_mapped(&list, &scrolled).is_none() {
-                blank_from = Some(offset);
+        // 1. The list is allocated the viewport. With an AdwClamp in the way
+        //    the scroller interposed a GtkViewport, which allocates its child
+        //    the child's full natural height: 5000 rows of about 418px, so
+        //    roughly two million pixels of list inside a 900px window.
+        let natural = scrolled.vadjustment().upper();
+        assert!(
+            f64::from(list.height()) < natural / 10.0,
+            "the list is {}px tall against a feed {natural}px long — it has been \
+             allocated its whole natural height rather than the viewport, which is \
+             what a GtkViewport between the scroller and the list does, and a list \
+             that believes it is fully visible does not recycle anything",
+            list.height(),
+        );
+
+        let realized_at_rest = rows_of(&list).len();
+        let binds_at_rest = binds.get();
+        let mut painted_by_offset = Vec::new();
+        let mut peak_pipelines = 0;
+        let mut peak_slots = 0;
+
+        for offset in [0.0, 200_000.0, 800_000.0, 1_500_000.0, 2_000_000.0] {
+            scroll_to(&scrolled, offset);
+            settle(200);
+            // The election turns "on screen" into a live pipeline. Run here so
+            // the count below lands at a defined point instead of wherever the
+            // 200ms timer fell.
+            director.run_election();
+            // Sampled before the pipeline can die. These files do not exist,
+            // so each armed video fails on its bus a moment later. The question
+            // is how many were alive at once.
+            let armed_pipelines = crate::media::live_pipelines();
+            let armed_slots = director.slots.borrow().len();
+            settle(120);
+
+            let geometry = row_geometry(&list, &scrolled);
+            let realized = geometry.len();
+            let placed = geometry.iter().filter(|(_, _, on)| *on).count();
+            let on_screen = painted_rows(&list, &scrolled);
+            let painted: Vec<u32> = on_screen.iter().map(|(n, _)| *n).collect();
+            peak_pipelines = peak_pipelines.max(armed_pipelines);
+            peak_slots = peak_slots.max(armed_slots);
+
+            eprintln!(
+                "offset {offset:>9.0}: {realized:>3} realized, {placed} placed, painted \
+                 {painted:?}, media {:?}, binds {}, unbinds {}, slots {armed_slots}, \
+                 pipelines {armed_pipelines}",
+                on_screen.iter().map(|(_, m)| m.len()).collect::<Vec<_>>(),
+                binds.get(),
+                unbinds.get(),
+            );
+
+            // 4a. Something is on screen. The old layout went blank here.
+            assert!(
+                !painted.is_empty(),
+                "nothing painted at offset {offset} — the feed is blank"
+            );
+
+            // 2. Two bounds. `placed` counts rows GTK gives a rectangle inside
+            //    the viewport; under the old layout that was the whole realized
+            //    set. `realized` is looser on purpose: GtkListView keeps a pool
+            //    it never shrinks, and what matters is that the pool does not
+            //    grow with the feed.
+            assert!(
+                placed <= 8,
+                "{placed} rows placed in one viewport at offset {offset} — the list is \
+                 being allocated more than the viewport"
+            );
+            assert!(
+                realized < 400,
+                "{realized} rows realized at offset {offset} against a model of \
+                 {DEEP_POSTS} — the realized set is tracking the feed, not the viewport"
+            );
+
+            // 5. Recycled rows still show their media.
+            for (number, media) in &on_screen {
+                assert!(
+                    !media.is_empty(),
+                    "post {number} is on screen at offset {offset} with no media \
+                     allocated, though every post in this feed has a video embed. \
+                     At this depth every row is a recycled one, so this is what a \
+                     `bind` that does not rebuild its embed looks like once the feed \
+                     virtualizes: not a blank feed, a feed of blank posts."
+                );
+                for (kind, width, height) in media {
+                    assert!(
+                        *width > 0 && *height > 0,
+                        "post {number}'s {kind} is allocated {width}x{height} at offset \
+                         {offset}"
+                    );
+                }
             }
-            offset += 20_000.0;
+
+            painted_by_offset.push((offset, painted));
         }
 
+        // 4b. What is painted follows the scroll: every deep offset paints
+        //     higher-numbered posts than the top did.
+        let (_, at_top) = &painted_by_offset[0];
+        let top_min = *at_top.iter().min().expect("something painted at the top");
+        for (offset, painted) in painted_by_offset.iter().skip(1) {
+            let lowest = *painted.iter().min().expect("something painted");
+            assert!(
+                lowest > top_min,
+                "offset {offset} paints {painted:?}, no further into the feed than the \
+                 top did ({at_top:?}) — the list is not scrolling its rows"
+            );
+        }
+
+        // 3. Rows are recycled, which is what runs `release_video_on_unbind`,
+        //    and pipelines stayed bounded across the sweep.
+        assert!(
+            unbinds.get() > 0,
+            "`unbind` never fired across a two million pixel sweep, so \
+             `release_video_on_unbind` never ran and every row that ever held a video \
+             still holds it"
+        );
+        assert!(
+            binds.get() > binds_at_rest,
+            "no row was rebound while scrolling"
+        );
+        // A video was armed at every checkpoint. Without this the two bounds
+        // below are vacuous, and they were: an earlier draft measured a
+        // director no slot had registered with, read zero pipelines and passed.
+        assert!(
+            peak_pipelines >= 1,
+            "no pipeline was ever live at a checkpoint, so the two bounds below \
+             are measuring nothing. Either autoplay never armed a video or the \
+             director being measured is not the one the rows registered with."
+        );
+        assert!(
+            peak_pipelines <= 1,
+            "{peak_pipelines} live pipelines at once — there is supposed to be at \
+             most one video playing, and a virtualized feed that recycles a row \
+             out from under a playing pipeline without releasing it is exactly how \
+             that budget gets exceeded"
+        );
+        // Slots live as long as the row that owns them, so this is the count
+        // that grows without bound if recycling leaks: one per post shown
+        // instead of one per row in the pool.
+        assert!(
+            peak_slots < 400,
+            "{peak_slots} video slots registered at once against a pool of about \
+             {realized_at_rest} rows and {} posts bound over the sweep — slots are \
+             accumulating per post shown rather than per row, so rows are not \
+             releasing their video when they are recycled",
+            binds.get(),
+        );
+
         eprintln!(
-            "clamped layout: {realized} of {HARNESS_POSTS} rows realized (each holding a \
-             video slot), list allocated {}px inside a {}px viewport, nothing on screen \
-             from offset {:?}px",
+            "real timeline: {realized_at_rest} rows realized at rest of {DEEP_POSTS} posts, \
+             list allocated {}px in a {}px viewport against a {}px feed, {} binds and {} \
+             unbinds over the sweep, at most {peak_slots} slots and \
+             {peak_pipelines} live pipelines",
             list.height(),
             scrolled.height(),
-            blank_from,
+            scrolled.vadjustment().upper(),
+            binds.get(),
+            unbinds.get(),
         );
 
         window.destroy();
         drop(director);
         settle(100);
         assert_eq!(crate::media::live_pipelines(), 0);
+    }
+    /// The "N new posts" banner must not move the feed under the reader.
+    ///
+    /// `insert_posts_at_top` restores the scroll position by the change in
+    /// `upper`. That subtraction used to be exact, because `upper` was the sum
+    /// of every row's height. A virtualized list extrapolates `upper` from the
+    /// rows it has measured, so both terms are now estimates. Asserts on what a
+    /// reader sees, since the arithmetic is allowed to be approximate.
+    #[test]
+    fn inserting_posts_at_the_top_leaves_the_reader_where_they_were() {
+        with_gtk(inserting_posts_at_the_top_leaves_the_reader_where_they_were_body);
+    }
+
+    fn inserting_posts_at_the_top_leaves_the_reader_where_they_were_body() {
+        use gtk4::subclass::prelude::ObjectSubclassIsExt;
+
+        let window: crate::ui::HangarWindow = glib::Object::builder().build();
+        window.set_default_size(700, 900);
+
+        let scrolled = window
+            .imp()
+            .scrolled_window
+            .borrow()
+            .clone()
+            .expect("the timeline built a scroller");
+
+        window.set_posts(
+            (0..1000)
+                .map(|i| harness_post(&format!("home:{i}")))
+                .collect(),
+        );
+        window.present();
+        settle(600);
+
+        if !window.is_mapped() || scrolled.height() <= 400 {
+            eprintln!("skipping: the window never mapped, so there is no geometry to measure");
+            window.destroy();
+            return;
+        }
+
+        scroll_to(&scrolled, 200_000.0);
+        settle(250);
+
+        let before = posts_rendered_in(&scrolled);
+        let anchor = *before
+            .first()
+            .expect("something on screen before the insert");
+        let value_before = scrolled.vadjustment().value();
+        let upper_before = scrolled.vadjustment().upper();
+
+        // Numbered well clear of the existing feed so the two are told apart.
+        const NEW_POSTS: u32 = 20;
+        window.insert_posts_at_top(
+            (0..NEW_POSTS)
+                .map(|i| harness_post(&format!("home:{}", 90_000 + i)))
+                .collect(),
+        );
+        // The restore runs on an idle source, after GTK has relaid out.
+        settle(500);
+
+        let after = posts_rendered_in(&scrolled);
+        let value_after = scrolled.vadjustment().value();
+        let upper_after = scrolled.vadjustment().upper();
+
+        eprintln!(
+            "insert at top: on screen {before:?} at {value_before:.0}/{upper_before:.0}, \
+             after inserting {NEW_POSTS} posts {after:?} at {value_after:.0}/{upper_after:.0} \
+             (moved {:.0}px, {NEW_POSTS} posts is about {:.0}px)",
+            value_after - value_before,
+            f64::from(NEW_POSTS) * 418.0,
+        );
+
+        assert!(
+            !after.is_empty(),
+            "nothing on screen after inserting at the top"
+        );
+        assert!(
+            after.contains(&anchor),
+            "post {anchor} was on screen before the insert and is not after it: the feed \
+             now shows {after:?}. The scroll restore in `insert_posts_at_top` is derived \
+             from the adjustment's `upper`, which a virtualized list only estimates, so \
+             this is where that estimate being wrong would show up — as the feed jumping \
+             under someone who was reading it."
+        );
+        assert!(
+            after.iter().all(|post| *post < 90_000),
+            "the feed jumped to the newly inserted posts {after:?} — inserting at the top \
+             is supposed to leave the reader where they were, not scroll them to the top"
+        );
+
+        // Posts that are not the height of the ones already measured. Every
+        // row so far is a video embed of the same aspect ratio, so the
+        // extrapolation is exact. Text-only posts are a fraction of that
+        // height, which is where the estimate does real work.
+        let anchor = *after.first().expect("something on screen");
+        let value_mixed_before = scrolled.vadjustment().value();
+        window.insert_posts_at_top(
+            (0..NEW_POSTS)
+                .map(|i| {
+                    let mut post = harness_post(&format!("home:{}", 80_000 + i));
+                    post.embed = None;
+                    post
+                })
+                .collect(),
+        );
+        settle(500);
+
+        let mixed = posts_rendered_in(&scrolled);
+        eprintln!(
+            "insert at top, short rows: on screen {mixed:?} at {:.0} (moved {:.0}px for \
+             {NEW_POSTS} text posts)",
+            scrolled.vadjustment().value(),
+            scrolled.vadjustment().value() - value_mixed_before,
+        );
+
+        assert!(
+            mixed.contains(&anchor),
+            "post {anchor} was on screen before {NEW_POSTS} short posts were inserted at \
+             the top and is not after it: the feed now shows {mixed:?}. The restore adds \
+             the change in `upper`, and for a virtualized list `upper` is extrapolated \
+             from the rows measured so far — all of them tall video rows here — so \
+             inserting shorter ones is where that extrapolation is furthest out."
+        );
+
+        window.destroy();
     }
 
     /// Key controllers on widgets we built.

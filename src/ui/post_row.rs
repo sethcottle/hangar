@@ -19,6 +19,29 @@ use crate::atproto::Profile;
 /// is known. Tuned narrow; [`PostRow::embed_height`] clamps the error.
 const CONTENT_WIDTH: f64 = 540.0;
 
+/// Take off whatever the last `bind` left on a button's `clicked`.
+///
+/// The buttons are built once in `setup_ui` and `connect_clicked` adds a
+/// handler rather than replacing one, so anything left on the button is a
+/// closure still holding the post it was built for. Unconditional, so a row
+/// that has stopped being a repost stops navigating to the last reposter.
+fn disarm_click(btn: &gtk4::Button, slot: &std::cell::RefCell<Option<glib::SignalHandlerId>>) {
+    if let Some(id) = slot.take() {
+        btn.disconnect(id);
+    }
+}
+
+/// Replace a button's `clicked` handler, keeping the id so the next bind can
+/// take this one off in turn. See [`disarm_click`].
+fn rearm_click<F: Fn(&gtk4::Button) + 'static>(
+    btn: &gtk4::Button,
+    slot: &std::cell::RefCell<Option<glib::SignalHandlerId>>,
+    f: F,
+) {
+    disarm_click(btn, slot);
+    slot.replace(Some(btn.connect_clicked(f)));
+}
+
 mod imp {
     use super::*;
     use std::cell::{Cell, RefCell};
@@ -44,6 +67,14 @@ mod imp {
         pub repost_handler_id: RefCell<Option<glib::SignalHandlerId>>,
         pub quote_handler_id: RefCell<Option<glib::SignalHandlerId>>,
         pub reply_handler_id: RefCell<Option<glib::SignalHandlerId>>,
+        /// The five handlers [`super::PostRow::bind`] installs itself. Same
+        /// reason as the four above: the buttons outlive every post the row
+        /// shows, so the next `bind` needs the id to disconnect.
+        pub repost_attribution_handler_id: RefCell<Option<glib::SignalHandlerId>>,
+        pub reply_indicator_handler_id: RefCell<Option<glib::SignalHandlerId>>,
+        pub view_post_handler_id: RefCell<Option<glib::SignalHandlerId>>,
+        pub copy_link_handler_id: RefCell<Option<glib::SignalHandlerId>>,
+        pub open_link_handler_id: RefCell<Option<glib::SignalHandlerId>>,
         pub reply_btn: RefCell<Option<gtk4::Button>>,
         pub repost_item: RefCell<Option<gtk4::Button>>,
         pub repost_item_label: RefCell<Option<gtk4::Label>>,
@@ -783,12 +814,33 @@ impl PostRow {
         }
     }
 
+    /// Show `post` on this row, whatever it was showing before.
+    ///
+    /// The row is not necessarily new: a recycling `GtkListView` binds one
+    /// pooled row to thousands of posts, so anything this only ever adds sticks
+    /// for the life of the row. Two shapes of that here: a `connect_clicked`
+    /// per bind, see [`disarm_click`], and state set from outside that nothing
+    /// put back, like [`Self::set_not_clickable`].
     pub fn bind(&self, post: &Post) {
         let imp = self.imp();
         imp.post.replace(Some(post.clone()));
 
+        // Clickable again until something says otherwise. `set_not_clickable`
+        // runs after `bind` on a thread's focused post, and without this reset
+        // the row that carried it would refuse to navigate ever after.
+        imp.is_focused_post.set(false);
+        if let Some(main_box) = imp.main_box.borrow().as_ref() {
+            main_box.set_cursor_from_name(Some("pointer"));
+        }
+
         // Show/hide repost attribution with avatar - clickable to go to reposter's profile
         if let Some(repost_row) = imp.repost_row.borrow().as_ref() {
+            // Outside the branch. A row recycled from a repost onto a post
+            // nobody reposted must not keep the old reposter wired to a button
+            // it is about to hide.
+            if let Some(btn) = imp.repost_attribution_btn.borrow().as_ref() {
+                disarm_click(btn, &imp.repost_attribution_handler_id);
+            }
             if let Some(reason) = &post.repost_reason {
                 let name = reason
                     .by
@@ -808,9 +860,15 @@ impl PostRow {
                 }
                 // Wire up click to navigate to reposter's profile
                 if let Some(btn) = imp.repost_attribution_btn.borrow().as_ref() {
-                    let post_row = self.clone();
+                    // Weak. The button is a descendant of the row, so a strong
+                    // clone is the row holding itself alive through its own
+                    // widget tree and a pooled row is never dropped.
+                    let post_row = self.downgrade();
                     let reposter_profile = reason.by.clone();
-                    btn.connect_clicked(move |_| {
+                    rearm_click(btn, &imp.repost_attribution_handler_id, move |_| {
+                        let Some(post_row) = post_row.upgrade() else {
+                            return;
+                        };
                         let inner_imp = post_row.imp();
                         if let Some(cb) = inner_imp.profile_clicked_callback.borrow().as_ref() {
                             cb(reposter_profile.clone());
@@ -825,6 +883,10 @@ impl PostRow {
 
         // Show/hide reply indicator - clickable to go to parent author's profile
         if let Some(reply_indicator_box) = imp.reply_indicator_box.borrow().as_ref() {
+            // As above. Off first, whether or not this post puts one back.
+            if let Some(btn) = imp.reply_indicator.borrow().as_ref() {
+                disarm_click(btn, &imp.reply_indicator_handler_id);
+            }
             if let Some(context) = &post.reply_context {
                 // Update the handle label
                 if let Some(label) = imp.reply_handle_label.borrow().as_ref() {
@@ -832,9 +894,12 @@ impl PostRow {
                 }
                 // Wire up click to navigate to parent author's profile
                 if let Some(btn) = imp.reply_indicator.borrow().as_ref() {
-                    let post_row = self.clone();
+                    let post_row = self.downgrade();
                     let parent_profile = context.parent_author.clone();
-                    btn.connect_clicked(move |_| {
+                    rearm_click(btn, &imp.reply_indicator_handler_id, move |_| {
+                        let Some(post_row) = post_row.upgrade() else {
+                            return;
+                        };
                         let inner_imp = post_row.imp();
                         if let Some(cb) = inner_imp.profile_clicked_callback.borrow().as_ref() {
                             cb(parent_profile.clone());
@@ -996,12 +1061,15 @@ impl PostRow {
 
         // View Post action - uses existing post_clicked_callback
         if let Some(view_item) = imp.view_post_item.borrow().as_ref() {
-            let post_row = self.clone();
+            let post_row = self.downgrade();
             let popover_clone = popover.clone();
-            view_item.connect_clicked(move |_| {
+            rearm_click(view_item, &imp.view_post_handler_id, move |_| {
                 if let Some(p) = &popover_clone {
                     p.popdown();
                 }
+                let Some(post_row) = post_row.upgrade() else {
+                    return;
+                };
                 let inner_imp = post_row.imp();
                 if let Some(post) = inner_imp.post.borrow().as_ref() {
                     if let Some(cb) = inner_imp.post_clicked_callback.borrow().as_ref() {
@@ -1013,9 +1081,11 @@ impl PostRow {
 
         // Copy Link action
         if let Some(copy_item) = imp.copy_link_item.borrow().as_ref() {
+            // The URL is captured by value, so a stale handler copies a
+            // different post's link and raises a toast for it.
             let url = post_url.clone();
             let popover_clone = popover.clone();
-            copy_item.connect_clicked(move |btn| {
+            rearm_click(copy_item, &imp.copy_link_handler_id, move |btn| {
                 if let Some(p) = &popover_clone {
                     p.popdown();
                 }
@@ -1027,7 +1097,7 @@ impl PostRow {
         if let Some(open_item) = imp.open_link_item.borrow().as_ref() {
             let url = post_url;
             let popover_clone = popover;
-            open_item.connect_clicked(move |btn| {
+            rearm_click(open_item, &imp.open_link_handler_id, move |btn| {
                 if let Some(p) = &popover_clone {
                     p.popdown();
                 }
@@ -2586,5 +2656,503 @@ mod tests {
             );
         }
         assert!(cards[1].0 > cards[0].0, "the nested card is the deeper one");
+    }
+
+    // ---------------------------------------------------------------------
+    // Rebinding a row that is on screen
+    // ---------------------------------------------------------------------
+
+    /// Pump the main context for `ms`, so GTK has frames in which to lay
+    /// anything out.
+    fn settle(ms: u64) {
+        let ctx = glib::MainContext::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+        while std::time::Instant::now() < deadline {
+            while ctx.iteration(false) {}
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// The timeline's shape around a column of rows: no horizontal valve, an
+    /// `AdwClamp`, and a box that leaves its children their natural height.
+    ///
+    /// Presented, and checked for having mapped. An unallocated widget answers
+    /// every geometry question with a zero or a stale number.
+    fn presented_column() -> (adw::Window, gtk4::ScrolledWindow, gtk4::Box) {
+        use libadwaita::prelude::AdwWindowExt;
+
+        let column = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        column.set_valign(gtk4::Align::Start);
+
+        let clamp = adw::Clamp::new();
+        clamp.set_maximum_size(800);
+        clamp.set_tightening_threshold(600);
+        clamp.set_child(Some(&column));
+
+        let scrolled = gtk4::ScrolledWindow::new();
+        scrolled.set_vexpand(true);
+        scrolled.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
+        scrolled.set_child(Some(&clamp));
+
+        let window = adw::Window::new();
+        window.set_default_size(700, 900);
+        window.set_content(Some(&scrolled));
+        window.present();
+        settle(250);
+        (window, scrolled, column)
+    }
+
+    /// Give up if the session will not put a window on screen.
+    fn window_is_usable(window: &adw::Window, scrolled: &gtk4::ScrolledWindow) -> bool {
+        if window.is_mapped() && scrolled.width() > 400 {
+            return true;
+        }
+        eprintln!(
+            "skipping: the window never mapped (mapped {}, viewport {}px wide), so \
+             there is no geometry to measure",
+            window.is_mapped(),
+            scrolled.width()
+        );
+        false
+    }
+
+    fn embed_container_of(row: &PostRow) -> gtk4::Box {
+        row.imp()
+            .embed_container
+            .borrow()
+            .clone()
+            .expect("every row builds its embed container in setup_ui")
+    }
+
+    /// The embed subtree as (depth, type, width, height), container included.
+    ///
+    /// Compared against a freshly built row instead of numbers written down
+    /// here, so retuning `embed_height` or restyling a card does not break it.
+    fn subtree_geometry(container: &gtk4::Box) -> Vec<(usize, String, i32, i32)> {
+        let mut widgets = Vec::new();
+        walk(container.upcast_ref(), 0, &mut widgets);
+        widgets
+            .into_iter()
+            .map(|(depth, w)| (depth, w.type_().name().to_string(), w.width(), w.height()))
+            .collect()
+    }
+
+    /// What GTK paints at nine points across the embed band, as
+    /// `Type@depth-below-the-container`.
+    ///
+    /// Hit-tested rather than read off allocations. A container can have the
+    /// right size and still never allocate its child; the blank band this
+    /// guards against picks only the container itself.
+    ///
+    /// `pick` resolves downwards from the container, so where the row is
+    /// scrolled to does not matter.
+    fn band_hits(container: &gtk4::Box) -> Vec<String> {
+        let width = f64::from(container.width());
+        let height = f64::from(container.height());
+        let root: gtk4::Widget = container.clone().upcast();
+        let mut hits = Vec::new();
+        for fy in [0.25_f64, 0.5, 0.75] {
+            for fx in [0.25_f64, 0.5, 0.75] {
+                let hit = container.pick(width * fx, height * fy, gtk4::PickFlags::DEFAULT);
+                hits.push(match hit {
+                    None => "NOTHING".to_string(),
+                    Some(hit) if hit == root => "THE EMPTY CONTAINER".to_string(),
+                    Some(hit) => {
+                        // How far beneath the container GTK had to go. One
+                        // level is a filler box; real embeds are deeper.
+                        let mut depth = 0;
+                        let mut cursor = Some(hit.clone());
+                        while let Some(widget) = cursor {
+                            if widget == root {
+                                break;
+                            }
+                            depth += 1;
+                            cursor = widget.parent();
+                        }
+                        format!("{}@{depth}", hit.type_().name())
+                    }
+                });
+            }
+        }
+        hits
+    }
+
+    fn image(aspect_ratio: (u32, u32)) -> ImageEmbed {
+        ImageEmbed {
+            thumb: dead_url(),
+            fullsize: dead_url(),
+            alt: "alt text".into(),
+            aspect_ratio: Some(aspect_ratio),
+        }
+    }
+
+    /// Every kind of embed a row can be recycled onto, plus the post with no
+    /// embed, which is the transition that empties the container.
+    fn every_embed_kind() -> Vec<(&'static str, Option<Embed>)> {
+        vec![
+            ("one image", Some(Embed::Images(vec![image((16, 9))]))),
+            ("two images", Some(Embed::Images(vec![image((1, 1)); 2]))),
+            ("three images", Some(Embed::Images(vec![image((4, 3)); 3]))),
+            ("four images", Some(Embed::Images(vec![image((2, 3)); 4]))),
+            (
+                "video",
+                Some(Embed::Video(VideoEmbed {
+                    playlist: "file:///nonexistent/rebind.mp4".into(),
+                    thumbnail: Some(dead_url()),
+                    alt: Some("a cat".into()),
+                    aspect_ratio: Some((16, 9)),
+                })),
+            ),
+            (
+                "gif",
+                Some(Embed::External(ExternalEmbed {
+                    uri: KLIPY_GIF.into(),
+                    title: "Team".into(),
+                    description: "ALT: a shrug".into(),
+                    thumb: Some(dead_url()),
+                })),
+            ),
+            (
+                "link card",
+                Some(Embed::External(ExternalEmbed {
+                    uri: "https://www.example.com/world/2026/aug/01/a-story".into(),
+                    title: "A story about something".into(),
+                    description: "Something happened, and here is a sentence about it".into(),
+                    thumb: Some(dead_url()),
+                })),
+            ),
+            ("quote", Some(Embed::Quote(quote_with(None)))),
+            (
+                "quote with media",
+                Some(Embed::QuoteWithMedia {
+                    quote: quote_with(None),
+                    media: Box::new(Embed::Images(vec![image((16, 9))])),
+                }),
+            ),
+            ("no embed", None),
+        ]
+    }
+
+    /// A row that is bound again shows the new post's embed, every time.
+    ///
+    /// The property the virtualization migration rests on. A `GtkListView`
+    /// binds one pooled row to post after post, so anything `bind` gets wrong
+    /// the second time is a blank band in the feed.
+    ///
+    /// Each case is measured against a row built seconds earlier and bound to
+    /// the same post, in the same window, at the same width. Subtree geometry
+    /// and nine hit tests must match, and none of the nine may come back as the
+    /// container itself, which is what a subtree allocated 0x0 looks like.
+    #[test]
+    fn a_rebound_row_renders_every_embed_kind_where_you_can_hit_it() {
+        crate::ui::with_gtk(a_rebound_row_renders_every_embed_kind_where_you_can_hit_it_body);
+    }
+
+    fn a_rebound_row_renders_every_embed_kind_where_you_can_hit_it_body() {
+        /// Three, so the cycle is walked twice and two of the binds are
+        /// rebinds of a row already showing something.
+        const PASSES: usize = 3;
+
+        let (window, scrolled, column) = presented_column();
+        if !window_is_usable(&window, &scrolled) {
+            return;
+        }
+
+        let recycled = PostRow::new();
+        column.append(&recycled);
+        let recycled_container = embed_container_of(&recycled);
+
+        for pass in 0..PASSES {
+            for (kind, embed) in every_embed_kind() {
+                let uri = format!("at://did:plc:test/app.bsky.feed.post/{kind}-{pass}");
+
+                // The control. Never held anything else, same post, same
+                // column, same frame.
+                let fresh = PostRow::new();
+                column.append(&fresh);
+                fresh.bind(&post_with(embed.clone(), &uri));
+                let fresh_container = embed_container_of(&fresh);
+
+                recycled.bind(&post_with(embed.clone(), &uri));
+                settle(120);
+
+                let at = format!("pass {pass}, {kind}");
+
+                assert_eq!(
+                    recycled_container.is_visible(),
+                    fresh_container.is_visible(),
+                    "{at}: the recycled row's embed container is not even shown the \
+                     way a new row's is"
+                );
+
+                if embed.is_none() {
+                    assert!(
+                        !recycled_container.is_visible()
+                            && recycled_container.first_child().is_none(),
+                        "{at}: a post with no embed must leave the container empty \
+                         and hidden, not showing the last post's media"
+                    );
+                    column.remove(&fresh);
+                    continue;
+                }
+
+                assert!(
+                    recycled_container.width() > 0 && recycled_container.height() > 0,
+                    "{at}: the embed band itself was never allocated ({}x{})",
+                    recycled_container.width(),
+                    recycled_container.height()
+                );
+
+                // A zero-size widget is what a child its parent never
+                // allocated looks like.
+                let mut widgets = Vec::new();
+                walk(recycled_container.upcast_ref(), 0, &mut widgets);
+                let unallocated: Vec<String> = widgets
+                    .iter()
+                    .skip(1)
+                    .filter(|(_, w)| w.is_visible() && (w.width() == 0 || w.height() == 0))
+                    .map(|(depth, w)| format!("{}{}", "  ".repeat(*depth), w.type_().name()))
+                    .collect();
+                assert!(
+                    unallocated.is_empty(),
+                    "{at}: {} widget(s) in the new embed subtree are visible but \
+                     allocated 0x0, so the band is blank:\n{}",
+                    unallocated.len(),
+                    unallocated.join("\n")
+                );
+
+                // A blank band picks the container and nothing else. Anything
+                // real is at least two levels down.
+                let hits = band_hits(&recycled_container);
+                assert!(
+                    !hits
+                        .iter()
+                        .any(|h| h == "THE EMPTY CONTAINER" || h == "NOTHING"),
+                    "{at}: hit-testing the band found no embed beneath the \
+                     container at some of the nine sampled points: {hits:?}"
+                );
+                let deepest = hits
+                    .iter()
+                    .filter_map(|h| h.rsplit_once('@'))
+                    .filter_map(|(_, d)| d.parse::<usize>().ok())
+                    .max()
+                    .unwrap_or(0);
+                assert!(
+                    deepest >= 2,
+                    "{at}: the band picks only filler one level down, not a \
+                     frame, picture, card or play button: {hits:?}"
+                );
+
+                // And it matches what a new row shows.
+                assert_eq!(
+                    hits,
+                    band_hits(&fresh_container),
+                    "{at}: the recycled row paints something different from a \
+                     row bound to this post for the first time"
+                );
+                assert_eq!(
+                    subtree_geometry(&recycled_container),
+                    subtree_geometry(&fresh_container),
+                    "{at}: the recycled row's embed subtree is not laid out the \
+                     way a new row's is"
+                );
+
+                column.remove(&fresh);
+            }
+        }
+    }
+
+    /// One click on a recycled row does one thing.
+    ///
+    /// The buttons `bind` wires are built once in `setup_ui` and outlive every
+    /// post the row shows. Without a disconnect a pooled row accumulates one
+    /// live closure per post it has been bound to, each holding that post, so
+    /// one click opens every reposter the row has shown, pushes a thread page
+    /// per bind, and copies a link per bind.
+    ///
+    /// Counted through the row's navigation callbacks, where a user would see
+    /// it, instead of by counting handlers.
+    #[test]
+    fn rebinding_a_row_does_not_stack_up_the_last_posts_click_handlers() {
+        crate::ui::with_gtk(rebinding_a_row_does_not_stack_up_the_last_posts_click_handlers_body);
+    }
+
+    fn rebinding_a_row_does_not_stack_up_the_last_posts_click_handlers_body() {
+        use std::cell::RefCell as StdRefCell;
+        use std::rc::Rc;
+
+        /// Enough that an off-by-one in the disconnect is not a pass.
+        const BINDS: usize = 4;
+
+        let row = PostRow::new();
+
+        let profiles: Rc<StdRefCell<Vec<String>>> = Rc::default();
+        let sink = Rc::clone(&profiles);
+        row.set_profile_clicked_callback(move |p| sink.borrow_mut().push(p.handle.clone()));
+
+        let posts: Rc<StdRefCell<Vec<String>>> = Rc::default();
+        let sink = Rc::clone(&posts);
+        row.set_post_clicked_callback(move |p| sink.borrow_mut().push(p.uri.clone()));
+
+        let someone = |n: usize| Profile {
+            handle: format!("someone{n}.bsky.social"),
+            ..profile()
+        };
+
+        for n in 0..BINDS {
+            let mut post = post_with(None, &format!("at://did:plc:test/app.bsky.feed.post/{n}"));
+            post.repost_reason = Some(crate::atproto::RepostReason {
+                by: someone(n),
+                indexed_at: "2026-01-01T00:00:00Z".into(),
+            });
+            post.reply_context = Some(crate::atproto::ReplyContext {
+                parent_author: someone(100 + n),
+                root_author: someone(100 + n),
+            });
+            row.bind(&post);
+        }
+        let last = BINDS - 1;
+
+        let imp = row.imp();
+        let click = |btn: &StdRefCell<Option<gtk4::Button>>| {
+            btn.borrow()
+                .as_ref()
+                .expect("built in setup_ui")
+                .emit_clicked();
+        };
+
+        click(&imp.repost_attribution_btn);
+        assert_eq!(
+            *profiles.borrow(),
+            vec![someone(last).handle],
+            "one click on the repost attribution of a row bound {BINDS} times \
+             must open one profile, and it must be this post's reposter"
+        );
+        profiles.borrow_mut().clear();
+
+        click(&imp.reply_indicator);
+        assert_eq!(
+            *profiles.borrow(),
+            vec![someone(100 + last).handle],
+            "one click on the reply indicator must open one profile, and it must \
+             be this post's parent author"
+        );
+        profiles.borrow_mut().clear();
+
+        click(&imp.view_post_item);
+        assert_eq!(
+            *posts.borrow(),
+            vec![format!("at://did:plc:test/app.bsky.feed.post/{last}")],
+            "\"View Post and Replies\" must push one thread page, not one per \
+             post the row has ever been recycled onto"
+        );
+        posts.borrow_mut().clear();
+
+        // "Copy Link to Post" captures the URL by value, so a stale handler
+        // writes a different post's link and raises a toast for it. Counted off
+        // the clipboard's change notification.
+        //
+        // Compared against a control write: how many `changed` one `set_text`
+        // produces is the display's business, and on X11 it is two.
+        let clipboard = gtk4::gdk::Display::default()
+            .expect("a display, since with_gtk started GTK")
+            .clipboard();
+        let notifications = Rc::new(std::cell::Cell::new(0usize));
+        let counter = Rc::clone(&notifications);
+        clipboard.connect_changed(move |_| counter.set(counter.get() + 1));
+
+        let control = gtk4::Button::new();
+        control.connect_clicked(|btn| {
+            crate::ui::external::copy_text(btn, "one write", "Control");
+        });
+        control.emit_clicked();
+        settle(80);
+        let per_write = notifications.get();
+        assert!(
+            per_write >= 1,
+            "the clipboard reports nothing at all, so this measures nothing"
+        );
+
+        notifications.set(0);
+        click(&imp.copy_link_item);
+        settle(80);
+        assert_eq!(
+            notifications.get(),
+            per_write,
+            "one click on \"Copy Link to Post\" must write the clipboard once, \
+             not once per post the row has ever been recycled onto"
+        );
+
+        // "Open Link to Post" is wired the same way but must not be clicked
+        // here: it hands the URL to the user's browser, one per bind under the
+        // bug. Checked at the bookkeeping instead. The handler id is the whole
+        // mechanism by which the next bind takes the last one off.
+        assert!(
+            imp.open_link_handler_id.borrow().is_some(),
+            "\"Open Link to Post\" is connected but its handler is not being \
+             kept, so nothing will ever disconnect it and a recycled row will \
+             open one browser tab per post it has shown"
+        );
+
+        // Recycled off a repost onto an ordinary post: the old reposter must
+        // not stay wired to the button being hidden.
+        row.bind(&post_with(
+            None,
+            "at://did:plc:test/app.bsky.feed.post/plain",
+        ));
+        click(&imp.repost_attribution_btn);
+        click(&imp.reply_indicator);
+        assert!(
+            profiles.borrow().is_empty(),
+            "a post that is neither a repost nor a reply has no profile to \
+             navigate to, but the row still went to {:?}",
+            profiles.borrow()
+        );
+    }
+
+    /// `set_not_clickable` applies to one post, and `bind` has to undo it.
+    ///
+    /// It runs after `bind` on a thread's focused post. Nothing used to put it
+    /// back, so once a thread page recycles rows the row that carried the
+    /// focused post would refuse to navigate ever after.
+    #[test]
+    fn rebinding_a_row_makes_it_an_ordinary_clickable_post_again() {
+        crate::ui::with_gtk(rebinding_a_row_makes_it_an_ordinary_clickable_post_again_body);
+    }
+
+    fn rebinding_a_row_makes_it_an_ordinary_clickable_post_again_body() {
+        let row = PostRow::new();
+        row.bind(&post_with(
+            None,
+            "at://did:plc:test/app.bsky.feed.post/focused",
+        ));
+        row.set_not_clickable();
+
+        let main_box = row
+            .imp()
+            .main_box
+            .borrow()
+            .clone()
+            .expect("built in setup_ui");
+        assert!(row.imp().is_focused_post.get());
+        assert!(
+            main_box.cursor().is_none(),
+            "the focused post does not advertise itself as clickable"
+        );
+
+        row.bind(&post_with(
+            None,
+            "at://did:plc:test/app.bsky.feed.post/next",
+        ));
+        assert!(
+            !row.imp().is_focused_post.get(),
+            "a recycled row is an ordinary post again, and an ordinary post \
+             opens its thread"
+        );
+        assert_eq!(
+            main_box.cursor().and_then(|c| c.name()).as_deref(),
+            Some("pointer"),
+            "and it says so under the pointer"
+        );
     }
 }
