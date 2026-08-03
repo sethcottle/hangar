@@ -21,7 +21,7 @@ A native Bluesky client for Linux, built with Rust, GTK4, and Libadwaita. Learn 
 
 ## What is Hangar?
 
-Hangar is a desktop Bluesky client designed specifically for Linux and the GNOME desktop environment. No Electron, no web views, no hybrid UI—just native GTK4 with Libadwaita for a fast, integrated experience.
+Hangar is a desktop Bluesky client designed specifically for Linux and the GNOME desktop environment. No Electron, no web views, no hybrid UI. Just native GTK4 with Libadwaita for a fast, integrated experience.
 
 ### Goals
 
@@ -97,9 +97,9 @@ chmod +x Hangar-x86_64.AppImage
 ```
 
 The AppImage bundles no libraries. Besides GTK 4.12+ and libadwaita 1.5+, it
-now needs the host's GStreamer 1.20+ — `libgstreamer1.0-0`,
+now needs the host's GStreamer 1.20+: `libgstreamer1.0-0`,
 `libgstreamer-plugins-base1.0-0` and `libgstreamer-gl1.0-0` on Debian/Ubuntu,
-`gstreamer1` and `gstreamer1-plugins-base` on Fedora — plus the playback
+`gstreamer1` and `gstreamer1-plugins-base` on Fedora, plus the playback
 plugins listed under [Dependencies](#dependencies) for video. These are linked
 in rather than loaded on demand, so the AppImage refuses to start without them
 instead of merely losing video.
@@ -231,7 +231,7 @@ src/
 ├── media/
 │   └── mod.rs           # GStreamer init + playbin3 pipeline construction
 ├── atproto/
-│   ├── client.rs        # HangarClient — AT Protocol wrapper
+│   ├── client.rs        # HangarClient, the AT Protocol wrapper
 │   ├── facets.rs        # Rich text facet parsing (mentions, links, hashtags)
 │   └── types.rs         # Post, Profile, Session, Notification types
 ├── cache/
@@ -276,7 +276,7 @@ Before contributing:
 - Run `cargo fmt` (required)
 - Address `clippy` warnings
 - Follow existing code patterns
-- Keep changes focused—one feature per PR
+- Keep changes focused, one feature per PR
 
 **Resources:**
 - [Brand assets and logos](https://hangar.blue/brand/)

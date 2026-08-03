@@ -116,7 +116,7 @@ jobs:
       - name: Create AppRun script
         run: |
           printf '%s\n' '#!/bin/bash' > AppDir/AppRun
-          printf '%s\n' '# AppRun for Hangar — GTK4 + libadwaita app' >> AppDir/AppRun
+          printf '%s\n' '# AppRun for Hangar, a GTK4 + libadwaita app' >> AppDir/AppRun
           printf '%s\n' '#' >> AppDir/AppRun
           printf '%s\n' '# Hangar does NOT bundle GTK4/libadwaita libraries. It uses the' >> AppDir/AppRun
           printf '%s\n' '# host system libraries. Minimum: GTK 4.12 and libadwaita 1.5,' >> AppDir/AppRun
@@ -138,7 +138,7 @@ jobs:
           printf '%s\n' 'export XDG_DATA_DIRS="${HERE}/usr/share:/usr/share:/usr/local/share:${XDG_DATA_DIRS:-/usr/share}"' >> AppDir/AppRun
           printf '%s\n' '' >> AppDir/AppRun
           printf '%s\n' '# Probe for it with ldconfig, which lives in /usr/sbin and is therefore NOT' >> AppDir/AppRun
-          printf '%s\n' '# on the PATH a desktop launcher hands us -- hence the absolute fallbacks.' >> AppDir/AppRun
+          printf '%s\n' '# on the PATH a desktop launcher hands us, hence the absolute fallbacks.' >> AppDir/AppRun
           printf '%s\n' '# If no ldconfig can be found at all the probe proves nothing, and a probe' >> AppDir/AppRun
           printf '%s\n' '# that proves nothing must never be the reason the app refuses to start.' >> AppDir/AppRun
           printf '%s\n' 'LDCONFIG=""' >> AppDir/AppRun
@@ -252,12 +252,12 @@ jobs:
 
             ### Downloads
 
-            - **Flatpak**: `hangar.flatpak` — Install with `flatpak install hangar.flatpak`
+            - **Flatpak**: `hangar.flatpak`. Install with `flatpak install hangar.flatpak`
             - **AppImage**: Make executable and run
 
             ### Authentication
 
-            Hangar uses OAuth for authentication. An app password fallback is also available — create one at [bsky.app/settings/app-passwords](https://bsky.app/settings/app-passwords).
+            Hangar uses OAuth for authentication. An app password fallback is also available. Create one at [bsky.app/settings/app-passwords](https://bsky.app/settings/app-passwords).
           files: |
             hangar.flatpak
             Hangar*.AppImage
@@ -276,12 +276,12 @@ jobs:
 
             ### Downloads
 
-            - **Flatpak**: `hangar.flatpak` — Install with `flatpak install hangar.flatpak`
+            - **Flatpak**: `hangar.flatpak`. Install with `flatpak install hangar.flatpak`
             - **AppImage**: Make executable and run
 
             ### Authentication
 
-            Hangar uses OAuth for authentication. An app password fallback is also available — create one at [bsky.app/settings/app-passwords](https://bsky.app/settings/app-passwords).
+            Hangar uses OAuth for authentication. An app password fallback is also available. Create one at [bsky.app/settings/app-passwords](https://bsky.app/settings/app-passwords).
           files: |
             hangar.flatpak
             Hangar*.AppImage

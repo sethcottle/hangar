@@ -13,7 +13,7 @@
 # secret-service credentials stay separate between channels.
 #
 # Run from anywhere; operates on the repository root. Intended for CI, which
-# works on a throwaway checkout -- the manifest edit is destructive.
+# works on a throwaway checkout. The manifest edit is destructive.
 
 set -euo pipefail
 

@@ -63,7 +63,7 @@
 
           # wrapGAppsHook4 does not carry the GStreamer plugin path, so without
           # this the app builds and starts but no pipeline can find
-          # souphttpsrc or hlsdemux2 -- video fails at runtime only.
+          # souphttpsrc or hlsdemux2, and video fails at runtime only.
           #
           # GIO_EXTRA_MODULES is spelled out for the same reason: the TLS
           # backend is a runtime-only lookup, so getting it wrong is invisible

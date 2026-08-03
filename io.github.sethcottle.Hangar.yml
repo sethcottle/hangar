@@ -15,7 +15,7 @@ sdk-extensions:
 # flathub org.freedesktop.Platform.ffmpeg-full//25.08` answers "Can't find ref",
 # and the newest branch Flathub carries is 24.08, so naming it here would name
 # nothing. freedesktop-sdk 25.08 replaced it with codecs-extra, and
-# org.gnome.Platform//50 -- which is built on 25.08 -- declares that extension
+# org.gnome.Platform//50 is built on 25.08 and declares that extension
 # point itself:
 #
 #   [Extension org.freedesktop.Platform.codecs-extra]
@@ -28,7 +28,7 @@ sdk-extensions:
 # resolving `flatpak install org.gnome.Platform//50` for an architecture with
 # nothing installed lists org.freedesktop.Platform.codecs-extra 25.08-extra in
 # the transaction. The runtime also already has it on the plugin path, so
-# GST_PLUGIN_SYSTEM_PATH needs no extending either -- the runtime sets it to
+# GST_PLUGIN_SYSTEM_PATH needs no extending either. The runtime sets it to
 # /app/lib/gstreamer-1.0:/usr/lib/extensions/gstreamer-1.0:/usr/lib/$arch/codecs-extra/lib/gstreamer-1.0:/usr/lib/$arch/gstreamer-1.0
 #
 # That extension is what gives Bluesky's H.264 + AAC HLS somewhere to decode.
