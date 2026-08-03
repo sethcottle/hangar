@@ -483,8 +483,12 @@ impl HangarClient {
         use atrium_api::app::bsky::feed::defs::PostViewEmbedRefs;
         use atrium_api::types::Union;
 
-        let Union::Refs(embed_ref) = embed.as_ref()? else {
-            return None;
+        let embed_ref = match embed.as_ref()? {
+            Union::Refs(embed_ref) => embed_ref,
+            // A lexicon atrium does not know about. Some of them we can still
+            // read off the raw IPLD; the rest are at least named in the log
+            // rather than becoming a post with a hole in it.
+            Union::Unknown(unknown) => return Self::extract_unknown_embed(unknown, "post"),
         };
 
         match embed_ref {
@@ -530,14 +534,106 @@ impl HangarClient {
                 self.extract_quote_embed(&record_view.data.record)
             }
             PostViewEmbedRefs::AppBskyEmbedRecordWithMediaView(rwm_view) => {
-                let quote = self.extract_quote_from_record(&rwm_view.data.record.data.record)?;
-                let media = self.extract_media_embed(&rwm_view.data.media)?;
-                Some(Embed::QuoteWithMedia {
-                    quote,
-                    media: Box::new(media),
-                })
+                Self::combine_record_with_media(
+                    self.extract_quote_from_record(&rwm_view.data.record.data.record),
+                    Self::extract_media_embed(&rwm_view.data.media),
+                )
             }
         }
+    }
+
+    /// Put a record-with-media view back together from whichever halves
+    /// resolved.
+    ///
+    /// Never `and_then` the two together. A quote can be blocked, deleted or
+    /// detached, and a media half can be a lexicon this build does not know,
+    /// and both of those are ordinary. Requiring both is what made a post whose
+    /// quote had been deleted, or whose media was a GIF, come back as
+    /// `embed: None` — and `PostRow` hides the embed container outright for
+    /// `None`, so the post rendered as an author, a timestamp, an action bar
+    /// and a blank space where the content should be.
+    fn combine_record_with_media(quote: Option<QuoteEmbed>, media: Option<Embed>) -> Option<Embed> {
+        match (quote, media) {
+            (Some(quote), Some(media)) => Some(Embed::QuoteWithMedia {
+                quote,
+                media: Box::new(media),
+            }),
+            (Some(quote), None) => Some(Embed::Quote(quote)),
+            (None, Some(media)) => Some(media),
+            (None, None) => None,
+        }
+    }
+
+    /// Best effort at an embed whose `$type` is not in this build's lexicons.
+    ///
+    /// `app.bsky.embed.gallery` is the multi-image lexicon that supersedes
+    /// `app.bsky.embed.images`, and atrium-api 0.25 — the newest published
+    /// version — has no module for it, so it arrives as `Union::Unknown` and
+    /// used to be dropped on the floor. That was roughly 0.8% of embedded posts
+    /// in a live sample, every one of them rendering as a blank post body. The
+    /// view's items are `{thumbnail, fullsize, alt, aspectRatio}`, which is
+    /// exactly [`ImageEmbed`], so they are read straight off the raw IPLD and
+    /// rendered by the existing image grid.
+    ///
+    /// Anything else is named on stderr. A silent `None` here is indistinguish-
+    /// able from a post with no embed, which is what made this class of bug so
+    /// hard to see from the outside.
+    fn extract_unknown_embed(
+        unknown: &atrium_api::types::UnknownData,
+        context: &str,
+    ) -> Option<Embed> {
+        if unknown.r#type != "app.bsky.embed.gallery#view" {
+            eprintln!(
+                "hangar: unsupported {context} embed type {:?}; showing the post without it",
+                unknown.r#type
+            );
+            return None;
+        }
+
+        #[derive(serde::Deserialize)]
+        struct GalleryView {
+            #[serde(default)]
+            items: Vec<GalleryItem>,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct GalleryItem {
+            thumbnail: String,
+            fullsize: String,
+            #[serde(default)]
+            alt: String,
+            #[serde(default)]
+            aspect_ratio: Option<GalleryAspect>,
+        }
+        #[derive(serde::Deserialize)]
+        struct GalleryAspect {
+            width: u32,
+            height: u32,
+        }
+
+        let view: GalleryView = serde_json::to_value(&unknown.data)
+            .and_then(serde_json::from_value)
+            .map_err(|e| eprintln!("hangar: could not read a gallery embed: {e}"))
+            .ok()?;
+
+        if view.items.is_empty() {
+            return None;
+        }
+
+        Some(Embed::Images(
+            view.items
+                .into_iter()
+                .map(|item| ImageEmbed {
+                    thumb: item.thumbnail,
+                    fullsize: item.fullsize,
+                    alt: item.alt,
+                    aspect_ratio: item
+                        .aspect_ratio
+                        .filter(|a| a.width > 0 && a.height > 0)
+                        .map(|a| (a.width, a.height)),
+                })
+                .collect(),
+        ))
     }
 
     /// Extract quote embed from record view
@@ -641,20 +737,17 @@ impl HangarClient {
                 self.extract_quote_embed(&record_view.data.record)
             }
             Union::Refs(ViewRecordEmbedsItem::AppBskyEmbedRecordWithMediaView(rwm_view)) => {
-                let quote = self.extract_quote_from_record(&rwm_view.data.record.data.record)?;
-                let media = self.extract_media_embed(&rwm_view.data.media)?;
-                Some(Embed::QuoteWithMedia {
-                    quote,
-                    media: Box::new(media),
-                })
+                Self::combine_record_with_media(
+                    self.extract_quote_from_record(&rwm_view.data.record.data.record),
+                    Self::extract_media_embed(&rwm_view.data.media),
+                )
             }
-            _ => None,
+            Union::Unknown(unknown) => Self::extract_unknown_embed(unknown, "quoted post"),
         }
     }
 
     /// Extract media embed from record-with-media view
     fn extract_media_embed(
-        &self,
         media: &atrium_api::types::Union<
             atrium_api::app::bsky::embed::record_with_media::ViewMediaRefs,
         >,
@@ -692,7 +785,22 @@ impl HangarClient {
                         .map(|ar| (ar.data.width.get() as u32, ar.data.height.get() as u32)),
                 }))
             }
-            _ => None,
+            // The third variant of this union, and the one that was missing.
+            // "Quote a post, reply with a GIF" is the single most common shape
+            // a record-with-media takes — GIFs are `external` views, not a
+            // media type of their own — and dropping it here is what produced
+            // the empty post body. Ordinary link cards attached to a quote were
+            // collateral damage from the same line.
+            Union::Refs(ViewMediaRefs::AppBskyEmbedExternalView(external_view)) => {
+                let ext = &external_view.data.external;
+                Some(Embed::External(ExternalEmbed {
+                    uri: ext.data.uri.clone(),
+                    title: ext.data.title.clone(),
+                    description: ext.data.description.clone(),
+                    thumb: ext.data.thumb.clone(),
+                }))
+            }
+            Union::Unknown(unknown) => Self::extract_unknown_embed(unknown, "attached media"),
         }
     }
 
@@ -2420,4 +2528,145 @@ fn html_decode(s: &str) -> String {
         .replace("&#39;", "'")
         .replace("&#x27;", "'")
         .replace("&apos;", "'")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use atrium_api::app::bsky::embed::record_with_media::ViewMediaRefs;
+    use atrium_api::types::{Union, UnknownData};
+
+    fn quote() -> QuoteEmbed {
+        QuoteEmbed {
+            uri: "at://did:plc:test/app.bsky.feed.post/quoted".into(),
+            cid: "cid".into(),
+            author: Profile::minimal(
+                "did:plc:test".into(),
+                "someone.bsky.social".into(),
+                None,
+                None,
+            ),
+            text: "the quoted text".into(),
+            indexed_at: "2026-01-01T00:00:00Z".into(),
+            embed: None,
+        }
+    }
+
+    fn image() -> Embed {
+        Embed::Images(vec![ImageEmbed {
+            thumb: "t".into(),
+            fullsize: "f".into(),
+            alt: String::new(),
+            aspect_ratio: None,
+        }])
+    }
+
+    /// A GIF attached to a quote post is an `external` view, and `external` was
+    /// the one variant of this union that had no arm.
+    ///
+    /// It fell into `_ => None`, the `None` propagated out through
+    /// `extract_embed`, and `PostRow` hides its embed container for a post with
+    /// no embed — an author, a timestamp, an action bar, and nothing in
+    /// between. "Quote a post, reply with a GIF" is the most common shape a
+    /// record-with-media takes, so this was not a corner.
+    #[test]
+    fn an_external_attached_to_a_quote_still_reaches_the_ui() {
+        let media: Union<ViewMediaRefs> = serde_json::from_str(
+            r#"{
+                "$type": "app.bsky.embed.external#view",
+                "external": {
+                    "uri": "https://static.klipy.com/ii/hash/76/03/slug.gif?hh=278&ww=498&mp4=abc",
+                    "title": "Team",
+                    "description": "ALT: Team",
+                    "thumb": "https://cdn.bsky.app/img/feed_thumbnail/plain/did/cid"
+                }
+            }"#,
+        )
+        .expect("an external view is a media ref");
+
+        match HangarClient::extract_media_embed(&media) {
+            Some(Embed::External(ext)) => {
+                assert!(ext.uri.contains("static.klipy.com"));
+                assert_eq!(ext.title, "Team");
+            }
+            other => panic!("expected an external embed, got {other:?}"),
+        }
+    }
+
+    /// Half a record-with-media is still worth showing.
+    #[test]
+    fn a_record_with_media_survives_losing_either_half() {
+        // A quote whose media this build cannot read: show the quote.
+        assert!(matches!(
+            HangarClient::combine_record_with_media(Some(quote()), None),
+            Some(Embed::Quote(_))
+        ));
+        // Media whose quoted post was deleted, blocked or detached: show the
+        // media. `extract_quote_from_record` returns None for all three, and
+        // that used to take the media down with it.
+        assert!(matches!(
+            HangarClient::combine_record_with_media(None, Some(image())),
+            Some(Embed::Images(_))
+        ));
+        assert!(matches!(
+            HangarClient::combine_record_with_media(Some(quote()), Some(image())),
+            Some(Embed::QuoteWithMedia { .. })
+        ));
+        assert!(HangarClient::combine_record_with_media(None, None).is_none());
+    }
+
+    /// `app.bsky.embed.gallery` is newer than any published atrium-api, so it
+    /// arrives as raw IPLD. Dropping it silently made roughly one embedded post
+    /// in a hundred render blank.
+    #[test]
+    fn a_gallery_embed_is_read_off_the_raw_ipld() {
+        let unknown: UnknownData = serde_json::from_str(
+            r#"{
+                "$type": "app.bsky.embed.gallery#view",
+                "items": [
+                    {
+                        "$type": "app.bsky.embed.gallery#viewImage",
+                        "thumbnail": "https://cdn.bsky.app/thumb/1",
+                        "fullsize": "https://cdn.bsky.app/full/1",
+                        "alt": "a description",
+                        "aspectRatio": { "height": 3999, "width": 3000 }
+                    },
+                    {
+                        "$type": "app.bsky.embed.gallery#viewImage",
+                        "thumbnail": "https://cdn.bsky.app/thumb/2",
+                        "fullsize": "https://cdn.bsky.app/full/2"
+                    }
+                ]
+            }"#,
+        )
+        .expect("gallery view");
+
+        let Some(Embed::Images(images)) = HangarClient::extract_unknown_embed(&unknown, "post")
+        else {
+            panic!("a gallery is a set of images");
+        };
+        assert_eq!(images.len(), 2);
+        assert_eq!(images[0].fullsize, "https://cdn.bsky.app/full/1");
+        assert_eq!(images[0].alt, "a description");
+        assert_eq!(images[0].aspect_ratio, Some((3000, 3999)));
+        // The optional fields really are optional.
+        assert_eq!(images[1].alt, "");
+        assert_eq!(images[1].aspect_ratio, None);
+    }
+
+    /// Anything else is still `None`, but it is a `None` that says so on
+    /// stderr instead of leaving a hole in the post and no way to find out why.
+    #[test]
+    fn an_unrecognised_embed_type_is_declined_rather_than_guessed_at() {
+        let unknown: UnknownData =
+            serde_json::from_str(r#"{"$type":"app.bsky.embed.somethingNew#view","x":1}"#)
+                .expect("unknown view");
+        assert!(HangarClient::extract_unknown_embed(&unknown, "post").is_none());
+
+        // A gallery with no items is nothing to render either.
+        let empty: UnknownData =
+            serde_json::from_str(r#"{"$type":"app.bsky.embed.gallery#view","items":[]}"#)
+                .expect("empty gallery");
+        assert!(HangarClient::extract_unknown_embed(&empty, "post").is_none());
+    }
 }

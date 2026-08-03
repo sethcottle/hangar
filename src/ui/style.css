@@ -260,6 +260,19 @@ popover.menu > contents {
     background-color: alpha(black, 0.8);
 }
 
+/* GIF badge. A GIF embed shows a still frame until it is clicked, and a still
+   frame is indistinguishable from a photograph without something saying so.
+   Fixed colours rather than theme ones: it sits on top of arbitrary image
+   pixels, where a light-theme foreground would be unreadable half the time. */
+.gif-badge {
+    background-color: alpha(black, 0.7);
+    color: white;
+    font-size: 0.75em;
+    font-weight: bold;
+    padding: 2px 6px;
+    border-radius: 6px;
+}
+
 /* Video player: letterbox against black so a portrait clip does not sit on a
    bright dialog background. */
 .video-surface {
@@ -268,6 +281,40 @@ popover.menu > contents {
 
 .video-controls {
     padding: 6px 12px;
+}
+
+/* Inline transport. An overlay strip rather than a bar under the picture: the
+   row's height was decided from the video's aspect ratio before the player
+   existed, and a bar underneath would grow the embed past it. Sat on top of
+   arbitrary video pixels, so the same fixed dark treatment as the play button
+   rather than a theme colour that would be unreadable half the time. */
+.video-inline-controls {
+    background-color: alpha(black, 0.6);
+    padding: 4px 8px;
+    border-radius: 0 0 12px 12px;
+}
+
+.video-inline-controls button {
+    color: white;
+}
+
+.video-inline-controls label {
+    color: white;
+}
+
+/* One line saying why the thumbnail came back, where a dialog would show a
+   whole status page. Ellipsized and capped rather than wrapped: this is over an
+   embed in a scroller with no horizontal valve. */
+.video-inline-error {
+    background-color: alpha(black, 0.75);
+    color: white;
+    padding: 4px 8px;
+    border-radius: 8px;
+}
+
+.video-inline-error label {
+    color: white;
+    font-size: 0.9em;
 }
 
 /* Quote post card. The clickable wrapper is a plain box, not a button, so

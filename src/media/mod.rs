@@ -16,6 +16,56 @@ use gst::prelude::*;
 use gstreamer as gst;
 use gtk4::gdk;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// How many pipelines this process currently owns.
+///
+/// Not a statistic: it is the check on the one invariant inline video rests on.
+/// A recycled `GtkListView` row that arms a pipeline and is then rebound under
+/// it leaks a decoder, an audio sink and a bus watch, and the symptom people
+/// report is "the app got slow" a hundred rows later rather than anything
+/// pointing at a video. Counting them makes the leak assertable — see
+/// `ui::inline_video::tests` — and, with `HANGAR_DEBUG_PIPELINES=1` set,
+/// watchable while scrolling a real feed.
+static LIVE_PIPELINES: AtomicUsize = AtomicUsize::new(0);
+
+/// How many pipelines are alive right now.
+pub fn live_pipelines() -> usize {
+    LIVE_PIPELINES.load(Ordering::Relaxed)
+}
+
+/// Proof that one pipeline exists, and the thing that says so when it stops.
+///
+/// Deliberately an RAII token rather than a pair of counter calls: whoever owns
+/// the pipeline owns this, so the count cannot drift when a teardown path is
+/// added later and forgets to decrement. `gst::Element` is a refcounted GObject
+/// that gets cloned all over a player, so the count cannot hang off the element
+/// itself.
+pub struct PipelineToken {
+    _private: (),
+}
+
+impl PipelineToken {
+    fn new(uri: &str) -> Self {
+        let live = LIVE_PIPELINES.fetch_add(1, Ordering::Relaxed) + 1;
+        trace_pipelines("built", live, uri);
+        Self { _private: () }
+    }
+}
+
+impl Drop for PipelineToken {
+    fn drop(&mut self) {
+        let live = LIVE_PIPELINES.fetch_sub(1, Ordering::Relaxed) - 1;
+        trace_pipelines("dropped", live, "");
+    }
+}
+
+fn trace_pipelines(what: &str, live: usize, uri: &str) {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if *ENABLED.get_or_init(|| std::env::var_os("HANGAR_DEBUG_PIPELINES").is_some()) {
+        eprintln!("hangar: pipeline {what}, {live} live {uri}");
+    }
+}
 
 /// Everything that can keep a video from playing, in a shape the UI can show.
 #[derive(Debug, Clone)]
@@ -74,6 +124,9 @@ impl MediaError {
 pub struct VideoPipeline {
     pub playbin: gst::Element,
     pub paintable: gdk::Paintable,
+    /// Held for as long as the pipeline is; dropping it is what decrements
+    /// [`live_pipelines`]. Never clone the playbin *instead* of keeping this.
+    pub token: PipelineToken,
 }
 
 /// Initialize GStreamer and register `gtk4paintablesink`, once per process.
@@ -157,7 +210,12 @@ pub fn build_pipeline(uri: &str, volume: f64, muted: bool) -> Result<VideoPipeli
         .build()
         .map_err(|_| MediaError::MissingElement("playbin3"))?;
 
-    Ok(VideoPipeline { playbin, paintable })
+    Ok(VideoPipeline {
+        playbin,
+        paintable,
+        // Last, so nothing counted here can be undone by a `?` above it.
+        token: PipelineToken::new(uri),
+    })
 }
 
 /// Convert a perceptual 0.0..=1.0 slider position to playbin3's linear scale.

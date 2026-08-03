@@ -36,6 +36,7 @@ flatpak-cargo-generator.py
 
 # Internal docs (not for public repo yet)
 DOCS/
+docs/
 CLAUDE.md
 
 # Rust specific

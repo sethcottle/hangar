@@ -84,6 +84,12 @@ mod imp {
         pub mention_clicked_callback: RefCell<Option<Box<dyn Fn(String) + 'static>>>,
         // Main box for cursor control
         pub main_box: RefCell<Option<gtk4::Box>>,
+        /// The row's video embed, while it has one.
+        ///
+        /// The only strong reference to it in the process: the director keeps
+        /// `Weak`s. Dropping it — on rebind, on unbind, or with the row — is
+        /// what guarantees the pipeline goes with it.
+        pub video_slot: RefCell<Option<std::rc::Rc<crate::ui::inline_video::VideoSlot>>>,
     }
 
     #[glib::object_subclass]
@@ -888,19 +894,23 @@ impl PostRow {
 
         // Set content with rich text formatting (links, mentions, hashtags)
         if let Some(label) = imp.content_label.borrow().as_ref() {
-            let markup = Self::format_post_text(&post.text);
-            label.set_markup(&markup);
+            Self::set_post_markup(label, &post.text);
         }
 
         // Render embed content
         if let Some(container) = imp.embed_container.borrow().as_ref() {
+            // Before the widgets go, not after: this row may be a recycled one
+            // that was playing a video, and the pipeline belongs to the post
+            // that is being replaced rather than to the widget tree.
+            self.release_video();
+
             // Clear previous embeds
             while let Some(child) = container.first_child() {
                 container.remove(&child);
             }
 
             if let Some(embed) = &post.embed {
-                self.render_embed(container, embed);
+                self.render_embed(container, embed, true);
                 container.set_visible(true);
             } else {
                 container.set_visible(false);
@@ -1081,8 +1091,28 @@ impl PostRow {
         self.imp().viewer_repost_uri.replace(uri);
     }
 
+    /// Give up any video this row is playing. Idempotent.
+    ///
+    /// Called from every list factory's `unbind`, and from `bind` before the
+    /// old embed's widgets go. Public because a `SignalListItemFactory` has
+    /// nothing but the row to call.
+    pub fn release_video(&self) {
+        // Taken rather than borrowed: dropping the last `Rc` runs `VideoSlot`'s
+        // `Drop`, which tears the pipeline down, and doing that while this
+        // `RefCell` is still borrowed would be a panic waiting for the first
+        // person to add a slot lookup to that path.
+        let slot = self.imp().video_slot.borrow_mut().take();
+        drop(slot);
+    }
+
     /// Render embed content into the container
-    fn render_embed(&self, container: &gtk4::Box, embed: &Embed) {
+    ///
+    /// `inline_allowed` is false inside a quote card. The card is a focusable,
+    /// Space-activatable box with a bubble-phase claim-on-release gesture, and
+    /// nesting a transport and a drag-scrubber in it is a keyboard and gesture
+    /// mess for an embed that small. A quoted video keeps the thumbnail that
+    /// opens the viewer, which is what every embed did before this.
+    fn render_embed(&self, container: &gtk4::Box, embed: &Embed, inline_allowed: bool) {
         match embed {
             Embed::Images(images) => {
                 self.render_images(container, images);
@@ -1091,14 +1121,14 @@ impl PostRow {
                 self.render_external_card(container, ext);
             }
             Embed::Video(video) => {
-                self.render_video(container, video);
+                self.render_video(container, video, inline_allowed);
             }
             Embed::Quote(quote) => {
                 self.render_quote(container, quote);
             }
             Embed::QuoteWithMedia { quote, media } => {
                 // Render media first, then quote below
-                self.render_embed(container, media);
+                self.render_embed(container, media, inline_allowed);
                 self.render_quote(container, quote);
             }
         }
@@ -1254,6 +1284,14 @@ impl PostRow {
 
     /// Render an external link card (clickable to open URL)
     fn render_external_card(&self, container: &gtk4::Box, ext: &crate::atproto::ExternalEmbed) {
+        // A GIF is not a link card. It only arrives dressed as one, because
+        // Bluesky has no GIF embed type — see `atproto::gif`. Anything not
+        // recognised falls through and is rendered as the link card it is.
+        if let Some(gif) = crate::atproto::gif::detect(&ext.uri) {
+            self.render_gif(container, ext, &gif);
+            return;
+        }
+
         // Wrap card in a button for clickability
         let card_btn = gtk4::Button::new();
         card_btn.add_css_class("flat");
@@ -1351,8 +1389,129 @@ impl PostRow {
         container.append(&card_btn);
     }
 
+    /// The alt text a GIF carries, with Bluesky's own prefix taken back off.
+    ///
+    /// The composer writes the picker's caption into `description` as
+    /// `"ALT: <caption>"`, which is why an unrecognised GIF used to render as a
+    /// link card whose subtitle read "ALT: shrug".
+    fn gif_alt(ext: &crate::atproto::ExternalEmbed) -> Option<String> {
+        let text = ext
+            .description
+            .strip_prefix("ALT: ")
+            .unwrap_or(&ext.description)
+            .trim();
+        let text = if text.is_empty() {
+            ext.title.trim()
+        } else {
+            text
+        };
+        (!text.is_empty()).then(|| format!("GIF: {text}"))
+    }
+
+    /// Render an animated GIF that arrived as an external embed.
+    ///
+    /// A still frame plus a badge and a play button, not an inline pipeline.
+    /// One `playbin3` per visible GIF in a recycled `ListView` is a great many
+    /// pipelines and a great many bus watches bound to rows that get rebound
+    /// under them, and this file's history is four separate bugs where exactly
+    /// that kind of thing outlived the widget that armed it. Clicking hands the
+    /// URL to the media viewer, which already owns a player with a documented
+    /// teardown path.
+    fn render_gif(
+        &self,
+        container: &gtk4::Box,
+        ext: &crate::atproto::ExternalEmbed,
+        gif: &crate::atproto::GifEmbed,
+    ) {
+        let overlay = gtk4::Overlay::new();
+        overlay.add_css_class("video-embed");
+        overlay.set_hexpand(true);
+
+        // The GIF hosts state the exact pixel size in the link's own query
+        // string, so unlike most embeds this one never has to fall back to
+        // 16:9. Same clamp as a single image, since that is what it is.
+        let frame = gtk4::Frame::new(None);
+        frame.set_hexpand(true);
+        frame.set_overflow(gtk4::Overflow::Hidden);
+        frame.add_css_class("post-embed-image");
+        frame.set_size_request(-1, Self::embed_height(Some(gif.aspect_ratio), 180, 430));
+
+        let thumb = gtk4::Picture::new();
+        thumb.set_hexpand(true);
+        thumb.set_vexpand(true);
+        // Without this the thumbnail's intrinsic width becomes the row's
+        // minimum, and with no horizontal scroll valve on the timeline that
+        // widens the whole window.
+        thumb.set_can_shrink(true);
+        thumb.set_content_fit(gtk4::ContentFit::Contain);
+        if let Some(alt) = Self::gif_alt(ext) {
+            thumb.set_alternative_text(Some(&alt));
+        }
+        if let Some(thumb_url) = &ext.thumb {
+            avatar_cache::load_image_into_picture(thumb.clone(), thumb_url.clone());
+        }
+        frame.set_child(Some(&thumb));
+        overlay.set_child(Some(&frame));
+
+        // Says out loud what the still frame cannot: this moves.
+        let badge = gtk4::Label::new(Some("GIF"));
+        badge.add_css_class("gif-badge");
+        badge.set_halign(gtk4::Align::Start);
+        badge.set_valign(gtk4::Align::End);
+        badge.set_margin_start(8);
+        badge.set_margin_bottom(8);
+        badge.set_can_target(false);
+        overlay.add_overlay(&badge);
+
+        let play_btn = gtk4::Button::from_icon_name("media-playback-start-symbolic");
+        play_btn.add_css_class("circular");
+        play_btn.add_css_class("osd");
+        play_btn.set_halign(gtk4::Align::Center);
+        play_btn.set_valign(gtk4::Align::Center);
+        play_btn.set_tooltip_text(Some("Play GIF"));
+        play_btn.update_property(&[gtk4::accessible::Property::Label("Play GIF")]);
+
+        let gif = gif.clone();
+        let alt = Self::gif_alt(ext);
+        let link = ext.uri.clone();
+        let post_row = self.clone();
+        play_btn.connect_clicked(move |btn| {
+            // The post on the web if the pipeline fails, falling back to the
+            // GIF's own page. Neither is the re-encoded MP4: handing a browser
+            // a bare video URL is the same mistake as handing it an HLS
+            // playlist.
+            let fallback = post_row
+                .imp()
+                .post
+                .borrow()
+                .as_ref()
+                .map(|p| Self::get_post_url(&p.author.handle, &p.uri))
+                .or_else(|| Some(link.clone()));
+            crate::ui::media_viewer::show_video(
+                btn,
+                crate::ui::video_player::VideoSource::from_gif(&gif, alt.clone(), fallback),
+            );
+        });
+        overlay.add_overlay(&play_btn);
+
+        container.append(&overlay);
+    }
+
     /// Render a video embed
-    fn render_video(&self, container: &gtk4::Box, video: &crate::atproto::VideoEmbed) {
+    ///
+    /// The widgets are the same whether or not the video can play here: a
+    /// clipping frame at the video's own aspect ratio, a thumbnail, and a
+    /// centre play button. What `inline_allowed` decides is who the button
+    /// talks to — a [`crate::ui::inline_video::VideoSlot`], which swaps a
+    /// player into the frame, or the media viewer's dialog. Until something is
+    /// armed, an inline-capable embed is byte for byte the widget tree this
+    /// function built before inline playback existed.
+    fn render_video(
+        &self,
+        container: &gtk4::Box,
+        video: &crate::atproto::VideoEmbed,
+        inline_allowed: bool,
+    ) {
         let overlay = gtk4::Overlay::new();
         overlay.add_css_class("video-embed");
         overlay.set_hexpand(true);
@@ -1371,7 +1530,22 @@ impl PostRow {
         thumb.set_hexpand(true);
         thumb.set_vexpand(true);
         thumb.set_can_shrink(true);
-        thumb.set_content_fit(gtk4::ContentFit::Cover);
+        // Contain, exactly as a lone image gets. A video embed is always
+        // standalone — there is no video grid — so it has nothing to line up
+        // with, and Cover was simply throwing away the edges of the frame
+        // somebody chose as the thumbnail. The frame's height already comes
+        // from this video's own aspect ratio, so for anything between the
+        // clamp's bounds Contain fills it edge to edge and crops nothing.
+        // Grid cells keep Cover: see `create_image_cell`.
+        thumb.set_content_fit(gtk4::ContentFit::Contain);
+        if let Some(alt) = video
+            .alt
+            .as_deref()
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+        {
+            thumb.set_alternative_text(Some(alt));
+        }
 
         if let Some(thumb_url) = &video.thumbnail {
             avatar_cache::load_image_into_picture(thumb.clone(), thumb_url.clone());
@@ -1385,28 +1559,33 @@ impl PostRow {
         play_btn.add_css_class("osd");
         play_btn.set_halign(gtk4::Align::Center);
         play_btn.set_valign(gtk4::Align::Center);
+        play_btn.set_tooltip_text(Some("Play video"));
+        play_btn.update_property(&[gtk4::accessible::Property::Label("Play video")]);
 
-        // Play in app. If the pipeline fails the viewer offers the post on the
-        // web rather than opening it unasked.
-        let video = video.clone();
-        let post_row = self.clone();
-        play_btn.connect_clicked(move |btn| {
-            // The post on the web, or nothing. Falling back to the playlist
-            // would hand a browser the page of raw text this player exists to
-            // avoid, so the viewer drops the button instead.
-            let fallback = post_row
-                .imp()
-                .post
-                .borrow()
-                .as_ref()
-                .map(|p| Self::get_post_url(&p.author.handle, &p.uri));
-            crate::ui::media_viewer::show_video(
-                btn,
-                crate::ui::video_player::VideoSource::from_embed(&video, fallback),
-            );
-        });
+        // The post on the web, or nothing. Falling back to the playlist would
+        // hand a browser the page of raw text the player exists to avoid, so
+        // the failure path drops the button instead.
+        let fallback = self
+            .imp()
+            .post
+            .borrow()
+            .as_ref()
+            .map(|p| Self::get_post_url(&p.author.handle, &p.uri));
+        let source = crate::ui::video_player::VideoSource::from_embed(video, fallback);
 
         overlay.add_overlay(&play_btn);
+
+        if inline_allowed {
+            let slot = crate::ui::inline_video::VideoSlot::new(
+                &overlay, &frame, &thumb, &play_btn, source,
+            );
+            // The row is the slot's only owner, and the slot is the pipeline's.
+            self.imp().video_slot.replace(Some(slot));
+        } else {
+            play_btn.connect_clicked(move |btn| {
+                crate::ui::media_viewer::show_video(btn, source.clone());
+            });
+        }
 
         container.append(&overlay);
     }
@@ -1490,7 +1669,7 @@ impl PostRow {
         // Nested embed (if any)
         if let Some(nested_embed) = &quote.embed {
             let nested_container = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
-            self.render_embed(&nested_container, nested_embed);
+            self.render_embed(&nested_container, nested_embed, false);
             card.append(&nested_container);
         }
 
@@ -1607,89 +1786,125 @@ impl PostRow {
         ((CONTENT_WIDTH * f64::from(h) / f64::from(w)).round() as i32).clamp(min, max)
     }
 
-    /// Format post text with clickable links, mentions, and hashtags using Pango markup
-    /// URLs become actual <a> tags, mentions use bsky-mention:// scheme, hashtags use bsky-tag:// scheme
-    fn format_post_text(text: &str) -> String {
-        // First escape the entire text for Pango markup
-        let escaped = glib::markup_escape_text(text);
-        let mut result = escaped.to_string();
+    /// Put post text on `label`, linkified, and never blank.
+    ///
+    /// `gtk_label_set_markup` given markup it cannot parse does not fall back
+    /// to showing the text. It emits a `Gtk-WARNING` and returns having changed
+    /// nothing at all — so the label keeps whatever it had, which is empty on a
+    /// fresh row and, because `ListView` recycles rows, *the previous post's
+    /// text* on a reused one. Either way the post the reader is looking at is
+    /// not on screen, and nothing but that warning says so.
+    ///
+    /// So: clear the label to a known state, set the markup, and if the text
+    /// did not arrive, put it on unformatted. Links stop being clickable, which
+    /// is a great deal better than the post disappearing or impersonating
+    /// another one.
+    ///
+    /// [`Self::format_post_text`] is meant to make the fallback unreachable.
+    /// This stays anyway. It costs two property sets per bind, against the only
+    /// alternative way of noticing the next escaping bug being a user reporting
+    /// an empty post. Checking through the label rather than by re-parsing the
+    /// markup is deliberate: `pango::parse_markup` is only the *second* of the
+    /// two parsers `GtkLabel` runs — it rejects the `<a>` tags that GtkLabel's
+    /// own first pass strips out — so it cannot answer this question.
+    fn set_post_markup(label: &gtk4::Label, text: &str) {
+        let markup = Self::format_post_text(text);
+        label.set_text("");
+        label.set_markup(&markup);
+        if label.text().is_empty() && !text.is_empty() {
+            eprintln!(
+                "hangar: post text could not be marked up; showing it unformatted.\n  \
+                 text: {text:?}\n  markup: {markup:?}"
+            );
+            label.set_text(text);
+        }
+    }
 
-        // Pattern for URLs with protocol (http/https)
-        let url_with_protocol =
-            regex::Regex::new(r"https?://[^\s<>\[\]{}|\\^`\x00-\x1f\x7f]+").unwrap();
+    /// One linkified span, as byte offsets into the *raw* post text.
+    fn text_links(text: &str) -> Vec<(std::ops::Range<usize>, String)> {
+        use std::sync::LazyLock;
 
-        // Pattern for @mentions (e.g., @user.bsky.social)
-        let mention_pattern = regex::Regex::new(
-            r"@([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+[a-zA-Z]([a-zA-Z0-9-]*[a-zA-Z0-9])?",
-        )
-        .unwrap();
+        // Compiled once. These used to be rebuilt on every bind, which in a
+        // ListView means four regex compilations per row per scroll.
+        static URL: LazyLock<regex::Regex> = LazyLock::new(|| {
+            regex::Regex::new(r"https?://[^\s<>\[\]{}|\\^`\x00-\x1f\x7f]+").unwrap()
+        });
+        static MENTION: LazyLock<regex::Regex> = LazyLock::new(|| {
+            regex::Regex::new(
+                r"@([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+[a-zA-Z]([a-zA-Z0-9-]*[a-zA-Z0-9])?",
+            )
+            .unwrap()
+        });
+        // Bare domains, matched after mentions so that a handle ending in
+        // `.social` is a mention rather than a link to a website.
+        static BARE_URL: LazyLock<regex::Regex> = LazyLock::new(|| {
+            regex::Regex::new(
+                r"\b([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+(?:com|org|net|io|co|app|dev|edu|gov|me|info|biz|social)[/a-zA-Z0-9._~:/?#@!$&'()*+,;=-]*",
+            )
+            .unwrap()
+        });
+        static HASHTAG: LazyLock<regex::Regex> =
+            LazyLock::new(|| regex::Regex::new(r"#[a-zA-Z][a-zA-Z0-9_]*").unwrap());
 
-        // Pattern for hashtags
-        let hashtag_pattern = regex::Regex::new(r"#[a-zA-Z][a-zA-Z0-9_]*").unwrap();
+        let mut links: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+        let mut claim = |range: std::ops::Range<usize>, href: String| {
+            if !links
+                .iter()
+                .any(|(taken, _)| range.start < taken.end && range.end > taken.start)
+            {
+                links.push((range, href));
+            }
+        };
 
-        // Replace URLs with protocol - use placeholder to avoid re-matching
-        let mut link_count = 0;
-        let mut links: Vec<String> = Vec::new();
-        result = url_with_protocol
-            .replace_all(&result, |caps: &regex::Captures| {
-                let url = &caps[0];
-                let placeholder = format!("\x00LINK{}\x00", link_count);
-                links.push(format!("<a href=\"{}\">{}</a>", url, url));
-                link_count += 1;
-                placeholder
-            })
-            .to_string();
-
-        // Replace @mentions BEFORE bare URLs (since handles like @user.bsky.social
-        // would otherwise be caught by the bare URL pattern matching .social TLD)
-        result = mention_pattern
-            .replace_all(&result, |caps: &regex::Captures| {
-                let mention = &caps[0];
-                let handle = &mention[1..]; // Strip the @ prefix for the URI
-                let placeholder = format!("\x00LINK{}\x00", link_count);
-                links.push(format!(
-                    "<a href=\"bsky-mention://{}\">{}</a>",
-                    handle, mention
-                ));
-                link_count += 1;
-                placeholder
-            })
-            .to_string();
-
-        // Pattern for bare domain URLs (domain.tld/path) - only match if not already linkified
-        // Common TLDs that are likely to be URLs
-        let bare_url_pattern = regex::Regex::new(
-            r"\b([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+(?:com|org|net|io|co|app|dev|edu|gov|me|info|biz|social)[/a-zA-Z0-9._~:/?#@!$&'()*+,;=-]*",
-        )
-        .unwrap();
-
-        // Replace bare domain URLs
-        result = bare_url_pattern
-            .replace_all(&result, |caps: &regex::Captures| {
-                let url = &caps[0];
-                let placeholder = format!("\x00LINK{}\x00", link_count);
-                links.push(format!("<a href=\"https://{}\">{}</a>", url, url));
-                link_count += 1;
-                placeholder
-            })
-            .to_string();
-
-        // Replace hashtags with clickable links using custom scheme
-        result = hashtag_pattern
-            .replace_all(&result, |caps: &regex::Captures| {
-                let hashtag = &caps[0];
-                let tag = &hashtag[1..]; // Strip the # prefix for the URI
-                format!("<a href=\"bsky-tag://{}\">{}</a>", tag, hashtag)
-            })
-            .to_string();
-
-        // Restore all link placeholders
-        for (i, link) in links.iter().enumerate() {
-            let placeholder = format!("\x00LINK{}\x00", i);
-            result = result.replace(&placeholder, link);
+        for m in URL.find_iter(text) {
+            claim(m.range(), m.as_str().to_string());
+        }
+        for m in MENTION.find_iter(text) {
+            claim(m.range(), format!("bsky-mention://{}", &m.as_str()[1..]));
+        }
+        for m in BARE_URL.find_iter(text) {
+            claim(m.range(), format!("https://{}", m.as_str()));
+        }
+        for m in HASHTAG.find_iter(text) {
+            claim(m.range(), format!("bsky-tag://{}", &m.as_str()[1..]));
         }
 
-        result
+        links.sort_by_key(|(range, _)| range.start);
+        links
+    }
+
+    /// Format post text with clickable links, mentions and hashtags as Pango
+    /// markup. URLs become `<a>` tags; mentions use the `bsky-mention://`
+    /// scheme and hashtags `bsky-tag://`, both handled in `connect_activate_link`.
+    ///
+    /// Every span is found in the **raw** text and escaped on the way out. The
+    /// order matters and used to be the other way round: the text was escaped
+    /// first and the patterns then run over the result, so a pattern could
+    /// match *inside* an entity the escaper had just produced. GLib escapes a
+    /// control character as a numeric reference — U+001F becomes `&#x1f;` — and
+    /// the hashtag pattern happily took `#x1f` out of the middle of it, leaving
+    /// `&<a href="bsky-tag://x1f">#x1f</a>;`. Pango then rejected the lot with
+    /// "Entity did not end with a semicolon" and the post rendered blank.
+    fn format_post_text(text: &str) -> String {
+        let links = Self::text_links(text);
+        let mut out = String::with_capacity(text.len() + links.len() * 48);
+        let mut cursor = 0;
+
+        for (range, href) in &links {
+            out.push_str(&glib::markup_escape_text(&text[cursor..range.start]));
+            out.push_str("<a href=\"");
+            // The href is wire text too, and an unescaped `&` or `"` in a URL
+            // query string closes the attribute just as effectively as it
+            // breaks the body.
+            out.push_str(&glib::markup_escape_text(href));
+            out.push_str("\">");
+            out.push_str(&glib::markup_escape_text(&text[range.clone()]));
+            out.push_str("</a>");
+            cursor = range.end;
+        }
+        out.push_str(&glib::markup_escape_text(&text[cursor..]));
+
+        out
     }
 
     fn format_timestamp(indexed_at: &str) -> String {
@@ -1789,6 +2004,128 @@ mod tests {
         assert!((180..=430).contains(&sixteen_nine));
     }
 
+    /// A Klipy GIF exactly as one arrives on the wire.
+    const KLIPY_GIF: &str = "https://static.klipy.com/ii/4493325008d34b7bf8cd6813cd5c1619/76/03/cgMM2dB2oEoY.gif?hh=278&ww=498&mp4=UxPaHvFAwuHpj3&webm=MCEXFCTK5uN0J47r";
+
+    /// Whatever the post says, it has to end up on the label.
+    ///
+    /// Asserted through a real `GtkLabel` rather than by re-parsing the markup,
+    /// because `GtkLabel` runs *two* parsers — its own, which extracts the `<a>`
+    /// tags, and then Pango's — and only the label answers for both. The label
+    /// showing the post text back is the whole property: `set_markup` on markup
+    /// either parser rejects leaves the label untouched, and every case below
+    /// was a post that rendered blank.
+    #[test]
+    fn every_kind_of_post_text_ends_up_on_the_label() {
+        crate::ui::with_gtk(every_kind_of_post_text_ends_up_on_the_label_body);
+    }
+
+    fn every_kind_of_post_text_ends_up_on_the_label_body() {
+        let label = gtk4::Label::new(None);
+
+        let cases = [
+            // The three characters that are markup.
+            "Tom & Jerry",
+            "5 < 6 > 4 && 7 > 3",
+            "she said \"hi\" and it's fine",
+            // The reported crash, near enough: a control character between an
+            // emoji sequence and a hyphen. GLib escapes U+001F to `&#x1f;`,
+            // and the hashtag pattern used to take `#x1f` straight out of the
+            // middle of it, leaving an entity with no semicolon.
+            "Finally picked up Caper: Europe by @keymastergames.bsky.social, \
+             excited to try it\u{1f}-just look at that art direction \
+             keymaster.fun/products/caper",
+            // Every other character GLib escapes numerically.
+            "bell\u{7} backspace\u{8} vtab\u{b} escape\u{1b} delete\u{7f}",
+            // A mention pressed up against an ampersand, both directions.
+            "AT&T @someone.bsky.social & #rust",
+            "@a.bsky.social&#rust",
+            "&@a.bsky.social",
+            // Emoji, including a skin-tone modifier and a ZWJ sequence, which
+            // are the multi-codepoint cases a byte-offset bug would split.
+            "\u{1F44D}\u{1F3FD} and \u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F466} \u{FE0F}",
+            // A query string is mostly ampersands, and it is inside an href.
+            "https://example.com/s?a=1&b=2&amp=3 <tag> #done",
+            "R&D at r&d.example.com",
+            // Degenerate input.
+            "",
+            "#",
+            "&",
+            "<",
+            "&#x1f;",
+            "&amp;",
+            "&&&###@@@",
+        ];
+
+        for text in cases {
+            PostRow::set_post_markup(&label, text);
+            assert_eq!(
+                label.text().as_str(),
+                text,
+                "the label must show the post, not an empty string\n  markup: {}",
+                PostRow::format_post_text(text)
+            );
+            // `use-markup` still on means the markup was accepted rather than
+            // having gone down the unformatted fallback.
+            assert!(
+                label.uses_markup(),
+                "{text:?} fell back to plain text; the markup was rejected\n  markup: {}",
+                PostRow::format_post_text(text)
+            );
+        }
+
+        // And the fallback itself works, for whatever gets past the escaper
+        // next. Handed markup nothing can parse, the label still shows text.
+        label.set_text("a previous post, from before this row was recycled");
+        label.set_markup("broken &markup <a href=\"x\">");
+        assert!(
+            label.text().contains("previous post"),
+            "GtkLabel leaves the old text in place on a parse failure, which is \
+             what set_post_markup exists to catch"
+        );
+    }
+
+    #[test]
+    fn links_mentions_and_hashtags_are_still_linkified() {
+        // The escaping fix must not have quietly turned everything into plain
+        // text: these are what makes the label worth marking up at all.
+        let markup = PostRow::format_post_text(
+            "hi @user.bsky.social see https://example.com and example.org too #rust",
+        );
+        assert!(
+            markup.contains(r#"<a href="bsky-mention://user.bsky.social">@user.bsky.social</a>"#),
+            "{markup}"
+        );
+        assert!(
+            markup.contains(r#"<a href="https://example.com">https://example.com</a>"#),
+            "{markup}"
+        );
+        assert!(
+            markup.contains(r#"<a href="https://example.org">example.org</a>"#),
+            "{markup}"
+        );
+        assert!(
+            markup.contains(r#"<a href="bsky-tag://rust">#rust</a>"#),
+            "{markup}"
+        );
+
+        // A handle is a mention, not a website, even though `.social` is in
+        // the bare-domain TLD list.
+        let markup = PostRow::format_post_text("@someone.bsky.social");
+        assert!(
+            markup.starts_with(r#"<a href="bsky-mention://"#),
+            "{markup}"
+        );
+
+        // An `&` inside a URL is escaped in the href as well as in the body,
+        // and the two agree.
+        let markup = PostRow::format_post_text("https://example.com/?a=1&b=2");
+        assert_eq!(
+            markup,
+            r#"<a href="https://example.com/?a=1&amp;b=2">https://example.com/?a=1&amp;b=2</a>"#
+        );
+    }
+
     fn profile() -> Profile {
         Profile {
             did: "did:plc:test".into(),
@@ -1841,6 +2178,304 @@ mod tests {
         }
     }
 
+    /// Every kind of standalone media embed is shown whole, at its own shape.
+    ///
+    /// Three separate bugs meet here: a GIF that rendered as nothing at all, a
+    /// GIF that would otherwise render as a link card, and a video cropped to
+    /// fill a frame it was never measured for.
+    #[test]
+    fn standalone_media_is_shown_whole_and_a_gif_is_playable() {
+        crate::ui::with_gtk(standalone_media_is_shown_whole_and_a_gif_is_playable_body);
+    }
+
+    fn standalone_media_is_shown_whole_and_a_gif_is_playable_body() {
+        let row = PostRow::new();
+
+        let pictures = |widgets: &[(usize, gtk4::Widget)]| -> Vec<gtk4::Picture> {
+            widgets
+                .iter()
+                .filter_map(|(_, w)| w.downcast_ref::<gtk4::Picture>().cloned())
+                .collect()
+        };
+
+        // ---- A GIF, which arrives as an external embed ----
+        //
+        // Square, so its height is unmistakably not the 16:9 an embed with no
+        // stated aspect ratio would fall back to.
+        let square_gif = KLIPY_GIF.replace("hh=278&ww=498", "hh=500&ww=500");
+        let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        row.render_embed(
+            &container,
+            &Embed::External(ExternalEmbed {
+                uri: square_gif,
+                title: "Team".into(),
+                description: "ALT: a shrug".into(),
+                thumb: Some(dead_url()),
+            }),
+            true,
+        );
+        let embed = container.first_child().expect("the GIF rendered something");
+        assert!(
+            !embed.is::<gtk4::Button>() && embed.has_css_class("video-embed"),
+            "a GIF is playable media, not the link card it arrives disguised as"
+        );
+
+        let mut widgets = Vec::new();
+        walk(&embed, 0, &mut widgets);
+        assert!(
+            widgets.iter().any(|(_, w)| w
+                .downcast_ref::<gtk4::Label>()
+                .is_some_and(|l| l.text() == "GIF")),
+            "a still frame needs something on it saying that it moves"
+        );
+        assert!(
+            widgets.iter().any(|(_, w)| w.is::<gtk4::Button>()),
+            "and something to press to make it move"
+        );
+        let frame = widgets
+            .iter()
+            .find_map(|(_, w)| w.downcast_ref::<gtk4::Frame>().cloned())
+            .expect("the clipping frame carries the height");
+        assert_eq!(
+            frame.height_request(),
+            PostRow::embed_height(Some((500, 500)), 180, 430),
+            "the GIF hosts state the exact size, so nothing here guesses 16:9"
+        );
+        for picture in pictures(&widgets) {
+            assert_eq!(picture.content_fit(), gtk4::ContentFit::Contain);
+            assert!(
+                picture.can_shrink(),
+                "a Picture that cannot shrink reports its image's width as the \
+                 row minimum, and the timeline has no horizontal scrollbar to \
+                 absorb that"
+            );
+        }
+
+        // ---- An ordinary link is still an ordinary link card ----
+        let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        row.render_embed(
+            &container,
+            &Embed::External(ExternalEmbed {
+                uri: "https://www.theguardian.com/world/2026/aug/01/a-story".into(),
+                title: "A story".into(),
+                description: "Something happened".into(),
+                thumb: Some(dead_url()),
+            }),
+            true,
+        );
+        assert!(
+            container
+                .first_child()
+                .expect("the link card rendered")
+                .is::<gtk4::Button>(),
+            "only GIF hosts are diverted; everything else keeps its link card"
+        );
+
+        // ---- A single video, which has nothing to line up with ----
+        let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        row.render_embed(
+            &container,
+            &Embed::Video(VideoEmbed {
+                playlist: dead_url(),
+                thumbnail: Some(dead_url()),
+                alt: Some("a cat".into()),
+                aspect_ratio: Some((9, 16)),
+            }),
+            true,
+        );
+        let embed = container.first_child().expect("the video rendered");
+        let mut widgets = Vec::new();
+        walk(&embed, 0, &mut widgets);
+        let frame = widgets
+            .iter()
+            .find_map(|(_, w)| w.downcast_ref::<gtk4::Frame>().cloned())
+            .expect("the video's clipping frame");
+        assert_eq!(
+            frame.height_request(),
+            PostRow::embed_height(Some((9, 16)), 200, 400)
+        );
+        for picture in pictures(&widgets) {
+            assert_eq!(
+                picture.content_fit(),
+                gtk4::ContentFit::Contain,
+                "Cover crops to fill, and a lone video has no neighbour whose \
+                 edges it has to match — cropping it is just losing the frame \
+                 the author chose"
+            );
+            assert_eq!(picture.alternative_text().as_deref(), Some("a cat"));
+        }
+
+        // ---- Grid cells keep Cover, which is the point of the distinction ----
+        let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        row.render_embed(
+            &container,
+            &Embed::Images(vec![
+                ImageEmbed {
+                    thumb: dead_url(),
+                    fullsize: dead_url(),
+                    alt: String::new(),
+                    aspect_ratio: Some((2, 3)),
+                };
+                4
+            ]),
+            true,
+        );
+        let embed = container.first_child().expect("the grid rendered");
+        let mut widgets = Vec::new();
+        walk(&embed, 0, &mut widgets);
+        let cells = pictures(&widgets);
+        assert_eq!(cells.len(), 4);
+        for picture in cells {
+            assert_eq!(
+                picture.content_fit(),
+                gtk4::ContentFit::Cover,
+                "in a grid the cells have to line up, so they crop"
+            );
+        }
+    }
+
+    fn post_with(embed: Option<Embed>, uri: &str) -> Post {
+        Post {
+            uri: uri.into(),
+            cid: "cid".into(),
+            author: profile(),
+            text: "a post".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            indexed_at: "2026-01-01T00:00:00Z".into(),
+            like_count: None,
+            repost_count: None,
+            reply_count: None,
+            embed,
+            viewer_like: None,
+            viewer_repost: None,
+            repost_reason: None,
+            reply_context: None,
+        }
+    }
+
+    fn a_video(playlist: &str) -> Embed {
+        Embed::Video(VideoEmbed {
+            playlist: playlist.into(),
+            thumbnail: Some(dead_url()),
+            alt: Some("a cat".into()),
+            aspect_ratio: Some((16, 9)),
+        })
+    }
+
+    /// A recycled row must not carry the last post's pipeline into the next one.
+    ///
+    /// This is the leak in a `GtkListView` feed, and it has two doors: the
+    /// factory's `unbind`, and `bind` itself when a row is reused for a
+    /// different post. Both are exercised here against the live pipeline count,
+    /// because "we call release in bind" is a claim about code and this is a
+    /// claim about the process.
+    #[test]
+    fn a_recycled_row_gives_up_its_video() {
+        crate::ui::with_gtk(a_recycled_row_gives_up_its_video_body);
+    }
+
+    fn a_recycled_row_gives_up_its_video_body() {
+        use crate::ui::inline_video::{Intent, VideoDirector, set_director};
+
+        let director = VideoDirector::new(&crate::state::AppSettings::default());
+        set_director(&director);
+        assert_eq!(crate::media::live_pipelines(), 0);
+
+        let row = PostRow::new();
+        row.bind(&post_with(
+            Some(a_video("file:///nonexistent/hangar-row-1.mp4")),
+            "at://did:plc:test/app.bsky.feed.post/one",
+        ));
+
+        let slot = row
+            .imp()
+            .video_slot
+            .borrow()
+            .clone()
+            .expect("a timeline video row owns a slot");
+        director.arm(&slot, Intent::Manual);
+        assert_eq!(
+            crate::media::live_pipelines(),
+            1,
+            "pressing play should have built exactly one pipeline"
+        );
+        drop(slot);
+
+        // Door one: the row is reused for somebody else's post.
+        row.bind(&post_with(None, "at://did:plc:test/app.bsky.feed.post/two"));
+        assert_eq!(
+            crate::media::live_pipelines(),
+            0,
+            "rebinding left the previous post's pipeline running"
+        );
+        assert!(
+            row.imp().video_slot.borrow().is_none(),
+            "a post with no video left the previous post's slot in place"
+        );
+
+        // Door two: the factory unbinds the row while it is still playing.
+        row.bind(&post_with(
+            Some(a_video("file:///nonexistent/hangar-row-2.mp4")),
+            "at://did:plc:test/app.bsky.feed.post/three",
+        ));
+        let slot = row
+            .imp()
+            .video_slot
+            .borrow()
+            .clone()
+            .expect("the third post is a video too");
+        director.arm(&slot, Intent::Manual);
+        assert_eq!(crate::media::live_pipelines(), 1);
+        drop(slot);
+
+        row.release_video();
+        assert_eq!(
+            crate::media::live_pipelines(),
+            0,
+            "unbind left a pipeline bound to a row the list has taken back"
+        );
+        // Idempotent, because unbind and the next bind both call it.
+        row.release_video();
+        assert_eq!(crate::media::live_pipelines(), 0);
+    }
+
+    /// A quoted video keeps the thumbnail that opens the viewer.
+    ///
+    /// Nesting a transport and a drag-scrubber inside a focusable,
+    /// Space-activatable card with a claim-on-release gesture is a keyboard and
+    /// gesture mess for an embed that small — and halving the slot count is a
+    /// bonus rather than the reason.
+    #[test]
+    fn a_quoted_video_does_not_play_inline() {
+        crate::ui::with_gtk(a_quoted_video_does_not_play_inline_body);
+    }
+
+    fn a_quoted_video_does_not_play_inline_body() {
+        let row = PostRow::new();
+        let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        row.render_quote(
+            &container,
+            &quote_with(Some(a_video("file:///nonexistent/quoted.mp4"))),
+        );
+        assert!(
+            row.imp().video_slot.borrow().is_none(),
+            "a quoted video claimed the row's one inline slot"
+        );
+
+        // ...while the same video in the post's own embed does.
+        let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        row.render_embed(
+            &container,
+            &a_video("file:///nonexistent/standalone.mp4"),
+            true,
+        );
+        assert!(
+            row.imp().video_slot.borrow().is_some(),
+            "a standalone video should be playable in place"
+        );
+        row.release_video();
+    }
+
     /// A quote card must not out-rank the controls inside it.
     ///
     /// A `GtkButton` runs its click gesture in the CAPTURE phase and claims the
@@ -1858,14 +2493,12 @@ mod tests {
     /// harness gives each `#[test]` a thread of its own.
     #[test]
     fn quote_card_does_not_pre_empt_the_controls_inside_it() {
-        // Headless CI has no display, and a GTK widget cannot be built without
-        // one. Nothing to assert there rather than a failure to report.
-        if gtk4::init().is_err() {
-            eprintln!("skipping: no display available");
-            return;
-        }
-        adw::init().expect("libadwaita");
+        // On the GTK thread, or skipped where there is no display: see
+        // `crate::ui::with_gtk`.
+        crate::ui::with_gtk(quote_card_does_not_pre_empt_the_controls_inside_it_body);
+    }
 
+    fn quote_card_does_not_pre_empt_the_controls_inside_it_body() {
         let row = PostRow::new();
         let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
 

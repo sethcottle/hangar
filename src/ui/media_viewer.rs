@@ -9,7 +9,7 @@
 use crate::atproto::ImageEmbed;
 use crate::ui::avatar_cache;
 use crate::ui::external;
-use crate::ui::video_player::{VideoPlayer, VideoSource};
+use crate::ui::video_player::{MediaKind, PlayerConfig, VideoPlayer, VideoSource};
 use gtk4::gdk;
 use gtk4::gio;
 use gtk4::glib;
@@ -53,6 +53,16 @@ const FOREIGN_MODIFIERS: gdk::ModifierType = gdk::ModifierType::ALT_MASK
 /// button. Opening a browser without being asked is what the old code did, from
 /// a timer that could not tell a slow stream from a broken one.
 pub fn show_video(parent: &impl IsA<gtk4::Widget>, source: VideoSource) {
+    show_video_at(parent, source, 0.0);
+}
+
+/// Play a video embed in a dialog, resuming `start_at` seconds in.
+///
+/// The resume path exists for the inline transport's fullscreen button: going
+/// to the viewer should not mean watching the first forty seconds again. The
+/// seek waits for the first duration the stream reports rather than being
+/// issued up front — see `VideoPlayer::refresh_position`.
+pub fn show_video_at(parent: &impl IsA<gtk4::Widget>, source: VideoSource, start_at: f64) {
     let root = match parent
         .as_ref()
         .root()
@@ -62,15 +72,40 @@ pub fn show_video(parent: &impl IsA<gtk4::Widget>, source: VideoSource) {
         None => return,
     };
 
+    // One pipeline in the process. Whatever the feed was playing goes now, and
+    // stays gone until this dialog closes — otherwise the fullscreen handoff,
+    // or simply pressing play on a profile page, gives you two videos and two
+    // audio streams.
+    //
+    // The hold is counted, so this and the `dialog_closed` below have to come
+    // in pairs: a quoted video and a GIF both reach this function from any
+    // page, and when the hold was a flag the first dialog to close handed the
+    // feed back to the election while the second was still playing.
+    let director = crate::ui::inline_video::director();
+    if let Some(director) = director.as_ref() {
+        director.dialog_opened();
+    }
+
     let dialog = adw::Dialog::new();
-    dialog.set_title("Video");
+    dialog.set_title(match source.kind {
+        MediaKind::Video => "Video",
+        MediaKind::Gif => "GIF",
+    });
     dialog.set_content_width(900);
     dialog.set_content_height(620);
 
     let toolbar = adw::ToolbarView::new();
     toolbar.add_top_bar(&adw::HeaderBar::new());
 
-    let player = VideoPlayer::new(source);
+    let player = VideoPlayer::new_with(
+        source,
+        PlayerConfig {
+            start_at,
+            ..PlayerConfig::dialog()
+        },
+    );
+    // The dialog is the one place `Space`, the arrows and `M` have exactly one
+    // video to mean anything about. See `install_shortcuts`.
     player.install_shortcuts(&dialog);
 
     toolbar.set_content(Some(player.widget()));
@@ -85,7 +120,24 @@ pub fn show_video(parent: &impl IsA<gtk4::Widget>, source: VideoSource) {
     // segments and playing audio into a window nobody can see.
     dialog.connect_closed({
         let player = player.clone();
-        move |_| player.stop()
+        // The hold is a count, so it has to come off exactly once. `closed`
+        // is emitted again if a dialog is presented again, and while `stop` is
+        // idempotent, a second `dialog_closed` would let go of another
+        // dialog's hold.
+        let released = Cell::new(false);
+        move |_| {
+            if released.replace(true) {
+                return;
+            }
+            player.stop();
+            // The dialog may have written a new volume on its way out, so the
+            // director re-reads it rather than arming the next inline video at
+            // a level the person has already changed.
+            if let Some(director) = director.as_ref() {
+                director.refresh_volume();
+                director.dialog_closed();
+            }
+        }
     });
 
     dialog.present(Some(&root));
@@ -962,14 +1014,13 @@ mod tests {
     /// thread of its own.
     #[test]
     fn viewer_never_shows_or_acts_on_the_previous_image() {
-        // Headless CI has no display, and a GTK widget cannot be built without
-        // one. Nothing to assert there rather than a failure to report.
-        if gtk4::init().is_err() {
-            eprintln!("skipping: no display available");
-            return;
-        }
-        adw::init().expect("libadwaita");
+        // On the GTK thread, or skipped where there is no display: see
+        // `crate::ui::with_gtk`. This one also turns the main loop, so it has
+        // to be the thread that owns it.
+        crate::ui::with_gtk(viewer_never_shows_or_acts_on_the_previous_image_body);
+    }
 
+    fn viewer_never_shows_or_acts_on_the_previous_image_body() {
         let port = start_server();
         let url = |name: &str| format!("http://127.0.0.1:{port}/{name}");
 

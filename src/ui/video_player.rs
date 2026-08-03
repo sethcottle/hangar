@@ -4,8 +4,14 @@
 //!
 //! The widget is a self-contained `GtkBox`: picture, transport controls, and an
 //! error page it switches to when the pipeline gives up. Keeping the chrome
-//! here rather than in the dialog is what will let a post row embed the same
-//! player inline later without any of this being rewritten.
+//! here rather than in the dialog is what lets a post row embed the same player
+//! inline without any of this being rewritten.
+//!
+//! [`Chrome`] is the one axis that differs between the two. A dialog is 900x620
+//! and can hold a transport bar and an `AdwStatusPage`; a timeline row is as
+//! wide as the window and sits in a scroller with no horizontal valve, so its
+//! transport has to be an *unmeasured* overlay and its failures have to be
+//! handed back to the row rather than drawn here. See [`Self::build_controls`].
 
 use crate::media::{self, MediaError};
 use crate::state::{AppSettings, VideoVolume};
@@ -72,10 +78,30 @@ const FOREIGN_MODIFIERS: gdk::ModifierType = gdk::ModifierType::CONTROL_MASK
     .union(gdk::ModifierType::META_MASK)
     .union(gdk::ModifierType::HYPER_MASK);
 
-/// Everything the player needs to know about one video embed.
+/// What is being played, which decides how the player behaves around it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaKind {
+    /// A Bluesky video: audio, a scrubber, and it stops at the end.
+    Video,
+    /// A GIF that reached us as an MP4. Silent, looping, no transport chrome —
+    /// anything else would be a video player wrapped around a reaction image.
+    Gif,
+}
+
+impl MediaKind {
+    fn noun(self) -> &'static str {
+        match self {
+            Self::Video => "Video",
+            Self::Gif => "GIF",
+        }
+    }
+}
+
+/// Everything the player needs to know about one embed.
 #[derive(Debug, Clone)]
 pub struct VideoSource {
-    /// The HLS playlist Bluesky serves for this video.
+    /// What to hand `playbin3`: the HLS playlist for a video, an MP4 or WebM
+    /// for a GIF.
     pub playlist_url: String,
     pub alt: Option<String>,
     /// Where to send someone when playback fails: the post on the web, never
@@ -85,6 +111,7 @@ pub struct VideoSource {
     /// button at all, which is honest, rather than quietly handing over the
     /// playlist and reproducing the raw-text bug this player exists to fix.
     pub fallback_url: Option<String>,
+    pub kind: MediaKind,
 }
 
 impl VideoSource {
@@ -93,8 +120,91 @@ impl VideoSource {
             playlist_url: video.playlist.clone(),
             alt: video.alt.clone(),
             fallback_url,
+            kind: MediaKind::Video,
         }
     }
+
+    /// A GIF, which has no HLS playlist and no audio track.
+    ///
+    /// Separate from [`Self::from_embed`] because a GIF is not a
+    /// [`crate::atproto::VideoEmbed`] at all — it arrives as an external link
+    /// card and is recognised by [`crate::atproto::gif::detect`].
+    pub fn from_gif(
+        gif: &crate::atproto::GifEmbed,
+        alt: Option<String>,
+        fallback_url: Option<String>,
+    ) -> Self {
+        Self {
+            playlist_url: gif.video_url.clone(),
+            alt,
+            fallback_url,
+            kind: MediaKind::Gif,
+        }
+    }
+}
+
+/// Which chrome a player wears, and so how it lays out and how it fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Chrome {
+    /// A dialog of its own: transport bar under the picture, `AdwStatusPage` on
+    /// failure, keyboard shortcuts if the caller installs them.
+    Dialog,
+    /// A timeline row: transport as an overlay strip, failure handed to the
+    /// owner through [`PlayerConfig::on_fail`], never any key controller.
+    Inline,
+}
+
+/// Everything about a player that is not the stream itself.
+pub struct PlayerConfig {
+    pub chrome: Chrome,
+    /// Perceptual 0..=1. Passed in rather than read from disk here: inline
+    /// players are built on scroll, and a settings file read per pipeline is a
+    /// disk read per video somebody scrolled past.
+    pub volume: f64,
+    /// Applied before the pipeline ever reaches PLAYING, so a muted start
+    /// cannot leak a burst of audio.
+    pub muted: bool,
+    /// Seconds to resume from, once the stream admits to having a duration.
+    /// `0.0` starts at the beginning and issues no seek at all.
+    pub start_at: f64,
+    /// Called with a one-line message instead of showing an error page.
+    ///
+    /// How an inline player fails: the row drops the player, puts its thumbnail
+    /// back and shows a compact banner. An `AdwStatusPage` has a minimum width
+    /// well over 300px, and a row's normal child *is* measured, so rendering
+    /// one inline would widen the whole window through a scroller that has no
+    /// horizontal valve.
+    ///
+    /// The callback may drop the player. Every path into [`VideoPlayer::fail`]
+    /// holds a strong `Rc` across the call for exactly that reason — the local
+    /// upgrade in the bus-error idle, and the constructor's own binding when a
+    /// pipeline fails to build. Do not call `fail` from anywhere that does not.
+    pub on_fail: Option<Box<dyn Fn(String)>>,
+    /// Called with the current position when the fullscreen button is pressed.
+    /// `None` builds no such button, which is what the dialog wants — it is
+    /// already the thing an inline player hands off *to*.
+    pub on_expand: Option<Box<dyn Fn(f64)>>,
+}
+
+impl PlayerConfig {
+    /// The preset the media viewer's dialog has always used.
+    pub fn dialog() -> Self {
+        Self {
+            chrome: Chrome::Dialog,
+            volume: AppSettings::load().video_volume.value(),
+            muted: false,
+            start_at: 0.0,
+            on_fail: None,
+            on_expand: None,
+        }
+    }
+}
+
+/// The assembled transport, and the two controls only inline builds.
+struct Transport {
+    controls: gtk4::Box,
+    volume_menu: Option<gtk4::MenuButton>,
+    expand_btn: Option<gtk4::Button>,
 }
 
 pub struct VideoPlayer {
@@ -107,11 +217,23 @@ pub struct VideoPlayer {
     time_label: gtk4::Label,
     mute_btn: gtk4::ToggleButton,
     volume: gtk4::Scale,
+    /// The inline transport's volume control: a popover, so its slider's ~110px
+    /// minimum width never lands in the strip. `None` under [`Chrome::Dialog`].
+    volume_menu: Option<gtk4::MenuButton>,
+    /// Hands the stream to the full viewer. `None` under [`Chrome::Dialog`].
+    expand_btn: Option<gtk4::Button>,
     error_page: adw::StatusPage,
     error_detail: gtk4::Label,
+    chrome: Chrome,
+    on_fail: Option<Box<dyn Fn(String)>>,
+    on_expand: Option<Box<dyn Fn(f64)>>,
     source: VideoSource,
     /// `None` before the pipeline is built and after it is torn down.
     playbin: RefCell<Option<gst::Element>>,
+    /// Alive for exactly as long as the pipeline, so `media::live_pipelines`
+    /// counts what is actually running. Taken in [`Self::stop`] beside the
+    /// playbin it belongs to.
+    pipeline_token: RefCell<Option<media::PipelineToken>>,
     /// Dropping this removes the bus watch, so it has to outlive the pipeline.
     bus_watch: RefCell<Option<gst::bus::BusWatchGuard>>,
     tick: RefCell<Option<glib::SourceId>>,
@@ -144,14 +266,20 @@ pub struct VideoPlayer {
     /// so a rebuffer never restarts a video someone deliberately paused.
     wants_playing: Cell<bool>,
     duration: Cell<Option<f64>>,
+    /// Where to resume from, until the first duration arrives and it is used.
+    ///
+    /// Seeking before that point asks an HLS stream to seek before its demuxer
+    /// has the playlist, which answers "unseekable" — so the resume has to wait
+    /// for the one moment the stream is known to be ready, not for a timer.
+    pending_start: Cell<Option<f64>>,
 }
 
 impl VideoPlayer {
-    /// Build a player and start loading `source`.
+    /// Build a player wearing `config`'s chrome and start loading `source`.
     ///
     /// Must be called on the GTK main thread: the sink hands out its paintable
     /// only there.
-    pub fn new(source: VideoSource) -> Rc<Self> {
+    pub fn new_with(source: VideoSource, config: PlayerConfig) -> Rc<Self> {
         let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         root.set_hexpand(true);
         root.set_vexpand(true);
@@ -204,7 +332,6 @@ impl VideoPlayer {
         mute_btn.add_css_class("circular");
         mute_btn.set_tooltip_text(Some("Mute"));
 
-        let stored_volume = AppSettings::load().video_volume.value();
         let volume = gtk4::Scale::with_range(
             gtk4::Orientation::Horizontal,
             VideoVolume::MIN,
@@ -213,20 +340,54 @@ impl VideoPlayer {
         );
         volume.set_draw_value(false);
         volume.set_size_request(110, -1);
-        volume.set_value(stored_volume);
+        volume.set_value(config.volume);
         volume.set_tooltip_text(Some("Volume"));
 
-        let controls = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
-        controls.add_css_class("video-controls");
-        controls.append(&play_btn);
-        controls.append(&position);
-        controls.append(&time_label);
-        controls.append(&mute_btn);
-        controls.append(&volume);
+        let chrome = config.chrome;
+        let transport = Self::build_transport(
+            chrome,
+            &play_btn,
+            &position,
+            &time_label,
+            &mute_btn,
+            &volume,
+            config.on_expand.is_some(),
+        );
+        // A GIF has nothing to scrub, nothing to mute and nowhere to stop, so
+        // it gets no transport. The widgets are still built and still wired up
+        // — the keyboard shortcuts and the tick both go through them, and a
+        // hidden widget is a great deal less trouble than a set of Options.
+        transport
+            .controls
+            .set_visible(source.kind != MediaKind::Gif);
 
-        let video_page = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-        video_page.append(&overlay);
-        video_page.append(&controls);
+        let video_page: gtk4::Widget = match chrome {
+            Chrome::Dialog => {
+                let page = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+                page.append(&overlay);
+                page.append(&transport.controls);
+                page.upcast()
+            }
+            Chrome::Inline => {
+                // The transport goes *over* the picture, not under it: the row
+                // already committed to a height derived from the video's aspect
+                // ratio before this player existed, and a 40px bar beneath
+                // would grow the embed past it.
+                //
+                // It is also what keeps the strip's width off the window.
+                // `GtkOverlay` does not measure its overlay children —
+                // `measure-overlay` defaults to false — so the strip's minimum
+                // width never reaches the row, the `AdwClamp` or the
+                // (Never, Automatic) scroller above it. Never call
+                // `set_measure_overlay(true)` here.
+                let page = gtk4::Overlay::new();
+                page.set_hexpand(true);
+                page.set_vexpand(true);
+                page.set_child(Some(&overlay));
+                page.add_overlay(&transport.controls);
+                page.upcast()
+            }
+        };
 
         let error_detail = gtk4::Label::new(None);
         error_detail.add_css_class("dim-label");
@@ -273,15 +434,25 @@ impl VideoPlayer {
 
         let error_page = adw::StatusPage::new();
         error_page.set_icon_name(Some("dialog-warning-symbolic"));
-        error_page.set_title("Video Couldn't Be Played");
+        error_page.set_title(&format!("{} Couldn't Be Played", source.kind.noun()));
         error_page.set_child(Some(&error_body));
 
         let stack = gtk4::Stack::new();
         stack.set_hexpand(true);
         stack.set_vexpand(true);
         stack.add_named(&video_page, Some("video"));
-        stack.add_named(&error_page, Some("error"));
+        // The status page is only ever put in a dialog's tree. An inline player
+        // hands its failure back through `on_fail` instead, so the widget whose
+        // minimum width would widen the window is not merely hidden inline —
+        // it is not there. See `PlayerConfig::on_fail`.
+        if chrome == Chrome::Dialog {
+            stack.add_named(&error_page, Some("error"));
+        }
         root.append(&stack);
+
+        // A GIF is silent by definition; an autoplayed video starts muted when
+        // the setting says so.
+        let start_muted = config.muted || source.kind == MediaKind::Gif;
 
         let player = Rc::new(Self {
             root,
@@ -293,10 +464,16 @@ impl VideoPlayer {
             time_label,
             mute_btn,
             volume,
+            volume_menu: transport.volume_menu,
+            expand_btn: transport.expand_btn,
             error_page,
             error_detail,
+            chrome,
+            on_fail: config.on_fail,
+            on_expand: config.on_expand,
             source,
             playbin: RefCell::new(None),
+            pipeline_token: RefCell::new(None),
             bus_watch: RefCell::new(None),
             tick: RefCell::new(None),
             seek_settle: RefCell::new(None),
@@ -309,14 +486,124 @@ impl VideoPlayer {
             pending_volume: Cell::new(None),
             wants_playing: Cell::new(false),
             duration: Cell::new(None),
+            pending_start: Cell::new((config.start_at > 0.0).then_some(config.start_at)),
         });
 
         player.connect_controls();
+        // Setting the toggle rather than only muting the pipeline keeps the
+        // button, the icon and the `m` shortcut agreeing with what is actually
+        // coming out of the speakers.
+        if start_muted {
+            player.mute_btn.set_active(true);
+        }
         // The stored level may be low or zero, and the button was built with
         // the loud icon.
         player.sync_volume_icon();
-        player.start(stored_volume);
+        player.start(config.volume, start_muted);
         player
+    }
+
+    /// Assemble the transport for `chrome` out of controls the caller owns.
+    ///
+    /// The two layouts differ only in arrangement, never in behaviour: the same
+    /// `play_btn`, the same position `Scale` with its settle-coalesced seeks,
+    /// the same mute toggle. What inline changes is width. Budgeted against the
+    /// 495px content column measured in a 700px window: 34 (play) + ~40 (scale
+    /// minimum) + ~70 (time) + 34 (volume) + 34 (fullscreen) + spacing, which
+    /// is why the volume slider moves into a popover — inline it would have
+    /// been 110px of the strip on its own.
+    fn build_transport(
+        chrome: Chrome,
+        play_btn: &gtk4::Button,
+        position: &gtk4::Scale,
+        time_label: &gtk4::Label,
+        mute_btn: &gtk4::ToggleButton,
+        volume: &gtk4::Scale,
+        expandable: bool,
+    ) -> Transport {
+        let controls = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+
+        if chrome == Chrome::Dialog {
+            controls.add_css_class("video-controls");
+            controls.append(play_btn);
+            controls.append(position);
+            controls.append(time_label);
+            controls.append(mute_btn);
+            controls.append(volume);
+            return Transport {
+                controls,
+                volume_menu: None,
+                expand_btn: None,
+            };
+        }
+
+        controls.add_css_class("video-inline-controls");
+        controls.add_css_class("osd");
+        controls.set_valign(gtk4::Align::End);
+        controls.set_halign(gtk4::Align::Fill);
+        // Clicking the strip's padding must not reach the row body, which would
+        // open the thread. A bubble-phase gesture on the strip is walked
+        // descendants-first, so it claims before the row's own gesture sees the
+        // release — the same mechanism the quote card relies on.
+        let claim = gtk4::GestureClick::new();
+        claim.connect_released(|gesture, _, _, _| {
+            gesture.set_state(gtk4::EventSequenceState::Claimed);
+        });
+        controls.add_controller(claim);
+
+        // Bluesky caps video at three minutes, so "0:12 / 2:58" never truncates
+        // — only a hypothetical hour-long stream would, and an ellipsis beats
+        // an eleventh character of clock pushing the window wider.
+        time_label.set_max_width_chars(11);
+        time_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+
+        let volume_box = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
+        volume_box.set_margin_top(6);
+        volume_box.set_margin_bottom(6);
+        volume_box.set_margin_start(6);
+        volume_box.set_margin_end(6);
+        volume_box.append(mute_btn);
+        volume_box.append(volume);
+
+        let popover = gtk4::Popover::new();
+        popover.set_child(Some(&volume_box));
+
+        let volume_menu = gtk4::MenuButton::new();
+        volume_menu.set_icon_name("audio-volume-high-symbolic");
+        volume_menu.add_css_class("flat");
+        volume_menu.add_css_class("circular");
+        volume_menu.set_popover(Some(&popover));
+        volume_menu.set_tooltip_text(Some("Volume"));
+        volume_menu.update_property(&[gtk4::accessible::Property::Label("Volume")]);
+
+        // Only the scrubber expands; everything else keeps its natural width so
+        // the strip's total stays the sum budgeted above.
+        play_btn.set_hexpand(false);
+        position.set_hexpand(true);
+        time_label.set_hexpand(false);
+        volume_menu.set_hexpand(false);
+
+        controls.append(play_btn);
+        controls.append(position);
+        controls.append(time_label);
+        controls.append(&volume_menu);
+
+        let expand_btn = expandable.then(|| {
+            let btn = gtk4::Button::from_icon_name("view-fullscreen-symbolic");
+            btn.add_css_class("flat");
+            btn.add_css_class("circular");
+            btn.set_hexpand(false);
+            btn.set_tooltip_text(Some("Open in Viewer"));
+            btn.update_property(&[gtk4::accessible::Property::Label("Open in viewer")]);
+            controls.append(&btn);
+            btn
+        });
+
+        Transport {
+            controls,
+            volume_menu: Some(volume_menu),
+            expand_btn,
+        }
     }
 
     pub fn widget(&self) -> &gtk4::Box {
@@ -326,7 +613,16 @@ impl VideoPlayer {
     /// Attach Space / arrow / M shortcuts to `widget`.
     ///
     /// Left to the caller rather than wired up in `new`, because a player sat
-    /// in a feed must not swallow the keys the feed itself uses.
+    /// in a feed must not swallow the keys the feed itself uses. An inline
+    /// player never calls this and installs no key controller at all: `Space`
+    /// already activates whichever button or quote card has focus, `Left` and
+    /// `Right` belong to the list and to the focused scrubber, and with several
+    /// videos realized at once `M` has no unambiguous target. Everything an
+    /// inline transport needs from the keyboard falls out of ordinary focusable
+    /// widgets — Tab walks play, scrubber, volume, fullscreen; arrows scrub the
+    /// focused `GtkScale` through the same `request_seek` path a drag uses.
+    ///
+    /// [`crate::ui::media_viewer::show_video`] is the only caller.
     pub fn install_shortcuts(self: &Rc<Self>, widget: &impl IsA<gtk4::Widget>) {
         let key = gtk4::EventControllerKey::new();
         key.connect_key_pressed({
@@ -397,8 +693,40 @@ impl VideoPlayer {
         if let Some(playbin) = self.playbin.borrow_mut().take() {
             let _ = playbin.set_state(gst::State::Null);
         }
+        // After NULL and after the bus watch, so the count only drops once the
+        // pipeline really has nothing left running.
         self.bus_watch.borrow_mut().take();
+        self.pipeline_token.borrow_mut().take();
+        self.pending_start.set(None);
         self.picture.set_paintable(gdk::Paintable::NONE);
+    }
+
+    /// Whether the audio is currently off.
+    ///
+    /// The director reads this as a video is torn down: someone who unmuted an
+    /// autoplay has said what they want the next one to do.
+    pub fn is_muted(&self) -> bool {
+        self.mute_btn.is_active()
+    }
+
+    /// The perceptual 0..=1 level the slider is sat at.
+    ///
+    /// Lets the director keep its cached volume current without a settings read
+    /// per video, which is the whole reason the level is passed in rather than
+    /// loaded here.
+    pub fn volume_level(&self) -> f64 {
+        self.volume.value()
+    }
+
+    /// Where the stream is now, in seconds. `0.0` when there is no pipeline.
+    ///
+    /// For handing a position to the full viewer, which is the only reason a
+    /// caller outside this file needs it.
+    pub fn position(&self) -> f64 {
+        self.playbin()
+            .and_then(|p| p.query_position::<gst::ClockTime>())
+            .map(clock_seconds)
+            .unwrap_or(0.0)
     }
 
     pub fn toggle_playback(&self) {
@@ -447,11 +775,13 @@ impl VideoPlayer {
         self.playbin.borrow().clone()
     }
 
-    fn start(self: &Rc<Self>, volume: f64) {
+    /// `muted` is applied before the pipeline ever reaches PLAYING, so neither a
+    /// GIF nor a muted autoplay can leak a burst of audio.
+    fn start(self: &Rc<Self>, volume: f64, muted: bool) {
         let pipeline = match media::build_pipeline(
             &self.source.playlist_url,
             media::linear_volume(volume),
-            false,
+            muted,
         ) {
             Ok(p) => p,
             Err(e) => return self.fail(e),
@@ -478,6 +808,9 @@ impl VideoPlayer {
         }
 
         self.playbin.replace(Some(pipeline.playbin));
+        // Beside the playbin, and taken beside it in `stop`: that pairing is
+        // the whole reason `media::live_pipelines` can be trusted.
+        self.pipeline_token.replace(Some(pipeline.token));
         self.start_tick();
         self.play();
     }
@@ -532,12 +865,26 @@ impl VideoPlayer {
                 }
             }
             MessageView::Eos(..) => {
-                // Park at the start rather than looping: the dialog is somewhere
-                // people go to watch one video, not a feed.
-                self.wants_playing.set(false);
-                let _ = playbin.set_state(gst::State::Paused);
-                self.seek_to(0.0);
-                self.sync_transport();
+                if self.source.kind == MediaKind::Gif {
+                    // Loop, because a GIF that stops after one pass is not a
+                    // GIF. `playbin3` has no loop property, so the only way is
+                    // to seek back on EOS; `wants_playing` stays true so the
+                    // seek is followed by PLAYING rather than parking.
+                    //
+                    // No timer involved, deliberately. This is the pipeline's
+                    // own bus watch, which `stop` already drops with the
+                    // player, so there is nothing here that can outlive the
+                    // widget the way a `glib::timeout` would.
+                    self.seek_to(0.0);
+                    let _ = playbin.set_state(gst::State::Playing);
+                } else {
+                    // Park at the start rather than looping: the dialog is
+                    // somewhere people go to watch one video, not a feed.
+                    self.wants_playing.set(false);
+                    let _ = playbin.set_state(gst::State::Paused);
+                    self.seek_to(0.0);
+                    self.sync_transport();
+                }
             }
             MessageView::StateChanged(sc) => {
                 if sc.src().map(|s| s == &playbin).unwrap_or(false) {
@@ -629,6 +976,23 @@ impl VideoPlayer {
                 }
             }
         });
+
+        if let Some(btn) = self.expand_btn.as_ref() {
+            btn.connect_clicked({
+                let weak = Rc::downgrade(self);
+                move |_| {
+                    let Some(player) = weak.upgrade() else {
+                        return;
+                    };
+                    // Read the position before handing over: the callback is
+                    // going to tear this player down.
+                    let at = player.position();
+                    if let Some(cb) = player.on_expand.as_ref() {
+                        cb(at);
+                    }
+                }
+            });
+        }
     }
 
     fn apply_volume(self: &Rc<Self>, slider: f64) {
@@ -694,6 +1058,11 @@ impl VideoPlayer {
             "audio-volume-high-symbolic"
         };
         self.mute_btn.set_icon_name(icon);
+        // Inline, the toggle is inside a popover nobody has open. The button
+        // that stands in for it has to say the same thing.
+        if let Some(menu) = self.volume_menu.as_ref() {
+            menu.set_icon_name(icon);
+        }
     }
 
     fn sync_transport(&self) {
@@ -703,8 +1072,10 @@ impl VideoPlayer {
         } else {
             "media-playback-start-symbolic"
         });
+        let label = if playing { "Pause" } else { "Play" };
+        self.play_btn.set_tooltip_text(Some(label));
         self.play_btn
-            .set_tooltip_text(Some(if playing { "Pause" } else { "Play" }));
+            .update_property(&[gtk4::accessible::Property::Label(label)]);
     }
 
     fn set_busy(&self, busy: bool) {
@@ -749,6 +1120,14 @@ impl VideoPlayer {
             self.duration.set(Some(total));
             self.position.set_range(0.0, total);
             self.position.set_sensitive(true);
+            // The first duration is the first moment the demuxer has the
+            // playlist, and so the first moment a seek can land. Resuming any
+            // earlier gets "unseekable" back from HLS and starts at zero
+            // anyway; resuming from a timer would be the fifth instance of the
+            // bug this file has had four times.
+            if let Some(at) = self.pending_start.take() {
+                self.seek_to(at);
+            }
         }
 
         let actual = playbin
@@ -890,6 +1269,18 @@ impl VideoPlayer {
         eprintln!("hangar: video playback failed: {}", error.detail());
         self.stop();
         self.set_busy(false);
+        // Inline, the owner is told and this player is on its way out; the
+        // row puts its thumbnail back and says so in one line. Only a dialog
+        // has room for the status page and its technical details.
+        if let Some(cb) = self.on_fail.as_ref() {
+            cb(error.user_message());
+            return;
+        }
+        debug_assert_eq!(
+            self.chrome,
+            Chrome::Dialog,
+            "an inline player has no error page to switch to"
+        );
         self.error_page.set_description(Some(&error.user_message()));
         self.error_detail.set_label(&error.detail());
         self.stack.set_visible_child_name("error");

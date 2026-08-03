@@ -14,6 +14,7 @@ use libadwaita as adw;
 use libadwaita::prelude::*;
 use libadwaita::subclass::prelude::*;
 use std::cell::RefCell;
+use std::rc::Rc;
 
 mod post_object {
     use super::*;
@@ -236,6 +237,10 @@ mod imp {
         pub reduce_motion_css_provider: RefCell<Option<gtk4::CssProvider>>,
         // Track which page was visible before settings (for back button)
         pub previous_page: RefCell<Option<String>>,
+        /// The one thing allowed to start a video, and the only strong
+        /// reference to it. Rows find it through a thread-local `Weak`, so it
+        /// has to die with the window — see `ui::inline_video`.
+        pub video_director: RefCell<Option<Rc<crate::ui::inline_video::VideoDirector>>>,
     }
 
     #[glib::object_subclass]
@@ -282,6 +287,14 @@ impl HangarWindow {
     }
 
     fn setup_ui(&self) {
+        // First, before any page is built: `build_timeline` hands it the
+        // scroller, and every `PostRow` a factory creates from here on looks it
+        // up to register its video embed.
+        let director =
+            crate::ui::inline_video::VideoDirector::new(&crate::state::AppSettings::load());
+        crate::ui::inline_video::set_director(&director);
+        self.imp().video_director.replace(Some(director));
+
         let main_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
 
         let sidebar = Sidebar::new();
@@ -360,6 +373,30 @@ impl HangarWindow {
         // Settings section
         let settings_page = self.build_settings_page();
         main_stack.add_named(&settings_page, Some("settings"));
+
+        // Leaving the feed stops the feed's video: a `GtkStack` unmaps the page
+        // it hides, and each slot's own unmap guard tears its pipeline down on
+        // the way out. What this adds is the trigger — a page switch changes
+        // what is on screen without scrolling, without touching a model and
+        // without registering a slot, so without this nothing would re-run the
+        // election on the way back either.
+        //
+        // Deliberately not "suspend unless this is home". That refused a
+        // *press of the play button* on Profile, Likes, Search, Mentions and
+        // Activity, which are five ordinary feeds of the same rows, all wired
+        // for inline playback. The election decides what may autoplay by
+        // measuring where rows actually are, and every row of a page the stack
+        // has hidden is unmapped, so a hidden feed has no candidates.
+        main_stack.connect_visible_child_notify(glib::clone!(
+            #[weak(rename_to = window)]
+            self,
+            move |_| {
+                let Some(director) = window.imp().video_director.borrow().clone() else {
+                    return;
+                };
+                director.page_changed();
+            }
+        ));
 
         main_box.append(&main_stack);
 
@@ -534,9 +571,15 @@ impl HangarWindow {
                 list_item.set_child(Some(&post_row));
             }
         });
+        Self::release_video_on_unbind(&factory);
 
+        // Weak, and so is every callback it installs below. The window owns
+        // this `GtkListView`, the list view owns the factory, and the factory
+        // owns this closure — a strong window here is a cycle the window can
+        // never get out of, which would mean `VideoDirector::drop` never runs
+        // and its election source outlives the window it was measuring.
         factory.connect_bind(glib::clone!(
-            #[strong(rename_to = win)]
+            #[weak(rename_to = win)]
             self,
             move |_, item| {
                 if let Some(list_item) = item.downcast_ref::<gtk4::ListItem>()
@@ -547,8 +590,11 @@ impl HangarWindow {
                     post_row.bind(&post);
                     // Like callback receives (post_row, was_liked, like_uri) captured before toggle
                     let post_for_like = post.clone();
-                    let w = win.clone();
+                    let w = win.downgrade();
                     post_row.connect_like_clicked(move |row, was_liked, like_uri| {
+                        let Some(w) = w.upgrade() else {
+                            return;
+                        };
                         let mut post_with_state = post_for_like.clone();
                         // If it was liked, we're unliking, so pass the like_uri
                         // If it wasn't liked, we're liking, so pass None
@@ -560,8 +606,11 @@ impl HangarWindow {
                     });
                     // Repost callback receives (post_row, was_reposted, repost_uri) captured before toggle
                     let post_for_repost = post.clone();
-                    let w = win.clone();
+                    let w = win.downgrade();
                     post_row.connect_repost_clicked(move |row, was_reposted, repost_uri| {
+                        let Some(w) = w.upgrade() else {
+                            return;
+                        };
                         let mut post_with_state = post_for_repost.clone();
                         post_with_state.viewer_repost =
                             if was_reposted { repost_uri } else { None };
@@ -571,34 +620,49 @@ impl HangarWindow {
                         }
                     });
                     let post_for_quote = post.clone();
-                    let w = win.clone();
+                    let w = win.downgrade();
                     post_row.connect_quote_clicked(move || {
+                        let Some(w) = w.upgrade() else {
+                            return;
+                        };
                         if let Some(cb) = w.imp().quote_callback.borrow().as_ref() {
                             cb(post_for_quote.clone());
                         }
                     });
                     let post_clone = post.clone();
-                    let w = win.clone();
+                    let w = win.downgrade();
                     post_row.connect_reply_clicked(move || {
+                        let Some(w) = w.upgrade() else {
+                            return;
+                        };
                         if let Some(cb) = w.imp().reply_callback.borrow().as_ref() {
                             cb(post_clone.clone());
                         }
                     });
                     // Navigation callbacks
-                    let w = win.clone();
+                    let w = win.downgrade();
                     post_row.set_post_clicked_callback(move |p| {
+                        let Some(w) = w.upgrade() else {
+                            return;
+                        };
                         if let Some(cb) = w.imp().post_clicked_callback.borrow().as_ref() {
                             cb(p);
                         }
                     });
-                    let w = win.clone();
+                    let w = win.downgrade();
                     post_row.set_profile_clicked_callback(move |profile| {
+                        let Some(w) = w.upgrade() else {
+                            return;
+                        };
                         if let Some(cb) = w.imp().profile_clicked_callback.borrow().as_ref() {
                             cb(profile);
                         }
                     });
-                    let w = win.clone();
+                    let w = win.downgrade();
                     post_row.set_mention_clicked_callback(move |handle| {
+                        let Some(w) = w.upgrade() else {
+                            return;
+                        };
                         if let Some(cb) = w.imp().mention_clicked_callback.borrow().as_ref() {
                             cb(handle);
                         }
@@ -667,6 +731,20 @@ impl HangarWindow {
 
         timeline_box.append(&overlay);
 
+        // Autoplay is scoped to this one scroller, mirroring
+        // `hide_replies_in_feed`'s main-feed-only scope. Threads, profiles,
+        // likes and search play inline too, but only when asked.
+        if let Some(director) = self.imp().video_director.borrow().as_ref() {
+            director.set_timeline_scroller(&scrolled);
+        }
+        // A refresh or an appended page can bring a video onto a screen that is
+        // not being scrolled, so the model gets a trigger of its own.
+        model.connect_items_changed(glib::clone!(
+            #[weak(rename_to = win)]
+            self,
+            move |_, _, _, _| win.schedule_video_election()
+        ));
+
         let imp = self.imp();
         imp.timeline_model.replace(Some(model));
         imp.timeline_list_view.replace(Some(list_view.clone()));
@@ -705,6 +783,11 @@ impl HangarWindow {
                 let upper = adj.upper();
                 let page_size = adj.page_size();
 
+                // Re-arm the one election source. Not an election: this fires
+                // per frame of a scroll, and the whole point of the settle
+                // delay is that flinging through fifty posts costs nothing.
+                win.schedule_video_election();
+
                 // Auto-hide "new posts" banner when user scrolls to top
                 if value < 50.0 {
                     win.hide_new_posts_banner();
@@ -734,6 +817,36 @@ impl HangarWindow {
         self.imp()
             .refresh_callback
             .replace(Some(Box::new(callback)));
+    }
+
+    /// Make a `PostRow` factory give up its video when a row is recycled.
+    ///
+    /// Every factory that builds `PostRow`s needs this, not just the timeline's
+    /// — a video started on the Likes page and scrolled past would otherwise
+    /// keep its decoder, its audio sink and its bus watch bound to a row that
+    /// has since been rebound to somebody else's post. `release_video` is
+    /// idempotent, so it costs nothing on the overwhelming majority of rows
+    /// that never had one.
+    pub(crate) fn release_video_on_unbind(factory: &gtk4::SignalListItemFactory) {
+        factory.connect_unbind(|_, item| {
+            if let Some(list_item) = item.downcast_ref::<gtk4::ListItem>()
+                && let Some(post_row) = list_item.child().and_downcast::<PostRow>()
+            {
+                post_row.release_video();
+            }
+        });
+    }
+
+    /// Re-arm the one election timer, if there is a director to arm it.
+    ///
+    /// Every scroll frame, model change and page switch comes through here.
+    /// With autoplay off and nothing playing — the default — it arms nothing
+    /// at all.
+    fn schedule_video_election(&self) {
+        let director = self.imp().video_director.borrow().clone();
+        if let Some(director) = director {
+            director.schedule_election();
+        }
     }
 
     /// Refetch the timeline, exactly as the refresh button does.
@@ -769,8 +882,11 @@ impl HangarWindow {
             .compose_callback
             .replace(Some(Box::new(callback)));
         if let Some(sidebar) = self.imp().sidebar.borrow().as_ref() {
-            let win = self.clone();
+            let win = self.downgrade();
             sidebar.connect_compose_clicked(move || {
+                let Some(win) = win.upgrade() else {
+                    return;
+                };
                 if let Some(cb) = win.imp().compose_callback.borrow().as_ref() {
                     cb();
                 }
@@ -1309,8 +1425,11 @@ impl HangarWindow {
 
             // Like callback
             let post_for_like = post.clone();
-            let w = win.clone();
+            let w = win.downgrade();
             post_row.connect_like_clicked(move |row, was_liked, like_uri| {
+                let Some(w) = w.upgrade() else {
+                    return;
+                };
                 let mut post_with_state = post_for_like.clone();
                 post_with_state.viewer_like = if was_liked { like_uri } else { None };
                 let row_weak = row.downgrade();
@@ -1323,8 +1442,11 @@ impl HangarWindow {
 
             // Repost callback
             let post_for_repost = post.clone();
-            let w = win.clone();
+            let w = win.downgrade();
             post_row.connect_repost_clicked(move |row, was_reposted, repost_uri| {
+                let Some(w) = w.upgrade() else {
+                    return;
+                };
                 let mut post_with_state = post_for_repost.clone();
                 post_with_state.viewer_repost = if was_reposted { repost_uri } else { None };
                 let row_weak = row.downgrade();
@@ -1337,8 +1459,11 @@ impl HangarWindow {
 
             // Quote callback
             let post_for_quote = post.clone();
-            let w = win.clone();
+            let w = win.downgrade();
             post_row.connect_quote_clicked(move || {
+                let Some(w) = w.upgrade() else {
+                    return;
+                };
                 w.imp()
                     .quote_callback
                     .borrow()
@@ -1348,8 +1473,11 @@ impl HangarWindow {
 
             // Reply callback
             let post_clone = post.clone();
-            let w = win.clone();
+            let w = win.downgrade();
             post_row.connect_reply_clicked(move || {
+                let Some(w) = w.upgrade() else {
+                    return;
+                };
                 w.imp()
                     .reply_callback
                     .borrow()
@@ -1361,23 +1489,32 @@ impl HangarWindow {
             // When !clickable (main post in thread), the row body click is
             // disabled via set_not_clickable(), but quote cards still fire this.
             {
-                let w = win.clone();
+                let w = win.downgrade();
                 post_row.set_post_clicked_callback(move |p| {
+                    let Some(w) = w.upgrade() else {
+                        return;
+                    };
                     if let Some(cb) = w.imp().post_clicked_callback.borrow().as_ref() {
                         cb(p);
                     }
                 });
             }
 
-            let w = win.clone();
+            let w = win.downgrade();
             post_row.set_profile_clicked_callback(move |profile| {
+                let Some(w) = w.upgrade() else {
+                    return;
+                };
                 if let Some(cb) = w.imp().profile_clicked_callback.borrow().as_ref() {
                     cb(profile);
                 }
             });
 
-            let w = win.clone();
+            let w = win.downgrade();
             post_row.set_mention_clicked_callback(move |handle| {
+                let Some(w) = w.upgrade() else {
+                    return;
+                };
                 if let Some(cb) = w.imp().mention_clicked_callback.borrow().as_ref() {
                     cb(handle);
                 }
@@ -1552,9 +1689,13 @@ impl HangarWindow {
                 list_item.set_child(Some(&post_row));
             }
         });
+        Self::release_video_on_unbind(&factory);
 
-        let win = self.clone();
+        let win = self.downgrade();
         factory.connect_bind(move |_, item| {
+            let Some(win) = win.upgrade() else {
+                return;
+            };
             if let Some(list_item) = item.downcast_ref::<gtk4::ListItem>()
                 && let Some(post_object) = list_item.item().and_downcast::<PostObject>()
                 && let Some(post) = post_object.post()
@@ -1563,8 +1704,11 @@ impl HangarWindow {
                 post_row.bind(&post);
                 // Wire up like/repost/reply/quote callbacks
                 let post_for_like = post.clone();
-                let w = win.clone();
+                let w = win.downgrade();
                 post_row.connect_like_clicked(move |row, was_liked, like_uri| {
+                    let Some(w) = w.upgrade() else {
+                        return;
+                    };
                     let mut post_with_state = post_for_like.clone();
                     post_with_state.viewer_like = if was_liked { like_uri } else { None };
                     let row_weak = row.downgrade();
@@ -1575,8 +1719,11 @@ impl HangarWindow {
                         .map(|cb| cb(post_with_state, row_weak));
                 });
                 let post_for_repost = post.clone();
-                let w = win.clone();
+                let w = win.downgrade();
                 post_row.connect_repost_clicked(move |row, was_reposted, repost_uri| {
+                    let Some(w) = w.upgrade() else {
+                        return;
+                    };
                     let mut post_with_state = post_for_repost.clone();
                     post_with_state.viewer_repost = if was_reposted { repost_uri } else { None };
                     let row_weak = row.downgrade();
@@ -1587,8 +1734,11 @@ impl HangarWindow {
                         .map(|cb| cb(post_with_state, row_weak));
                 });
                 let post_for_quote = post.clone();
-                let w = win.clone();
+                let w = win.downgrade();
                 post_row.connect_quote_clicked(move || {
+                    let Some(w) = w.upgrade() else {
+                        return;
+                    };
                     w.imp()
                         .quote_callback
                         .borrow()
@@ -1596,8 +1746,11 @@ impl HangarWindow {
                         .map(|cb| cb(post_for_quote.clone()));
                 });
                 let post_clone = post.clone();
-                let w = win.clone();
+                let w = win.downgrade();
                 post_row.connect_reply_clicked(move || {
+                    let Some(w) = w.upgrade() else {
+                        return;
+                    };
                     w.imp()
                         .reply_callback
                         .borrow()
@@ -1676,8 +1829,11 @@ impl HangarWindow {
             }
         });
 
-        let win = self.clone();
+        let win = self.downgrade();
         factory.connect_bind(move |_, item| {
+            let Some(win) = win.upgrade() else {
+                return;
+            };
             if let Some(list_item) = item.downcast_ref::<gtk4::ListItem>()
                 && let Some(notif_object) = list_item.item().and_downcast::<NotificationObject>()
                 && let Some(notif) = notif_object.notification()
@@ -1686,24 +1842,35 @@ impl HangarWindow {
                 row.bind(&notif);
                 // Connect profile click
                 let profile = notif.author.clone();
-                let w = win.clone();
+                let w = win.downgrade();
                 row.connect_profile_clicked(move |_| {
+                    let Some(w) = w.upgrade() else {
+                        return;
+                    };
                     w.imp()
                         .profile_clicked_callback
                         .borrow()
                         .as_ref()
                         .map(|cb| cb(profile.clone()));
                 });
-                // Connect post click (if there's an associated post)
-                if let Some(post) = notif.post.clone() {
-                    let w = win.clone();
-                    row.connect_clicked(move |_| {
-                        w.imp()
-                            .post_clicked_callback
-                            .borrow()
-                            .as_ref()
-                            .map(|cb| cb(post.clone()));
-                    });
+                // Connect post click, and clear it when there is no post: this
+                // row is recycled, so leaving the handler alone would keep
+                // whatever the previous notification put there.
+                match notif.post.clone() {
+                    Some(post) => {
+                        let w = win.downgrade();
+                        row.connect_clicked(move |_| {
+                            let Some(w) = w.upgrade() else {
+                                return;
+                            };
+                            w.imp()
+                                .post_clicked_callback
+                                .borrow()
+                                .as_ref()
+                                .map(|cb| cb(post.clone()));
+                        });
+                    }
+                    None => row.clear_clicked(),
                 }
             }
         });
@@ -1846,8 +2013,11 @@ impl HangarWindow {
             }
         });
 
-        let win = self.clone();
+        let win = self.downgrade();
         factory.connect_bind(move |_, item| {
+            let Some(win) = win.upgrade() else {
+                return;
+            };
             if let Some(list_item) = item.downcast_ref::<gtk4::ListItem>()
                 && let Some(notif_object) = list_item.item().and_downcast::<NotificationObject>()
                 && let Some(notif) = notif_object.notification()
@@ -1856,24 +2026,35 @@ impl HangarWindow {
                 row.bind(&notif);
                 // Connect profile click
                 let profile = notif.author.clone();
-                let w = win.clone();
+                let w = win.downgrade();
                 row.connect_profile_clicked(move |_| {
+                    let Some(w) = w.upgrade() else {
+                        return;
+                    };
                     w.imp()
                         .profile_clicked_callback
                         .borrow()
                         .as_ref()
                         .map(|cb| cb(profile.clone()));
                 });
-                // Connect post click (if there's an associated post)
-                if let Some(post) = notif.post.clone() {
-                    let w = win.clone();
-                    row.connect_clicked(move |_| {
-                        w.imp()
-                            .post_clicked_callback
-                            .borrow()
-                            .as_ref()
-                            .map(|cb| cb(post.clone()));
-                    });
+                // Connect post click, clearing it when there is none: a follow
+                // notification bound into a recycled row would otherwise
+                // inherit the previous occupant's post and open its thread.
+                match notif.post.clone() {
+                    Some(post) => {
+                        let w = win.downgrade();
+                        row.connect_clicked(move |_| {
+                            let Some(w) = w.upgrade() else {
+                                return;
+                            };
+                            w.imp()
+                                .post_clicked_callback
+                                .borrow()
+                                .as_ref()
+                                .map(|cb| cb(post.clone()));
+                        });
+                    }
+                    None => row.clear_clicked(),
                 }
             }
         });
@@ -2011,8 +2192,11 @@ impl HangarWindow {
             }
         });
 
-        let win = self.clone();
+        let win = self.downgrade();
         factory.connect_bind(move |_, item| {
+            let Some(win) = win.upgrade() else {
+                return;
+            };
             if let Some(list_item) = item.downcast_ref::<gtk4::ListItem>()
                 && let Some(convo_object) = list_item.item().and_downcast::<ConversationObject>()
                 && let Some(convo) = convo_object.conversation()
@@ -2022,8 +2206,11 @@ impl HangarWindow {
                 row.bind(&convo, my_did.as_deref());
                 // Connect click
                 let conversation = convo.clone();
-                let w = win.clone();
+                let w = win.downgrade();
                 row.connect_clicked(move |_| {
+                    let Some(w) = w.upgrade() else {
+                        return;
+                    };
                     w.imp()
                         .conversation_clicked_callback
                         .borrow()
@@ -2077,8 +2264,11 @@ impl HangarWindow {
 
         // Infinite scroll
         let adj = scrolled.vadjustment();
-        let win = self.clone();
+        let win = self.downgrade();
         adj.connect_value_changed(move |adj| {
+            let Some(win) = win.upgrade() else {
+                return;
+            };
             let value = adj.value();
             let upper = adj.upper();
             let page_size = adj.page_size();
@@ -2154,8 +2344,11 @@ impl HangarWindow {
             .nav_changed_callback
             .replace(Some(Box::new(callback)));
         if let Some(sidebar) = self.imp().sidebar.borrow().as_ref() {
-            let win = self.clone();
+            let win = self.downgrade();
             sidebar.connect_nav_changed(move |item| {
+                let Some(win) = win.upgrade() else {
+                    return;
+                };
                 win.imp()
                     .nav_changed_callback
                     .borrow()
@@ -2251,9 +2444,13 @@ impl HangarWindow {
                 list_item.set_child(Some(&post_row));
             }
         });
+        Self::release_video_on_unbind(&factory);
 
-        let win = self.clone();
+        let win = self.downgrade();
         factory.connect_bind(move |_, item| {
+            let Some(win) = win.upgrade() else {
+                return;
+            };
             if let Some(list_item) = item.downcast_ref::<gtk4::ListItem>()
                 && let Some(post_object) = list_item.item().and_downcast::<PostObject>()
                 && let Some(post) = post_object.post()
@@ -2261,8 +2458,11 @@ impl HangarWindow {
             {
                 post_row.bind(&post);
                 let post_for_like = post.clone();
-                let w = win.clone();
+                let w = win.downgrade();
                 post_row.connect_like_clicked(move |row, was_liked, like_uri| {
+                    let Some(w) = w.upgrade() else {
+                        return;
+                    };
                     let mut post_with_state = post_for_like.clone();
                     post_with_state.viewer_like = if was_liked { like_uri } else { None };
                     let row_weak = row.downgrade();
@@ -2273,8 +2473,11 @@ impl HangarWindow {
                         .map(|cb| cb(post_with_state, row_weak));
                 });
                 let post_for_repost = post.clone();
-                let w = win.clone();
+                let w = win.downgrade();
                 post_row.connect_repost_clicked(move |row, was_reposted, repost_uri| {
+                    let Some(w) = w.upgrade() else {
+                        return;
+                    };
                     let mut post_with_state = post_for_repost.clone();
                     post_with_state.viewer_repost = if was_reposted { repost_uri } else { None };
                     let row_weak = row.downgrade();
@@ -2285,8 +2488,11 @@ impl HangarWindow {
                         .map(|cb| cb(post_with_state, row_weak));
                 });
                 let post_for_quote = post.clone();
-                let w = win.clone();
+                let w = win.downgrade();
                 post_row.connect_quote_clicked(move || {
+                    let Some(w) = w.upgrade() else {
+                        return;
+                    };
                     w.imp()
                         .quote_callback
                         .borrow()
@@ -2294,8 +2500,11 @@ impl HangarWindow {
                         .map(|cb| cb(post_for_quote.clone()));
                 });
                 let post_clone = post.clone();
-                let w = win.clone();
+                let w = win.downgrade();
                 post_row.connect_reply_clicked(move || {
+                    let Some(w) = w.upgrade() else {
+                        return;
+                    };
                     w.imp()
                         .reply_callback
                         .borrow()
@@ -2303,8 +2512,11 @@ impl HangarWindow {
                         .map(|cb| cb(post_clone.clone()));
                 });
                 // Navigation callbacks for posts in profile
-                let w = win.clone();
+                let w = win.downgrade();
                 post_row.set_post_clicked_callback(move |p| {
+                    let Some(w) = w.upgrade() else {
+                        return;
+                    };
                     w.imp()
                         .post_clicked_callback
                         .borrow()
@@ -2339,8 +2551,11 @@ impl HangarWindow {
 
         // Infinite scroll
         let adj = scrolled.vadjustment();
-        let win = self.clone();
+        let win = self.downgrade();
         adj.connect_value_changed(move |adj| {
+            let Some(win) = win.upgrade() else {
+                return;
+            };
             let value = adj.value();
             let upper = adj.upper();
             let page_size = adj.page_size();
@@ -2598,9 +2813,13 @@ impl HangarWindow {
                 list_item.set_child(Some(&post_row));
             }
         });
+        Self::release_video_on_unbind(&factory);
 
-        let win = self.clone();
+        let win = self.downgrade();
         factory.connect_bind(move |_, item| {
+            let Some(win) = win.upgrade() else {
+                return;
+            };
             if let Some(list_item) = item.downcast_ref::<gtk4::ListItem>()
                 && let Some(post_object) = list_item.item().and_downcast::<PostObject>()
                 && let Some(post) = post_object.post()
@@ -2608,8 +2827,11 @@ impl HangarWindow {
             {
                 post_row.bind(&post);
                 let post_for_like = post.clone();
-                let w = win.clone();
+                let w = win.downgrade();
                 post_row.connect_like_clicked(move |row, was_liked, like_uri| {
+                    let Some(w) = w.upgrade() else {
+                        return;
+                    };
                     let mut post_with_state = post_for_like.clone();
                     post_with_state.viewer_like = if was_liked { like_uri } else { None };
                     let row_weak = row.downgrade();
@@ -2620,8 +2842,11 @@ impl HangarWindow {
                         .map(|cb| cb(post_with_state, row_weak));
                 });
                 let post_for_repost = post.clone();
-                let w = win.clone();
+                let w = win.downgrade();
                 post_row.connect_repost_clicked(move |row, was_reposted, repost_uri| {
+                    let Some(w) = w.upgrade() else {
+                        return;
+                    };
                     let mut post_with_state = post_for_repost.clone();
                     post_with_state.viewer_repost = if was_reposted { repost_uri } else { None };
                     let row_weak = row.downgrade();
@@ -2632,8 +2857,11 @@ impl HangarWindow {
                         .map(|cb| cb(post_with_state, row_weak));
                 });
                 let post_for_quote = post.clone();
-                let w = win.clone();
+                let w = win.downgrade();
                 post_row.connect_quote_clicked(move || {
+                    let Some(w) = w.upgrade() else {
+                        return;
+                    };
                     w.imp()
                         .quote_callback
                         .borrow()
@@ -2641,8 +2869,11 @@ impl HangarWindow {
                         .map(|cb| cb(post_for_quote.clone()));
                 });
                 let post_clone = post.clone();
-                let w = win.clone();
+                let w = win.downgrade();
                 post_row.connect_reply_clicked(move || {
+                    let Some(w) = w.upgrade() else {
+                        return;
+                    };
                     w.imp()
                         .reply_callback
                         .borrow()
@@ -2650,8 +2881,11 @@ impl HangarWindow {
                         .map(|cb| cb(post_clone.clone()));
                 });
                 // Navigation callbacks for posts in likes
-                let w = win.clone();
+                let w = win.downgrade();
                 post_row.set_post_clicked_callback(move |p| {
+                    let Some(w) = w.upgrade() else {
+                        return;
+                    };
                     w.imp()
                         .post_clicked_callback
                         .borrow()
@@ -2695,8 +2929,11 @@ impl HangarWindow {
 
         // Infinite scroll
         let adj = scrolled.vadjustment();
-        let win = self.clone();
+        let win = self.downgrade();
         adj.connect_value_changed(move |adj| {
+            let Some(win) = win.upgrade() else {
+                return;
+            };
             let value = adj.value();
             let upper = adj.upper();
             let page_size = adj.page_size();
@@ -2789,8 +3026,11 @@ impl HangarWindow {
         search_entry.set_margin_bottom(12);
 
         // Connect search activation (Enter key)
-        let win = self.clone();
+        let win = self.downgrade();
         search_entry.connect_activate(move |entry| {
+            let Some(win) = win.upgrade() else {
+                return;
+            };
             let query = entry.text().to_string();
             if !query.is_empty() {
                 if let Some(cb) = win.imp().search_callback.borrow().as_ref() {
@@ -2817,9 +3057,13 @@ impl HangarWindow {
                 list_item.set_child(Some(&post_row));
             }
         });
+        Self::release_video_on_unbind(&factory);
 
-        let win = self.clone();
+        let win = self.downgrade();
         factory.connect_bind(move |_, item| {
+            let Some(win) = win.upgrade() else {
+                return;
+            };
             if let Some(list_item) = item.downcast_ref::<gtk4::ListItem>()
                 && let Some(post_object) = list_item.item().and_downcast::<PostObject>()
                 && let Some(post) = post_object.post()
@@ -2827,8 +3071,11 @@ impl HangarWindow {
             {
                 post_row.bind(&post);
                 let post_for_like = post.clone();
-                let w = win.clone();
+                let w = win.downgrade();
                 post_row.connect_like_clicked(move |row, was_liked, like_uri| {
+                    let Some(w) = w.upgrade() else {
+                        return;
+                    };
                     let mut post_with_state = post_for_like.clone();
                     post_with_state.viewer_like = if was_liked { like_uri } else { None };
                     let row_weak = row.downgrade();
@@ -2839,8 +3086,11 @@ impl HangarWindow {
                         .map(|cb| cb(post_with_state, row_weak));
                 });
                 let post_for_repost = post.clone();
-                let w = win.clone();
+                let w = win.downgrade();
                 post_row.connect_repost_clicked(move |row, was_reposted, repost_uri| {
+                    let Some(w) = w.upgrade() else {
+                        return;
+                    };
                     let mut post_with_state = post_for_repost.clone();
                     post_with_state.viewer_repost = if was_reposted { repost_uri } else { None };
                     let row_weak = row.downgrade();
@@ -2851,8 +3101,11 @@ impl HangarWindow {
                         .map(|cb| cb(post_with_state, row_weak));
                 });
                 let post_for_quote = post.clone();
-                let w = win.clone();
+                let w = win.downgrade();
                 post_row.connect_quote_clicked(move || {
+                    let Some(w) = w.upgrade() else {
+                        return;
+                    };
                     w.imp()
                         .quote_callback
                         .borrow()
@@ -2860,8 +3113,11 @@ impl HangarWindow {
                         .map(|cb| cb(post_for_quote.clone()));
                 });
                 let post_clone = post.clone();
-                let w = win.clone();
+                let w = win.downgrade();
                 post_row.connect_reply_clicked(move || {
+                    let Some(w) = w.upgrade() else {
+                        return;
+                    };
                     w.imp()
                         .reply_callback
                         .borrow()
@@ -2869,8 +3125,11 @@ impl HangarWindow {
                         .map(|cb| cb(post_clone.clone()));
                 });
                 // Navigation callbacks for posts in search results
-                let w = win.clone();
+                let w = win.downgrade();
                 post_row.set_post_clicked_callback(move |p| {
+                    let Some(w) = w.upgrade() else {
+                        return;
+                    };
                     w.imp()
                         .post_clicked_callback
                         .borrow()
@@ -2914,8 +3173,11 @@ impl HangarWindow {
 
         // Infinite scroll
         let adj = scrolled.vadjustment();
-        let win = self.clone();
+        let win = self.downgrade();
         adj.connect_value_changed(move |adj| {
+            let Some(win) = win.upgrade() else {
+                return;
+            };
             let value = adj.value();
             let upper = adj.upper();
             let page_size = adj.page_size();
@@ -3208,6 +3470,62 @@ impl HangarWindow {
         feed_group.add(&hide_replies_row);
 
         page.add(&feed_group);
+
+        // ---- Media ----
+        let media_group = adw::PreferencesGroup::new();
+        media_group.set_title("Media");
+        media_group.set_description(Some(
+            "Applies to the main timeline. Threads, profiles and search always wait for you to press play.",
+        ));
+
+        let autoplay_labels: Vec<&str> = crate::state::VideoAutoplay::ALL
+            .iter()
+            .map(|mode| mode.label())
+            .collect();
+        let autoplay_model = gtk4::StringList::new(&autoplay_labels);
+        let autoplay_row = adw::ComboRow::builder()
+            .title("Autoplay Videos")
+            .subtitle("Play the video nearest the middle of the feed as you scroll")
+            .model(&autoplay_model)
+            .build();
+        let selected = crate::state::VideoAutoplay::ALL
+            .iter()
+            .position(|mode| *mode == current_settings.video_autoplay)
+            .unwrap_or(0);
+        autoplay_row.set_selected(selected as u32);
+        autoplay_row.update_property(&[gtk4::accessible::Property::Label(
+            "Autoplay videos in the timeline",
+        )]);
+
+        let window_weak = self.downgrade();
+        autoplay_row.connect_selected_notify(move |row| {
+            let mode = crate::state::VideoAutoplay::ALL
+                .get(row.selected() as usize)
+                .copied()
+                .unwrap_or_default();
+
+            let mut settings = crate::state::AppSettings::load();
+            settings.video_autoplay = mode;
+            if let Err(e) = settings.save() {
+                eprintln!("Failed to save settings: {e}");
+            }
+
+            // Deliberately not `refresh_feed`, unlike Hide Replies: this changes
+            // how the feed behaves, not what is in it, and refetching would
+            // throw away the scroll position for nothing. The director applies
+            // it where the user can see it — turning autoplay off stops the
+            // video that is playing, turning it on starts one.
+            if let Some(window) = window_weak.upgrade() {
+                let director = window.imp().video_director.borrow().clone();
+                if let Some(director) = director {
+                    director.set_autoplay(mode);
+                }
+            }
+        });
+
+        media_group.add(&autoplay_row);
+        page.add(&media_group);
+
         page
     }
 
@@ -3814,9 +4132,18 @@ mod mention_row {
 
             // Avatar with click gesture
             let avatar = adw::Avatar::new(48, None, true);
+            avatar.set_cursor_from_name(Some("pointer"));
             let avatar_click = gtk4::GestureClick::new();
             let row_weak = self.downgrade();
-            avatar_click.connect_released(move |_, _, _, _| {
+            avatar_click.connect_released(move |gesture, _, _, _| {
+                // Claim the sequence, or the row's own gesture (added to
+                // `self` further down) also sees this release and one click on
+                // an avatar both opens the profile and opens the thread. Both
+                // gestures bubble, and bubble is walked descendants-first, so
+                // the avatar gets the release first and claiming here is what
+                // cancels the row's. Same rule as the quote card and the image
+                // cells in `post_row`.
+                gesture.set_state(gtk4::EventSequenceState::Claimed);
                 if let Some(row) = row_weak.upgrade() {
                     if let Some(cb) = row.imp().profile_clicked_callback.borrow().as_ref() {
                         cb(&row);
@@ -3996,6 +4323,16 @@ mod mention_row {
                 .clicked_callback
                 .replace(Some(Box::new(callback)));
         }
+
+        /// Forget the row-click handler.
+        ///
+        /// `ListView` recycles rows, so a binding that leaves the handler alone
+        /// inherits the previous occupant's. A notification with no post kept
+        /// the closure some *other* notification installed, and clicking it
+        /// opened that unrelated thread.
+        pub fn clear_clicked(&self) {
+            self.imp().clicked_callback.replace(None);
+        }
     }
 
     impl Default for MentionRow {
@@ -4090,9 +4427,14 @@ mod activity_row {
             avatar_overlay.add_overlay(&badge_icon);
 
             // Click gesture for avatar
+            avatar_overlay.set_cursor_from_name(Some("pointer"));
             let avatar_click = gtk4::GestureClick::new();
             let row_weak = self.downgrade();
-            avatar_click.connect_released(move |_, _, _, _| {
+            avatar_click.connect_released(move |gesture, _, _, _| {
+                // See `MentionRow::setup_ui`: without this claim the row's own
+                // gesture answers the same release and the click both opens
+                // the profile and opens the post.
+                gesture.set_state(gtk4::EventSequenceState::Claimed);
                 if let Some(row) = row_weak.upgrade() {
                     if let Some(cb) = row.imp().profile_clicked_callback.borrow().as_ref() {
                         cb(&row);
@@ -4348,6 +4690,13 @@ mod activity_row {
                 .clicked_callback
                 .replace(Some(Box::new(callback)));
         }
+
+        /// Forget the row-click handler. See [`super::MentionRow::clear_clicked`]:
+        /// a follow notification, which has no post, otherwise inherits the
+        /// handler of whatever was bound to this recycled row before it.
+        pub fn clear_clicked(&self) {
+            self.imp().clicked_callback.replace(None);
+        }
     }
 
     impl Default for ActivityRow {
@@ -4601,3 +4950,204 @@ mod conversation_row {
 }
 
 use conversation_row::ConversationRow;
+
+#[cfg(test)]
+mod tests {
+    use super::activity_row::ActivityRow;
+    use super::mention_row::MentionRow;
+    use super::*;
+    use crate::atproto::{Notification, Profile};
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    fn notification(with_post: bool) -> Notification {
+        let author = Profile::minimal(
+            "did:plc:test".into(),
+            "someone.bsky.social".into(),
+            Some("Someone".into()),
+            None,
+        );
+        Notification {
+            uri: "at://did:plc:test/app.bsky.feed.post/n".into(),
+            cid: "cid".into(),
+            reason: if with_post { "mention" } else { "follow" }.into(),
+            indexed_at: "2026-01-01T00:00:00Z".into(),
+            is_read: false,
+            post: with_post.then(|| Post {
+                uri: "at://did:plc:test/app.bsky.feed.post/p".into(),
+                cid: "cid".into(),
+                author: author.clone(),
+                text: "hello".into(),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                indexed_at: "2026-01-01T00:00:00Z".into(),
+                like_count: None,
+                repost_count: None,
+                reply_count: None,
+                embed: None,
+                viewer_like: None,
+                viewer_repost: None,
+                repost_reason: None,
+                reply_context: None,
+            }),
+            author,
+        }
+    }
+
+    /// Every click gesture on `widget`, as its propagation phase.
+    fn click_phases(widget: &gtk4::Widget) -> Vec<gtk4::PropagationPhase> {
+        let list = widget.observe_controllers();
+        (0..list.n_items())
+            .filter_map(|i| list.item(i))
+            .filter_map(|obj| obj.downcast::<gtk4::EventController>().ok())
+            .filter(|c| c.type_().name() == "GtkGestureClick")
+            .map(|c| c.propagation_phase())
+            .collect()
+    }
+
+    fn walk(widget: &gtk4::Widget, depth: usize, out: &mut Vec<(usize, gtk4::Widget)>) {
+        out.push((depth, widget.clone()));
+        let mut child = widget.first_child();
+        while let Some(c) = child {
+            walk(&c, depth + 1, out);
+            child = c.next_sibling();
+        }
+    }
+
+    /// One click on a notification avatar has to mean one thing.
+    ///
+    /// A notification row carries two click gestures: one on the avatar, which
+    /// opens the profile, and one on the row, which opens the post. Both
+    /// bubble, and bubble is walked descendants-first, so a click on the avatar
+    /// reaches the avatar's gesture first — but until it *claims* the sequence
+    /// the row's gesture answers the same release, and the single click both
+    /// opened the profile and navigated to the thread.
+    ///
+    /// GTK's propagation rules make that structural, so the test is structural,
+    /// in the same shape as `post_row`'s quote-card test: the avatar's gesture
+    /// must sit strictly deeper than the row's, and nothing between them may
+    /// capture. Whether `set_state(Claimed)` is then called cannot be observed
+    /// without synthesising input, which GTK4 gives no public way to do.
+    #[test]
+    fn a_notification_avatar_does_not_also_trigger_the_row() {
+        crate::ui::with_gtk(a_notification_avatar_does_not_also_trigger_the_row_body);
+    }
+
+    fn a_notification_avatar_does_not_also_trigger_the_row_body() {
+        for row in [
+            MentionRow::new().upcast::<gtk4::Widget>(),
+            ActivityRow::new().upcast::<gtk4::Widget>(),
+        ] {
+            let name = row.type_().name().to_string();
+
+            assert_eq!(
+                click_phases(&row),
+                vec![gtk4::PropagationPhase::Bubble],
+                "{name}: the row's own gesture must bubble, or it would answer \
+                 the release before anything inside it"
+            );
+
+            let mut widgets = Vec::new();
+            walk(&row, 0, &mut widgets);
+            let inner: Vec<_> = widgets
+                .iter()
+                .filter(|(depth, w)| *depth > 0 && !click_phases(w).is_empty())
+                .collect();
+            assert_eq!(
+                inner.len(),
+                1,
+                "{name}: exactly one click target inside the row (the avatar)"
+            );
+            assert_eq!(
+                click_phases(&inner[0].1),
+                vec![gtk4::PropagationPhase::Bubble],
+                "{name}: the avatar's gesture bubbles too, so the deeper one is \
+                 reached first and is the one that gets to claim"
+            );
+            assert!(
+                inner[0].1.cursor().is_some(),
+                "{name}: the avatar is clickable, so it says so"
+            );
+        }
+    }
+
+    /// A recycled row must not inherit the previous notification's handler.
+    ///
+    /// `ListView` reuses row widgets, and the bind path only installed the
+    /// row-click handler when the notification had a post. A follow, which has
+    /// none, therefore kept whatever some earlier notification had left behind
+    /// and opened that unrelated thread.
+    #[test]
+    fn rebinding_a_notification_row_forgets_the_previous_post() {
+        crate::ui::with_gtk(rebinding_a_notification_row_forgets_the_previous_post_body);
+    }
+
+    fn rebinding_a_notification_row_forgets_the_previous_post_body() {
+        let fired = Rc::new(Cell::new(0));
+
+        let row = MentionRow::new();
+        row.bind(&notification(true));
+        let count = fired.clone();
+        row.connect_clicked(move |_| count.set(count.get() + 1));
+        assert!(row.imp().clicked_callback.borrow().is_some());
+
+        // Rebound to a notification with no post, the way the factory does it.
+        row.bind(&notification(false));
+        row.clear_clicked();
+        assert!(
+            row.imp().clicked_callback.borrow().is_none(),
+            "the previous notification's post must not still be clickable"
+        );
+        assert_eq!(fired.get(), 0);
+
+        let row = ActivityRow::new();
+        row.bind(&notification(true));
+        row.connect_clicked(|_| {});
+        row.bind(&notification(false));
+        row.clear_clicked();
+        assert!(row.imp().clicked_callback.borrow().is_none());
+    }
+
+    /// A window that has been closed has to be able to die.
+    ///
+    /// The window owns the list views, a list view owns its factory, and a
+    /// factory owns the `bind` closure — so a closure holding the window
+    /// strongly, or installing a row callback that did, was a cycle that
+    /// closing the window could not break. Nothing about that is visible while
+    /// the app is running, and the cost is not the widgets: it is that
+    /// `VideoDirector::drop`, which removes the one election source, would
+    /// never run.
+    ///
+    /// So the assertion is not "no leak" in the abstract. It is that the
+    /// director, which rows reach through a thread-local `Weak`, is gone once
+    /// its window is.
+    #[test]
+    fn a_closed_window_takes_its_video_director_with_it() {
+        crate::ui::with_gtk(a_closed_window_takes_its_video_director_with_it_body);
+    }
+
+    fn a_closed_window_takes_its_video_director_with_it_body() {
+        // Built without an application on purpose: `setup_ui` runs from
+        // `constructed` either way, and this keeps the one reference to the
+        // window in this function rather than in a `GtkApplication` that would
+        // have to be torn down first to prove anything.
+        let window: HangarWindow = glib::Object::builder().build();
+        assert!(
+            crate::ui::inline_video::director().is_some(),
+            "the window did not build a director, so this proves nothing"
+        );
+
+        let weak = window.downgrade();
+        window.destroy();
+        drop(window);
+
+        assert!(
+            weak.upgrade().is_none(),
+            "a closed window was still alive: something the window owns is \
+             holding it strongly"
+        );
+        assert!(
+            crate::ui::inline_video::director().is_none(),
+            "the director outlived its window, so its election source did too"
+        );
+    }
+}

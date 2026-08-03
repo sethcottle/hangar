@@ -99,6 +99,48 @@ impl Default for VideoVolume {
 
 impl Eq for VideoVolume {}
 
+/// Whether videos in the main timeline start on their own, and with what audio.
+///
+/// Three variants rather than a bool because a bool has to silently pick a
+/// meaning: "autoplay at the app-wide volume" makes scrolling the feed blast
+/// audio, and "autoplay always muted" leaves the person who wanted sound with
+/// no way to ask for it.
+///
+/// `Never` carries `#[default]`, which is what makes `AppSettings::default()`
+/// and serde's missing-field path the *same function* — unlike a bare `bool` or
+/// `f64` field, an enum with an explicit `#[default]` variant cannot have the
+/// two disagree, which is exactly what [`VideoVolume`]'s hand-written `Default`
+/// exists to prevent. The ordering is load-bearing for readers, not for
+/// correctness: do not reorder without moving `#[default]`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VideoAutoplay {
+    #[default]
+    Never,
+    Muted,
+    WithSound,
+}
+
+impl VideoAutoplay {
+    /// Every variant, in the order the settings combo shows them.
+    pub const ALL: &'static [Self] = &[Self::Never, Self::Muted, Self::WithSound];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Never => "Never",
+            Self::Muted => "Muted",
+            Self::WithSound => "With Sound",
+        }
+    }
+
+    pub fn enabled(self) -> bool {
+        !matches!(self, Self::Never)
+    }
+
+    pub fn starts_muted(self) -> bool {
+        matches!(self, Self::Muted)
+    }
+}
+
 /// User-preferred color scheme
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ColorScheme {
@@ -150,6 +192,15 @@ pub struct AppSettings {
     /// time a viewer opens.
     #[serde(default)]
     pub video_volume: VideoVolume,
+    /// Whether timeline videos start on their own. Off by default: a feed that
+    /// starts making noise the moment it loads is a feed people turn off.
+    ///
+    /// `#[serde(default)]` is not optional here, and what it prevents is worse
+    /// than one field defaulting wrong: [`Self::load`] is
+    /// `from_str(..).unwrap_or_default()`, so a missing-field *parse error*
+    /// would silently discard the user's whole settings file.
+    #[serde(default)]
+    pub video_autoplay: VideoAutoplay,
 }
 
 impl AppSettings {
@@ -190,5 +241,62 @@ impl AppSettings {
         std::fs::write(&path, json).map_err(|e| format!("Failed to write settings: {e}"))?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Both paths into `video_autoplay` have to agree on "off".
+    ///
+    /// The legacy-blob case is the one that catches a forgotten
+    /// `#[serde(default)]`: `AppSettings::load` swallows a parse error into
+    /// `unwrap_or_default()`, so a required field would not fail loudly — it
+    /// would quietly reset a real user's font size, colour scheme and threadgate
+    /// defaults the first time they opened the app.
+    #[test]
+    fn autoplay_defaults_to_never_from_both_paths() {
+        assert_eq!(AppSettings::default().video_autoplay, VideoAutoplay::Never);
+
+        // `font_size` is the one field with no `#[serde(default)]`, so it is
+        // the minimum a file has to carry; everything since has been optional
+        // and autoplay is no exception.
+        let minimal: AppSettings =
+            serde_json::from_str(r#"{"font_size":1.0}"#).expect("a minimal settings file loads");
+        assert_eq!(minimal.video_autoplay, VideoAutoplay::Never);
+
+        let legacy: AppSettings = serde_json::from_str(
+            r#"{"font_size":1.3,"reduce_motion":true,"video_volume":0.5,"hide_replies_in_feed":true}"#,
+        )
+        .expect("a settings file written before autoplay existed still loads");
+        assert_eq!(legacy.video_autoplay, VideoAutoplay::Never);
+        // The rest of the file survived, which is the actual stake.
+        assert_eq!(legacy.font_size, FontSize(1.3));
+        assert!(legacy.reduce_motion);
+        assert_eq!(legacy.video_volume, VideoVolume(0.5));
+        assert!(legacy.hide_replies_in_feed);
+    }
+
+    #[test]
+    fn autoplay_round_trips_by_name() {
+        for mode in VideoAutoplay::ALL {
+            let json = serde_json::to_string(mode).expect("serialize");
+            let back: VideoAutoplay = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, *mode, "{json} did not round-trip");
+        }
+        assert_eq!(
+            serde_json::to_string(&VideoAutoplay::WithSound).unwrap(),
+            "\"WithSound\""
+        );
+    }
+
+    #[test]
+    fn only_muted_starts_muted_and_only_never_is_off() {
+        assert!(!VideoAutoplay::Never.enabled());
+        assert!(VideoAutoplay::Muted.enabled());
+        assert!(VideoAutoplay::WithSound.enabled());
+        assert!(VideoAutoplay::Muted.starts_muted());
+        assert!(!VideoAutoplay::WithSound.starts_muted());
     }
 }
