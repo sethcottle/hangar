@@ -208,7 +208,7 @@ pub fn build_pipeline(uri: &str, volume: f64, muted: bool) -> Result<VideoPipeli
 /// Convert a perceptual 0.0..=1.0 slider position to playbin3's linear scale.
 ///
 /// `playbin3` implements `GstStreamVolume`, whose `volume` property is linear;
-/// a volume slider wants a cubic scale. GStreamer's own cubic-to-linear
+/// a volume slider needs a cubic scale. GStreamer's own cubic-to-linear
 /// conversion is x^3, so this needs no audio bindings.
 pub fn linear_volume(slider: f64) -> f64 {
     let s = slider.clamp(0.0, 1.0);

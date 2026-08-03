@@ -451,9 +451,9 @@ impl Census {
 
 /// Bind a presented row repeatedly and check its band after every bind.
 ///
-/// The shape the blocker report describes: no list, no recycling, just `bind`
-/// twice on a row that is on screen. Walked over every embed kind in both
-/// directions, four times.
+/// The shape the blocker report describes: no list and no recycling, only
+/// `bind` twice on a row that is on screen. Walked over every embed kind in
+/// both directions, four times.
 #[test]
 fn rebinding_a_presented_row_keeps_its_media_for_every_embed_kind() {
     crate::ui::with_gtk(rebinding_a_presented_row_keeps_its_media_for_every_embed_kind_body);

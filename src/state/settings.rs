@@ -159,9 +159,9 @@ impl ColorScheme {
 pub struct AppSettings {
     /// Text scale factor. `FontSize::default()` is 1.0.
     ///
-    /// This was the one field without `#[serde(default)]`, and [`Self::load`]
-    /// is `unwrap_or_default()` - so a file missing this key was a parse error
-    /// and every other setting reverted.
+    /// This was the one field without `#[serde(default)]`. [`Self::load`]
+    /// funnels parse errors into `unwrap_or_default()`, so a file missing this
+    /// key reverted every other setting.
     /// [`no_single_missing_field_resets_the_others`] fails if a new field
     /// forgets it.
     #[serde(default)]
@@ -193,7 +193,7 @@ pub struct AppSettings {
     pub video_volume: VideoVolume,
     /// Whether timeline videos start on their own. Off by default.
     ///
-    /// `#[serde(default)]` is required - see [`Self::font_size`].
+    /// Requires `#[serde(default)]`; [`Self::font_size`] explains why.
     #[serde(default)]
     pub video_autoplay: VideoAutoplay,
 }
@@ -271,7 +271,7 @@ mod tests {
     /// [`AppSettings::load`] funnels a parse error into `unwrap_or_default()`,
     /// so a field without `#[serde(default)]` resets every other setting.
     ///
-    /// Driven by the serialized object, not a field list, so a new field is
+    /// The field set comes from the serialized object, so a new field is
     /// covered the day it lands. Compared through `serde_json::Value` because
     /// `AppSettings` derives no `PartialEq`.
     #[test]
@@ -336,10 +336,10 @@ mod tests {
         }
     }
 
-    /// The missing-field default for `font_size` is 1.0, not `f64`'s 0.0.
+    /// The missing-field default for `font_size` is 1.0.
     ///
-    /// `#[serde(default)]` calls `FontSize::default()`, not `Default` on the
-    /// inner `f64`, which would be a 0.0 scale factor.
+    /// `#[serde(default)]` calls `FontSize::default()`; falling through to the
+    /// inner `f64`'s `Default` would give a 0.0 scale factor.
     #[test]
     fn a_settings_file_with_no_font_size_reads_as_the_default_scale() {
         let empty: AppSettings = serde_json::from_str("{}").expect("an empty settings file loads");

@@ -60,7 +60,7 @@ impl LoginDialog {
         self.set_title("Sign In to Bluesky");
         self.set_content_width(400);
 
-        // Header bar with Cancel (start) — GNOME HIG pattern
+        // Header bar with Cancel at the start, per GNOME HIG
         let header = adw::HeaderBar::new();
         header.set_show_start_title_buttons(false);
         header.set_show_end_title_buttons(false);

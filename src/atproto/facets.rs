@@ -71,7 +71,7 @@ fn overlaps(byte_start: usize, byte_end: usize, existing: &[RawFacet]) -> bool {
     })
 }
 
-/// Trim trailing punctuation that is likely sentence-ending, not part of the URL.
+/// Trim trailing punctuation that probably belongs to the surrounding sentence.
 fn trim_url_trailing(url: &str) -> &str {
     url.trim_end_matches(['.', ',', ';', '!', '?'])
 }
@@ -96,7 +96,7 @@ pub fn parse_facets(text: &str) -> Vec<RawFacet> {
         });
     }
 
-    // 2. Mentions — the regex captures a leading boundary character, so we
+    // 2. Mentions. The regex captures a leading boundary character, so we
     //    use capture group 1 for the @handle portion and group 2 for the
     //    bare handle (without @).
     for caps in MENTION_RE.captures_iter(text) {
@@ -114,7 +114,7 @@ pub fn parse_facets(text: &str) -> Vec<RawFacet> {
         }
     }
 
-    // 3. Hashtags — regex captures a leading boundary, so we find the '#'
+    // 3. Hashtags. The regex captures a leading boundary, so we find the '#'
     //    position within the match and use group 1 for the tag name.
     for caps in HASHTAG_RE.captures_iter(text) {
         let full_match = caps.get(0).unwrap();
@@ -299,7 +299,7 @@ mod tests {
         // A URL containing an @ should not also produce a mention
         let text = "See https://example.com/@user.bsky.social/post";
         let facets = parse_facets(text);
-        // Should only have the URL, not a mention
+        // Only the URL facet should survive; the overlapping mention is suppressed
         assert_eq!(facets.len(), 1);
         assert!(matches!(facets[0], RawFacet::Link { .. }));
     }

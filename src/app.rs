@@ -107,7 +107,7 @@ mod imp {
             let display = gtk4::gdk::Display::default().expect("Could not get default display");
             let icon_theme = gtk4::IconTheme::for_display(&display);
 
-            // Add our bundled icons path - try multiple locations for development vs installed
+            // Add the bundled icons path. Development and installed layouts differ, so try both.
             if let Ok(exe_path) = std::env::current_exe() {
                 if let Some(exe_dir) = exe_path.parent() {
                     // For development: look relative to executable
@@ -417,7 +417,7 @@ impl HangarApplication {
             let _ = runtime::block_on(SessionManager::clear());
         });
 
-        // Close the current window — this drops all UI state
+        // Closing the current window drops all UI state.
         if let Some(window) = self.imp().window.take() {
             window.close();
         }
@@ -577,7 +577,7 @@ impl HangarApplication {
 
             thread::spawn(move || {
                 let result = runtime::block_on(async {
-                    // Start authorization — binds callback server, creates OAuth client
+                    // Start authorization: bind the callback server and create the OAuth client.
                     let session_store = crate::state::session_store::FileSessionStore::new();
                     let (auth_url, oauth_client, callback_rx) =
                         OAuthManager::start_auth(&handle, session_store)
@@ -674,7 +674,7 @@ impl HangarApplication {
             });
         });
 
-        // OAuth cancel handler — resets UI back to initial state
+        // OAuth cancel handler. Resets the UI to its initial state.
         dialog.connect_oauth_cancel(move |dlg| {
             dlg.set_oauth_waiting(false);
         });
@@ -848,7 +848,7 @@ impl HangarApplication {
         let (tx, rx) = std::sync::mpsc::channel::<Result<Option<String>, String>>();
         let client = self.client();
 
-        // Check if already liked - if so, unlike
+        // If already liked, this press unlikes.
         if let Some(like_uri) = &post.viewer_like {
             let like_uri = like_uri.clone();
             thread::spawn(move || {
@@ -1322,7 +1322,7 @@ impl HangarApplication {
         let (tx, rx) = std::sync::mpsc::channel::<Result<Option<String>, String>>();
         let client = self.client();
 
-        // Check if already reposted - if so, delete repost
+        // If already reposted, this press deletes the repost.
         if let Some(repost_uri) = &post.viewer_repost {
             let repost_uri = repost_uri.clone();
             thread::spawn(move || {
@@ -1567,7 +1567,7 @@ impl HangarApplication {
     }
 
     fn show_new_posts(&self) {
-        // Posts are already in the model - just scroll to top to see them
+        // The posts are already in the model. Scroll to top to reveal them.
         if let Some(window) = self.imp().window.borrow().as_ref() {
             window.hide_new_posts_banner();
             window.scroll_to_top();

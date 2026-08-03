@@ -15,8 +15,9 @@ const ACTION_TOAST_TIMEOUT: u32 = 5;
 
 /// The toast overlay nearest `widget`.
 ///
-/// Nearest, not the window's own: an AdwDialog draws over the window content,
-/// so a toast added to the window while a dialog is up comes up behind it.
+/// Uses the nearest overlay because an AdwDialog draws over the window
+/// content, so a toast added to the window while a dialog is up comes up
+/// behind it.
 fn nearest_overlay(widget: &gtk4::Widget) -> Option<adw::ToastOverlay> {
     widget
         .ancestor(adw::ToastOverlay::static_type())

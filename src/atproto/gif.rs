@@ -28,9 +28,9 @@ const METADATA_PARAMS: [&str; 4] = ["hh", "ww", "mp4", "webm"];
 
 /// An animated GIF recovered from an external link card.
 ///
-/// Derived at render time, not stored on [`crate::atproto::ExternalEmbed`]: a
-/// new non-defaulted field there would fail every cached post's deserialize,
-/// and `cache::posts` drops those silently.
+/// Derived at render time. Storing it on [`crate::atproto::ExternalEmbed`]
+/// would add a non-defaulted field, which fails every cached post's
+/// deserialize, and `cache::posts` drops those silently.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GifEmbed {
     /// An MP4 or WebM of the same animation, which `playbin3` can decode.
@@ -70,7 +70,7 @@ fn parse_klipy(url: &Url) -> Option<GifEmbed> {
     }
 
     let mut player = url.clone();
-    // Host and scheme set, not inherited.
+    // Overwrite scheme and host so the player URL never inherits them from the post.
     player.set_scheme("https").ok()?;
     player.set_host(Some(KLIPY_PLAYER_HOST)).ok()?;
     strip_metadata_params(&mut player);
@@ -235,7 +235,7 @@ mod tests {
 
     #[test]
     fn the_player_host_is_never_taken_from_the_post() {
-        // Scheme and host are set, not inherited, so an http link still comes
+        // detect() overwrites scheme and host, so an http link still comes
         // back as https on Bluesky's CDN.
         let gif = detect(&KLIPY.replace("https://", "http://")).expect("still a GIF");
         assert!(

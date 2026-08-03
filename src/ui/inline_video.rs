@@ -158,8 +158,8 @@ impl VideoSlot {
         source: VideoSource,
     ) -> Rc<Self> {
         let error_label = gtk4::Label::new(None);
-        // GtkOverlay does not measure overlay children, and this is capped and
-        // ellipsized anyway - an inline failure must not widen the window.
+        // GtkOverlay does not measure overlay children. Capped and ellipsized
+        // anyway so an inline failure cannot widen the window.
         error_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         error_label.set_max_width_chars(28);
 
@@ -172,8 +172,8 @@ impl VideoSlot {
         error_banner.set_visible(false);
         error_banner.append(&error_label);
 
-        // The post URL, never the HLS playlist - a browser renders that as raw
-        // text. No URL, no button.
+        // The post URL. A browser renders the HLS playlist as raw text, so
+        // the button never opens that. Without a post URL no button is built.
         if let Some(url) = source.fallback_url.clone() {
             let open = gtk4::Button::with_label("Open");
             open.add_css_class("flat");
@@ -387,13 +387,13 @@ pub struct VideoDirector {
     /// Cached so arming does not read the settings file on every scroll.
     volume: Cell<f64>,
     /// Once an autoplayed video is unmuted, later ones start unmuted.
-    /// Session-only, not persisted.
+    /// Session-only state; never written to settings.
     unmuted_by_user: Cell<bool>,
     /// How many dialogs hold the one pipeline.
     ///
-    /// Counted rather than a flag. The viewer opens from a quoted video, a GIF
-    /// and the inline fullscreen button, so two dialogs can overlap and the
-    /// first to close must not release the second's hold.
+    /// The viewer opens from a quoted video, a GIF and the inline fullscreen
+    /// button, so two dialogs can overlap. A boolean would release the second
+    /// dialog's hold when the first closed.
     dialog_holds: Cell<usize>,
     /// Where one video got to, so scrolling back to it does not start it over.
     /// One entry; a map would grow for the length of the session.
@@ -424,8 +424,8 @@ impl VideoDirector {
         self.autoplay.get()
     }
 
-    /// Apply a new autoplay mode. No refetch - the feed contents do not change,
-    /// and a refetch would lose the scroll position.
+    /// Apply a new autoplay mode without refetching. The feed contents do not
+    /// change, and a refetch would lose the scroll position.
     pub fn set_autoplay(self: &Rc<Self>, mode: VideoAutoplay) {
         self.autoplay.set(mode);
         if mode.enabled() {
@@ -451,8 +451,8 @@ impl VideoDirector {
     /// A dialog is taking the pipeline. Balanced by exactly one
     /// [`Self::dialog_closed`].
     ///
-    /// Do not call this on a page switch - that refused the play button on five
-    /// pages.
+    /// Never call this on a page switch. That mistake refused the play button
+    /// on five pages.
     pub fn dialog_opened(&self) {
         self.dialog_holds.set(self.dialog_holds.get() + 1);
         self.release_current();
@@ -522,19 +522,19 @@ impl VideoDirector {
     /// Build a pipeline for `slot`, after taking down whatever was playing.
     pub fn arm(self: &Rc<Self>, slot: &Rc<VideoSlot>, intent: Intent) {
         if self.dialog_holds.get() > 0 {
-            // A dialog owns the pipeline. Manual is refused too - the dialog's
-            // player is not ours to tear down.
+            // A dialog owns the pipeline, so even a manual press is refused;
+            // the dialog's player is not ours to tear down.
             //
             // Do not refuse here for "wrong page"; that made the play button
             // inert on Profile, Likes, Search, Mentions and Activity.
             return;
         }
-        // Down before up. Two decoders at once posts a bus ERROR, not a
-        // slowdown.
+        // Tear down the old pipeline first. Two decoders at once does not
+        // just slow down; it posts a bus ERROR.
         self.release_current();
 
-        // Checked in release, not debug_assert: a survivor is only attributable
-        // here, not a hundred rows of scroll later.
+        // Checked in release builds too. A survivor is only attributable at
+        // this point, before another hundred rows of scroll.
         let survivors = crate::media::live_pipelines();
         if survivors > 0 {
             eprintln!(
@@ -612,7 +612,7 @@ impl VideoDirector {
     /// Where `slot` sits in the timeline: how much shows, and how far down.
     ///
     /// `None` when it is not in the timeline at all (a thread or profile page);
-    /// those are torn down by unbind/unmap, not by the election.
+    /// unbind/unmap tear those down and the election never touches them.
     /// `Some(0.0, _)` is in the feed but off screen, which the release check
     /// does act on.
     fn geometry_of(&self, slot: &VideoSlot) -> Option<(f64, f64)> {
@@ -624,10 +624,9 @@ impl VideoDirector {
         }
 
         let viewport_height = f64::from(scrolled.height());
-        // In the feed, not mapped. compute_bounds answers from the last
-        // allocation, so a row on a hidden GtkStack page keeps the rectangle it
-        // had when visible - it reported 1.00 and could never fall below
-        // RELEASE_FRACTION.
+        // In the feed but unmapped. compute_bounds answers from the last
+        // allocation, so a row on a hidden GtkStack page kept its visible-time
+        // rectangle, reported 1.00, and never fell below RELEASE_FRACTION.
         let unseen = Some((0.0, viewport_height));
         if !scrolled.is_mapped() || !slot.root.is_mapped() {
             return unseen;
@@ -653,8 +652,8 @@ impl VideoDirector {
     }
 
     fn candidates(&self) -> Vec<Candidate> {
-        // Cloned, not borrowed: measuring touches widgets and can re-enter this
-        // RefCell.
+        // Clone the list first. Measuring touches widgets and can re-enter
+        // this RefCell.
         let slots = self.slots.borrow().clone();
         slots
             .iter()
@@ -672,7 +671,7 @@ impl VideoDirector {
 
     fn prune(&self) {
         self.slots.borrow_mut().retain(|(_, weak)| {
-            // strong_count, not upgrade: must not resurrect a slot.
+            // strong_count check only; an upgrade here could resurrect a slot.
             weak.strong_count() > 0
         });
     }
@@ -713,7 +712,7 @@ impl VideoDirector {
         if let Some(slot) = self.current_slot() {
             match self.visible_fraction_of(&slot) {
                 // Not in the timeline: a thread or profile page. unbind and
-                // unmap tear those down, not the election.
+                // unmap tear those down; the election leaves them alone.
                 None => return,
                 Some(fraction) => {
                     if fraction < RELEASE_FRACTION {
@@ -959,7 +958,7 @@ mod tests {
         assert_eq!(media::live_pipelines(), 1, "manual play builds a pipeline");
         assert_eq!(director.current_id(), Some(slot.id()));
 
-        // No release_video, no unbind, no unmap: just the row going away.
+        // Nothing calls release_video, unbind, or unmap; the row just goes away.
         drop(slot);
         assert_eq!(media::live_pipelines(), 0);
         assert_eq!(
@@ -1119,7 +1118,7 @@ mod tests {
                 row.set_widget_name(&name);
             }
         });
-        // The production wiring itself, not a copy of it.
+        // The test exercises the shipped release_video_on_unbind wiring itself.
         crate::ui::HangarWindow::release_video_on_unbind(&factory);
 
         let list = gtk4::ListView::new(Some(gtk4::NoSelection::new(Some(model))), Some(factory));
@@ -1345,7 +1344,7 @@ mod tests {
 
     /// Autoplay must never arm a post that is not on screen.
     ///
-    /// Checked by hit test ([`posts_rendered_in`]) - comparing rectangles was
+    /// Checked by hit test ([`posts_rendered_in`]). Comparing rectangles was
     /// intermittently red because of pool rows, see [`row_geometry`]. Both
     /// layouts swept: `Recycling` has the pool, `Clamped` is what ships.
     #[test]
@@ -1508,7 +1507,7 @@ mod tests {
         director.page_changed();
     }
 
-    /// Pressing play must work on every page, not just Home.
+    /// Pressing play must work on every page; it once failed everywhere but Home.
     #[test]
     fn pressing_play_off_the_home_page_plays_the_video() {
         with_gtk(pressing_play_off_the_home_page_plays_the_video_body);
@@ -1572,7 +1571,7 @@ mod tests {
             "pressing play on a page that is not Home did nothing at all: \
              (pipelines, dialogs) per press = {outcomes:?}"
         );
-        // And in place, not in the viewer.
+        // And it must play in place; a dialog would show up as d == 1.
         assert!(
             outcomes.iter().all(|(p, d)| *p == 1 && *d == 0),
             "pressing play off Home opened a dialog instead of playing in \
@@ -2119,9 +2118,9 @@ mod tests {
 
     /// Key controllers on widgets we built.
     ///
-    /// GTK's own are skipped - GtkButton's is what makes Space activate,
-    /// GtkRange's what makes the arrows scrub, GtkPopover's what makes Escape
-    /// close. The boxes, overlays and frames in between must have none.
+    /// GTK's own controllers are skipped. GtkButton's makes Space activate,
+    /// GtkRange's makes the arrows scrub, and GtkPopover's makes Escape close.
+    /// The boxes, overlays and frames in between must have none.
     fn collect_key_controllers(widget: gtk4::Widget, out: &mut Vec<String>) {
         let is_gtk_control = widget.is::<gtk4::Button>()          // and GtkToggleButton
             || widget.is::<gtk4::MenuButton>()

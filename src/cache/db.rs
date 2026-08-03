@@ -76,7 +76,7 @@ impl CacheDb {
         let conn = self.conn();
         let now = Self::now();
 
-        // Feed items older than 24 hours - the feed order is stale
+        // Feed items expire after 24 hours; the ordering is stale by then
         let feed_cutoff = now - (24 * 60 * 60);
         conn.execute("DELETE FROM feed_items WHERE fetched_at < ?", [feed_cutoff])?;
 

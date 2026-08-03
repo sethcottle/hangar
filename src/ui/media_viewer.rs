@@ -23,7 +23,8 @@ use std::rc::Rc;
 const ZOOM_STEP: f64 = 1.25;
 
 /// 8 screen pixels per image pixel. Also stops a held key asking GTK for a
-/// million-pixel widget. No minimum - zooming out stops at fitted.
+/// million-pixel widget. Zooming out has no separate minimum; it stops at the
+/// fitted scale.
 const ZOOM_MAX: f64 = 8.0;
 
 /// Modifiers that mean a keypress belongs to somebody else.
@@ -59,9 +60,10 @@ pub fn show_video_at(parent: &impl IsA<gtk4::Widget>, source: VideoSource, start
         None => return,
     };
 
-    // One pipeline per process: stop whatever the feed is playing. The hold is
-    // a count, so this and the `dialog_closed` below must pair - a quoted video
-    // and a GIF both reach here from any page.
+    // One pipeline per process: stop whatever the feed is playing. The hold
+    // is a count, so every `dialog_opened` here needs the matching
+    // `dialog_closed` below; a quoted video and a GIF both reach here from any
+    // page.
     let director = crate::ui::inline_video::director();
     if let Some(director) = director.as_ref() {
         director.dialog_opened();
@@ -167,9 +169,9 @@ impl ImageViewer {
         picture.set_hexpand(true);
         picture.set_vexpand(true);
 
-        // GtkPicture can shrink to nothing, so while no zoom is set the
-        // viewport hands it exactly the visible area and Contain letterboxes
-        // inside that -- no scrollbars until a zoom asks for room.
+        // GtkPicture can shrink to nothing, so at no zoom the viewport
+        // hands it the visible area and Contain letterboxes inside it.
+        // Scrollbars only appear once a zoom asks for more room.
         let scroller = gtk4::ScrolledWindow::new();
         scroller.set_child(Some(&picture));
         scroller.set_hexpand(true);
@@ -386,8 +388,9 @@ impl ImageViewer {
         let total = self.images.len();
 
         let key = gtk4::EventControllerKey::new();
-        // Capture, not bubble: a focused header button claims Left and Right
-        // for focus navigation before a bubbling controller sees them.
+        // Runs in the capture phase because a focused header button claims
+        // Left and Right for focus navigation before a bubbling controller
+        // sees them.
         key.set_propagation_phase(gtk4::PropagationPhase::Capture);
         key.connect_key_pressed({
             let weak = Rc::downgrade(self);
@@ -548,8 +551,8 @@ impl ImageViewer {
         self.apply();
     }
 
-    /// Fitted scale, and the floor for zooming out - the viewport never hands
-    /// the picture less than the visible area.
+    /// The fitted scale. Zooming out floors here, so the picture never gets
+    /// less than the visible area.
     fn fit_scale(&self) -> Option<f64> {
         let texture = self.texture()?;
         let (width, height) = (texture.width() as f64, texture.height() as f64);
@@ -569,7 +572,7 @@ impl ImageViewer {
         };
         let target = (self.zoom.get().unwrap_or(fit) * factor).min(ZOOM_MAX);
         if target <= fit {
-            // All the way out is the fitted state, not an equivalent number.
+            // At or below fit, drop back to the fitted state instead of storing a number.
             self.zoom_reset();
             return;
         }
@@ -605,8 +608,8 @@ impl ImageViewer {
             }
         }
 
-        // The zoom level belongs in the subtitle, not in a toast: it changes on
-        // every scroll notch, and a toast per notch would bury the image.
+        // The zoom level goes in the subtitle because it changes on every
+        // scroll notch; a toast per notch would bury the image.
         self.title.set_subtitle(&match self.zoom.get() {
             Some(zoom) => format!("{}%", (zoom * 100.0).round()),
             None => String::new(),
@@ -614,8 +617,8 @@ impl ImageViewer {
     }
 
     fn copy_url(&self) {
-        // The embed's own URL, not avatar_cache's `@jpeg`-normalised cache key.
-        // This is the link a person pastes somewhere else.
+        // Copies the embed's own URL. avatar_cache's `@jpeg`-normalised cache
+        // key is not a link a person would paste elsewhere.
         external::copy_text(&self.picture, &self.current().fullsize, "Image link");
     }
 
@@ -626,8 +629,8 @@ impl ImageViewer {
         };
         // GTK assembles the union content provider behind this, so the paste
         // side is offered PNG, JPEG, TIFF and GdkPixbuf without us building one.
-        // The clipboard is served lazily by this process, so the copy does not
-        // outlive Hangar -- nothing persists it on Wayland once we quit.
+        // The clipboard is served lazily by this process. On Wayland
+        // nothing persists it, so the copy is gone once Hangar quits.
         self.picture.display().clipboard().set_texture(&texture);
         external::toast(&self.picture, "Image copied to clipboard");
     }
@@ -676,7 +679,7 @@ impl ImageViewer {
             };
             match result {
                 Ok(file) => viewer.write_image(file, bytes),
-                // Closing the picker is ordinary behaviour, not a failure.
+                // The user closed the picker; nothing went wrong.
                 Err(e) if e.matches(gtk4::DialogError::Dismissed) => {}
                 Err(e) => {
                     eprintln!("Save dialog failed: {e}");
@@ -724,7 +727,7 @@ impl ImageViewer {
         );
     }
 
-    /// The window the dialog is presented over, weakly.
+    /// Weak ref to the window the dialog is presented over.
     fn root_window(&self) -> glib::WeakRef<gtk4::Window> {
         self.dialog
             .root()

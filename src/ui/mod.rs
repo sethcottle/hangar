@@ -21,12 +21,12 @@ pub use window::HangarWindow;
 /// Run a test body on the one GTK thread, or skip if there is no display.
 ///
 /// GTK may only be used from the thread that initialised it, and the harness
-/// gives every `#[test]` its own - `gtk4::init` from a second panics. Tests that
-/// called `init` directly raced: the loser got an `Err` and skipped itself as
-/// though headless.
+/// gives every `#[test]` its own thread; `gtk4::init` from a second one panics.
+/// Tests that called `init` directly raced: the loser got an `Err` and skipped
+/// itself as though headless.
 ///
-/// Not `#[gtk4::test]`: that panics when GTK cannot start, and headless CI has
-/// nothing to assert.
+/// `#[gtk4::test]` was rejected here because it panics when GTK cannot start,
+/// and headless CI has nothing to assert.
 #[cfg(test)]
 pub(crate) fn with_gtk<F: FnOnce() + Send + 'static>(body: F) {
     use std::sync::{OnceLock, mpsc};

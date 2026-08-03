@@ -15,7 +15,7 @@ use crate::atproto::Profile;
 /// Post content column width at the timeline's 800px `AdwClamp`.
 ///
 /// An estimate: the real column is 495px in a 700px window, 633 at 820, ~684
-/// once the clamp binds - and the height has to be requested before any of that
+/// once the clamp binds, and the height has to be requested before any of that
 /// is known. Tuned narrow; [`PostRow::embed_height`] clamps the error.
 const CONTENT_WIDTH: f64 = 540.0;
 
@@ -197,7 +197,8 @@ impl PostRow {
         let content_column = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
         content_column.set_hexpand(true);
 
-        // Repost attribution row (above header, shows "Reposted by X") - clickable to go to reposter's profile
+        // Repost attribution row above the header, shows "Reposted by X".
+        // Clicking goes to the reposter's profile.
         let repost_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
         repost_row.set_margin_bottom(2);
         repost_row.add_css_class("repost-attribution");
@@ -275,7 +276,8 @@ impl PostRow {
 
         content_column.append(&header);
 
-        // Reply indicator (shows "Replying to @handle") - below header, above content - clickable
+        // Reply indicator between header and content, shows "Replying to
+        // @handle". Clickable.
         let reply_indicator_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
         reply_indicator_box.set_margin_top(2);
         reply_indicator_box.set_margin_bottom(4);
@@ -327,7 +329,7 @@ impl PostRow {
         let post_row_for_links = self.clone();
         content.connect_activate_link(move |label, uri| {
             if uri.starts_with("bsky-mention://") {
-                // Handle @mention click - navigate to profile
+                // An @mention click navigates to the profile
                 let handle = uri.strip_prefix("bsky-mention://").unwrap_or("");
                 let imp = post_row_for_links.imp();
                 if let Some(cb) = imp.mention_clicked_callback.borrow().as_ref() {
@@ -335,12 +337,12 @@ impl PostRow {
                 }
                 glib::Propagation::Stop // We handled it
             } else if uri.starts_with("bsky-tag://") {
-                // Handle hashtag click - could open search in future
+                // Hashtag click. No navigation yet.
                 let _tag = uri.strip_prefix("bsky-tag://").unwrap_or("");
                 // TODO: Implement hashtag search navigation
                 glib::Propagation::Stop
             } else {
-                // Regular URL - open in browser
+                // A regular URL opens in the browser
                 crate::ui::external::open_url(label, uri, "link");
                 glib::Propagation::Stop
             }
@@ -833,7 +835,7 @@ impl PostRow {
             main_box.set_cursor_from_name(Some("pointer"));
         }
 
-        // Show/hide repost attribution with avatar - clickable to go to reposter's profile
+        // Show or hide the repost attribution. Clicking goes to the reposter's profile.
         if let Some(repost_row) = imp.repost_row.borrow().as_ref() {
             // Outside the branch. A row recycled from a repost onto a post
             // nobody reposted must not keep the old reposter wired to a button
@@ -881,7 +883,7 @@ impl PostRow {
             }
         }
 
-        // Show/hide reply indicator - clickable to go to parent author's profile
+        // Show or hide the reply indicator. Clicking goes to the parent author's profile.
         if let Some(reply_indicator_box) = imp.reply_indicator_box.borrow().as_ref() {
             // As above. Off first, whether or not this post puts one back.
             if let Some(btn) = imp.reply_indicator.borrow().as_ref() {
@@ -1059,7 +1061,7 @@ impl PostRow {
             .as_ref()
             .and_then(|m| m.popover());
 
-        // View Post action - uses existing post_clicked_callback
+        // The View Post action reuses post_clicked_callback
         if let Some(view_item) = imp.view_post_item.borrow().as_ref() {
             let post_row = self.downgrade();
             let popover_clone = popover.clone();
@@ -1149,8 +1151,8 @@ impl PostRow {
     /// old embed's widgets go. Public because a `SignalListItemFactory` has
     /// nothing but the row to call.
     pub fn release_video(&self) {
-        // Taken, not borrowed: dropping the last `Rc` runs `VideoSlot::drop`,
-        // which can re-enter this `RefCell`.
+        // take() ends the borrow before the drop. Dropping the last `Rc` runs
+        // `VideoSlot::drop`, which can re-enter this `RefCell`.
         let slot = self.imp().video_slot.borrow_mut().take();
         drop(slot);
     }
@@ -1190,8 +1192,8 @@ impl PostRow {
         match images.len() {
             0 => return,
             1 => {
-                // Height from the image's own aspect ratio, not a fixed 400px
-                // box.
+                // The height comes from the image's own aspect ratio instead
+                // of a fixed 400px box.
                 let img = &images[0];
 
                 let frame = gtk4::Frame::new(None);
@@ -1206,8 +1208,8 @@ impl PostRow {
                 picture.set_hexpand(true);
                 picture.set_vexpand(true);
                 // Without can_shrink the minimum width is the image's full
-                // width, which widens the window - the timeline has no
-                // horizontal scrollbar.
+                // width. The timeline has no horizontal scrollbar, so that
+                // widens the whole window.
                 picture.set_can_shrink(true);
                 // Contain: a lone image has nothing to line up with. Cover
                 // discarded 57% of a 2:3 portrait and 27% of a 16:9 landscape
@@ -1236,7 +1238,7 @@ impl PostRow {
                 let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
                 row.set_homogeneous(true);
 
-                // Left image - tall (spans both rows visually)
+                // Left image, tall, visually spanning both rows
                 let left = self.create_image_cell(&images[0].thumb, 300);
                 Self::attach_image_click(&left, images, 0);
                 row.append(&left);
@@ -1309,8 +1311,8 @@ impl PostRow {
         frame.set_overflow(gtk4::Overflow::Hidden);
         frame.add_css_class("post-embed-image");
 
-        // Cover fills the cell. Fill ignored the aspect ratio - a 2:3 portrait
-        // in a 338x240 cell came out 2.4x too wide.
+        // Cover fills the cell. Fill ignored the aspect ratio and stretched a
+        // 2:3 portrait in a 338x240 cell 2.4x too wide.
         let picture = gtk4::Picture::new();
         picture.set_hexpand(true);
         picture.set_vexpand(true);
@@ -1345,14 +1347,14 @@ impl PostRow {
         // Lets the card's border-radius clip the thumbnail's top corners.
         card.set_overflow(gtk4::Overflow::Hidden);
 
-        // Thumbnail (if available) - full card width, capped height
+        // Optional thumbnail spanning the card width, height capped
         if let Some(thumb_url) = &ext.thumb {
             let thumb_frame = gtk4::Frame::new(None);
             thumb_frame.set_hexpand(true);
             thumb_frame.set_overflow(gtk4::Overflow::Hidden);
             thumb_frame.add_css_class("external-thumb-top");
-            // Height only. A width request here would become the card's - and
-            // so the feed's - minimum width.
+            // Height only. A width request here would become the minimum
+            // width of the card and then the feed.
             thumb_frame.set_size_request(-1, 180);
 
             let thumb = gtk4::Picture::new();
@@ -1450,8 +1452,8 @@ impl PostRow {
 
     /// Render an animated GIF that arrived as an external embed.
     ///
-    /// Still frame + badge + play button, not an inline pipeline - one
-    /// `playbin3` per visible GIF in a recycled `ListView` is a pipeline per
+    /// Still frame + badge + play button. An inline pipeline here would mean
+    /// one `playbin3` per visible GIF in a recycled `ListView`, a pipeline per
     /// row. Clicking opens the media viewer.
     fn render_gif(
         &self,
@@ -1544,9 +1546,9 @@ impl PostRow {
         overlay.add_css_class("video-embed");
         overlay.set_hexpand(true);
 
-        // The height goes on a clipping frame, not the Picture: a Picture given
-        // more width than its Contain-scaled image needs centres the result,
-        // and there is no property to align it left.
+        // The height goes on a clipping frame. A Picture given more width
+        // than its Contain-scaled image needs centres the result, and there is
+        // no property to align it left.
         let frame = gtk4::Frame::new(None);
         frame.set_hexpand(true);
         frame.set_overflow(gtk4::Overflow::Hidden);
@@ -1557,9 +1559,9 @@ impl PostRow {
         thumb.set_hexpand(true);
         thumb.set_vexpand(true);
         thumb.set_can_shrink(true);
-        // Contain, same as a lone image - the frame's height already comes from
-        // this video's aspect ratio, so it fills edge to edge. Grid cells keep
-        // Cover; see `create_image_cell`.
+        // Contain, same as a lone image. The frame's height already comes
+        // from this video's aspect ratio, so it fills edge to edge. Grid cells
+        // keep Cover; see `create_image_cell`.
         thumb.set_content_fit(gtk4::ContentFit::Contain);
         if let Some(alt) = video
             .alt
@@ -1613,11 +1615,12 @@ impl PostRow {
 
     /// Render a quote post card (clickable to open quoted post)
     fn render_quote(&self, container: &gtk4::Box, quote: &crate::atproto::QuoteEmbed) {
-        // A Box, not a Button. GtkButton's click gesture runs in CAPTURE and
-        // claims on release, and capture is walked ancestors-first - so a button
-        // wrapping the card claimed the release before the play button, images
-        // or link card inside it, and they navigated instead of activating. A
-        // bubble-phase gesture on a Box is walked descendants-first.
+        // Deliberately a Box. GtkButton's click gesture runs in CAPTURE and
+        // claims on release, and capture is walked ancestors-first, so a
+        // button wrapping the card claimed the release before the play button,
+        // images or link card inside it, and they navigated instead of
+        // activating. A bubble-phase gesture on a Box is walked
+        // descendants-first.
         //
         // The accessible role must be set at construction; GTK cannot change it
         // later.
@@ -1801,8 +1804,8 @@ impl PostRow {
     /// and changes nothing, so a recycled row keeps the previous post's text.
     /// Clear, set markup, and if nothing arrived set it unformatted.
     ///
-    /// Checked through the label, not `pango::parse_markup`: GtkLabel runs its
-    /// own parser first and strips the `<a>` tags Pango would reject.
+    /// Checked through the label itself. GtkLabel runs its own parser first
+    /// and strips the `<a>` tags `pango::parse_markup` would reject.
     fn set_post_markup(label: &gtk4::Label, text: &str) {
         let markup = Self::format_post_text(text);
         label.set_text("");
@@ -1877,8 +1880,8 @@ impl PostRow {
     /// other way round: with escaping first, a pattern can match inside an
     /// entity the escaper just produced. GLib escapes U+001F as `&#x1f;`, the
     /// hashtag pattern took `#x1f` out of the middle, and Pango then rejected
-    /// the whole string with "Entity did not end with a semicolon" - blank
-    /// post.
+    /// the whole string with "Entity did not end with a semicolon", leaving a
+    /// blank post.
     fn format_post_text(text: &str) -> String {
         let links = Self::text_links(text);
         let mut out = String::with_capacity(text.len() + links.len() * 48);
@@ -1959,7 +1962,7 @@ mod tests {
         assert!(!collapsed.contains('\n'), "no paragraph breaks survive");
         assert!(collapsed.starts_with("• Feature bullet 1 • Feature bullet 2"));
 
-        // Every flavour of wire whitespace, not just \n.
+        // Every flavour of wire whitespace: \r\n, tabs, U+2028, runs of spaces.
         assert_eq!(
             PostRow::collapse_whitespace("a\r\nb\tc\u{2028}d  e\n\n\nf"),
             "a b c d e f"
@@ -2059,8 +2062,8 @@ mod tests {
             );
         }
 
-        // And the fallback itself works, for whatever gets past the escaper
-        // next. Handed markup nothing can parse, the label still shows text.
+        // If unparseable markup ever reaches the label, it should still
+        // show the text instead of going blank.
         label.set_text("a previous post, from before this row was recycled");
         label.set_markup("broken &markup <a href=\"x\">");
         assert!(
@@ -2094,7 +2097,7 @@ mod tests {
             "{markup}"
         );
 
-        // A handle is a mention, not a website, even though `.social` is in
+        // A handle must come out as a mention even though `.social` is in
         // the bare-domain TLD list.
         let markup = PostRow::format_post_text("@someone.bsky.social");
         assert!(

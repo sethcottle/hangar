@@ -137,7 +137,7 @@ fn is_emoji(ch: char) -> bool {
         // Miscellaneous Technical (⌚ ⏰ etc.)
         0x2300..=0x23FF |
         0x25AA..=0x25AB | 0x25B6 | 0x25C0 | 0x25FB..=0x25FE |
-        // Miscellaneous Symbols & Dingbats (☀️–✿)
+        // Miscellaneous Symbols & Dingbats (U+2600..U+27BF)
         0x2600..=0x27BF |
         0x2934..=0x2935 |
         0x2B05..=0x2B07 | 0x2B1B..=0x2B1C | 0x2B50..=0x2B55 |
@@ -224,7 +224,7 @@ mod imp {
         // Content warning
         pub cw_button: RefCell<Option<gtk4::Button>>,
         pub content_warning: RefCell<Option<String>>,
-        // Interaction settings — button shows dynamic text like "Everyone can reply"
+        // Interaction settings. The button text is dynamic, e.g. "Everyone can reply".
         pub interaction_label: RefCell<Option<gtk4::Button>>,
         pub threadgate_config: RefCell<Option<crate::atproto::ThreadgateConfig>>,
         pub postgate_config: RefCell<Option<crate::atproto::PostgateConfig>>,
@@ -233,7 +233,7 @@ mod imp {
         pub link_card_data: RefCell<Option<LinkCardData>>,
         /// The URL we've already fetched or are fetching (to avoid duplicate requests)
         pub link_preview_url: RefCell<Option<String>>,
-        /// User dismissed the link card — don't re-fetch until text changes the URL
+        /// Set when the user dismissed the link card. No re-fetch until the text changes the URL.
         pub link_preview_dismissed: Cell<bool>,
         /// Callback to fetch link card metadata (called with URL string)
         pub link_preview_fetch_callback: RefCell<Option<Box<dyn Fn(String) + 'static>>>,
@@ -242,7 +242,7 @@ mod imp {
         // Thread composer
         /// Container holding all thread post blocks
         pub thread_container: RefCell<Option<gtk4::Box>>,
-        /// Additional thread posts (Post 2, 3, ... — Post 1 is the main text_view)
+        /// Additional thread posts (Post 2 onward; Post 1 is the main text_view)
         pub thread_posts: RefCell<Vec<ThreadPostBlock>>,
         /// "Add to thread" button
         pub add_thread_button: RefCell<Option<gtk4::Button>>,
@@ -474,7 +474,7 @@ impl ComposeDialog {
         ))]);
         status_row.append(&lang_btn);
 
-        // Interaction settings button — shows dynamic text
+        // Interaction settings button with dynamic text
         let settings = AppSettings::load();
         let initial_interaction_text = Self::interaction_summary_text(&settings.default_threadgate);
         let interaction_btn = gtk4::Button::with_label(&initial_interaction_text);
@@ -534,7 +534,7 @@ impl ComposeDialog {
             }
         };
 
-        // All facet tags use accent color only — no extra weight, consistent with
+        // All facet tags use accent color with no extra weight, matching the
         // surrounding text. URLs additionally get an underline per WCAG 1.4.1.
         let mention_tag = gtk4::TextTag::new(Some(TAG_MENTION));
         mention_tag.set_foreground_rgba(Some(&accent));
@@ -674,7 +674,7 @@ impl ComposeDialog {
         link_preview_box.set_visible(false);
         content.append(&link_preview_box);
 
-        // Character counter for main post — right-aligned
+        // Character counter for the main post, right-aligned
         let char_counter = gtk4::Label::new(Some(&MAX_GRAPHEMES.to_string()));
         char_counter.set_halign(gtk4::Align::End);
         char_counter.add_css_class("dim-label");
@@ -709,7 +709,7 @@ impl ComposeDialog {
 
         content.append(&main_action_row);
 
-        // Wire up add image button — targets the currently focused post
+        // The add-image button targets the currently focused post
         let dialog_weak = self.downgrade();
         add_image_btn.connect_clicked(move |_| {
             if let Some(dialog) = dialog_weak.upgrade() {
@@ -730,7 +730,7 @@ impl ComposeDialog {
             }
         });
 
-        // Wire up content warning button — opens a dialog
+        // The content warning button opens a dialog
         let dialog_weak = self.downgrade();
         cw_btn.connect_clicked(move |_| {
             if let Some(dialog) = dialog_weak.upgrade() {
@@ -1134,7 +1134,7 @@ impl ComposeDialog {
             .clone()
             .unwrap_or_else(|| profile.handle.clone());
 
-        // Circular avatar — show initials immediately, load real image async
+        // Circular avatar. Initials show immediately; the real image loads async.
         let avatar = adw::Avatar::new(32, Some(&display_name), true);
         if let Some(url) = &profile.avatar {
             avatar_cache::load_avatar(avatar.clone(), url.clone());
@@ -1397,7 +1397,7 @@ impl ComposeDialog {
         imp.images.borrow_mut().push(compose_image);
         self.rebuild_image_strip();
         self.update_image_button_state();
-        // Images take precedence over link cards — hide link preview
+        // Images take precedence over link cards, so hide the link preview
         self.clear_link_preview();
 
         // Re-evaluate post button state (images allow posting without text)
@@ -1457,7 +1457,7 @@ impl ComposeDialog {
             });
             thumb_box.add_overlay(&remove_btn);
 
-            // ALT badge (bottom-left) — shown when alt text is set
+            // ALT badge in the bottom-left, shown when alt text is set
             if !img.alt_text.is_empty() {
                 let alt_badge = gtk4::Label::new(Some("ALT"));
                 alt_badge.add_css_class("compose-alt-badge");
@@ -1563,7 +1563,7 @@ impl ComposeDialog {
             }
         }
 
-        // Content warning button — update label text based on current CW
+        // Update the content warning button label from the current CW
         if let Some(btn) = imp.cw_button.borrow().as_ref() {
             btn.set_visible(has_images);
             if has_images {
@@ -2094,7 +2094,7 @@ impl ComposeDialog {
 
                 // Build threadgate config
                 if reply_switch_ref.is_active() {
-                    // Everyone can reply — no threadgate
+                    // Everyone can reply means no threadgate record
                     imp.threadgate_config.replace(None);
                 } else {
                     let mut rules = Vec::new();
@@ -2297,7 +2297,7 @@ impl ComposeDialog {
             }
         });
 
-        // Character counter — right-aligned
+        // Character counter, right-aligned
         let char_counter = gtk4::Label::new(Some(&MAX_GRAPHEMES.to_string()));
         char_counter.set_halign(gtk4::Align::End);
         char_counter.add_css_class("dim-label");
@@ -2989,7 +2989,7 @@ impl ComposeDialog {
         });
 
         let Some(url) = first_url else {
-            // No URL in text — clear any existing preview
+            // No URL in the text, so clear any existing preview
             self.clear_link_preview();
             imp.link_preview_url.replace(None);
             imp.link_preview_dismissed.set(false);
@@ -2999,11 +2999,11 @@ impl ComposeDialog {
         // Check if this URL is different from what we already fetched
         let current_url = imp.link_preview_url.borrow().clone();
         if current_url.as_deref() == Some(&url) {
-            // Same URL — keep existing preview (or dismissed state)
+            // Same URL: keep the existing preview (or dismissed state)
             return;
         }
 
-        // New URL — reset dismissed state
+        // New URL: reset the dismissed state
         imp.link_preview_dismissed.set(false);
         imp.link_preview_url.replace(Some(url.clone()));
 
@@ -3143,7 +3143,7 @@ impl ComposeDialog {
         preview_box.set_visible(true);
     }
 
-    /// User dismissed the link card — hide it and don't re-fetch the same URL.
+    /// The user dismissed the link card. Hide it and skip re-fetching the same URL.
     fn dismiss_link_card(&self) {
         let imp = self.imp();
         imp.link_preview_dismissed.set(true);
@@ -3210,7 +3210,7 @@ impl ComposeDialog {
         let threadgate = imp.threadgate_config.borrow().clone();
         let postgate = imp.postgate_config.borrow().clone();
 
-        // Link card (only when no images attached — images take precedence)
+        // Link card, only when no images are attached (images take precedence)
         let link_card = if images.is_empty() {
             imp.link_card_data.borrow().clone()
         } else {

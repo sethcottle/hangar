@@ -46,7 +46,7 @@
     min-height: 48px;
 }
 
-/* Post row styling - cleaner look without heavy card background */
+/* Post row styling. Cleaner look without a heavy card background. */
 .post-row {
     padding: 8px 16px 8px 12px;
     border-bottom: 1px solid alpha(@borders, 0.5);
@@ -73,7 +73,7 @@
     color: @accent_color;
 }
 
-/* Repost attribution styling - small text above the post */
+/* Repost attribution, the small text above the post */
 .post-row .repost-attribution {
     margin-bottom: 2px;
 }
@@ -142,13 +142,13 @@
     font-weight: 600;
 }
 
-/* Liked state - use accent color (blue by default, follows system theme) */
+/* Liked state uses the accent color (blue by default, follows system theme) */
 .flat.circular.liked,
 button.flat.circular.liked {
     color: @accent_color;
 }
 
-/* Reposted state - use accent color to match like button */
+/* Reposted state uses the accent color to match the like button */
 .flat.circular.reposted,
 menubutton.flat.circular.reposted > button {
     color: @accent_color;
@@ -308,7 +308,9 @@ popover.menu > contents {
 .video-inline-error {
     background-color: alpha(black, 0.75);
     color: white;
-    padding: 4px 8px;
+    /* 12px matches .video-controls. The flat Open button pads its own right
+       edge; at 8px the text side read as flush. */
+    padding: 6px 12px;
     border-radius: 8px;
 }
 
@@ -317,9 +319,9 @@ popover.menu > contents {
     font-size: 0.9em;
 }
 
-/* Quote post card. The clickable wrapper is a plain box, not a button, so
-   interactive controls inside the card can claim their own clicks - which
-   means it also needs its own focus ring. */
+/* Quote post card. The clickable wrapper is a plain box rather than a
+   button so interactive controls inside the card can claim their own
+   clicks, and that means it also needs its own focus ring. */
 .quote-card-button {
     padding: 0;
     border-radius: 12px;
@@ -433,7 +435,7 @@ popover.menu > contents {
    Accessibility Enhancements
    ============================================================ */
 
-/* Links in post content should be underlined (WCAG 1.4.1 - color alone not sufficient) */
+/* Links in post content are underlined; WCAG 1.4.1 says color alone is not enough */
 .post-row label a {
     text-decoration: underline;
 }
@@ -560,7 +562,7 @@ popover.mention-popover > contents {
     min-height: 72px;
 }
 
-/* Compose status row — right-aligned labels */
+/* Compose status row with right-aligned labels */
 .compose-status-row {
     margin-top: 2px;
     margin-bottom: 4px;

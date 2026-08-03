@@ -32,7 +32,7 @@ static AVATAR_CACHE: Lazy<Arc<RwLock<HashMap<String, Vec<u8>>>>> =
 static IN_FLIGHT: Lazy<Arc<RwLock<HashSet<String>>>> =
     Lazy::new(|| Arc::new(RwLock::new(HashSet::new())));
 
-/// Dedicated runtime for image fetching - isolated from main app runtime
+/// Dedicated runtime so image fetching stays off the main app runtime
 static IMAGE_RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -162,7 +162,7 @@ pub fn cached_bytes(url: &str) -> Option<Vec<u8>> {
 pub fn load_avatar(avatar: adw::Avatar, url: String) {
     let url = ensure_jpeg_format(&url);
 
-    // Check memory cache first — instant hit
+    // Check the memory cache first; hits return immediately
     if let Some(cached) = AVATAR_CACHE.read().unwrap().get(&url).cloned() {
         apply_avatar_bytes(&avatar, &cached);
         return;
@@ -278,7 +278,7 @@ fn start_picture_load(
         cancel_on_drop: true,
     };
 
-    // Check memory cache first — instant hit
+    // Check the memory cache first; hits return immediately
     if let Some(cached) = AVATAR_CACHE.read().unwrap().get(&url).cloned() {
         let result = decode_result(&picture, &cached);
         if let Some(done) = &on_done {

@@ -196,7 +196,7 @@ impl HangarClient {
     /// Forget whichever session is active.
     ///
     /// The client outlives the window, and so does the 30-second poll, so
-    /// without this the previous account's agent keeps making requests - and an
+    /// without this the previous account's agent keeps making requests. An
     /// OAuth agent that refreshes writes the whole session file back over
     /// whatever the next sign-in has written.
     pub fn sign_out(&self) {
@@ -311,8 +311,8 @@ impl HangarClient {
                 if let Err(e) = store.del(&did).await {
                     eprintln!("hangar: could not discard the unusable OAuth session: {e}");
                 }
-                // Returned, not latched: the caller is already waiting, and
-                // latching as well would raise it twice.
+                // Return the error without latching it. The caller is
+                // already waiting; latching as well would raise it twice.
                 return Err(ClientError::ReauthRequired);
             }
             Err(e) => {
@@ -657,7 +657,7 @@ impl HangarClient {
                     embed: nested_embed.map(Box::new),
                 })
             }
-            // ViewNotFound, ViewBlocked, ViewDetached - return None
+            // ViewNotFound, ViewBlocked, ViewDetached all map to None
             _ => None,
         }
     }
@@ -1121,7 +1121,7 @@ impl HangarClient {
                 if let Ok(did) = self.resolve_handle(handle).await {
                     resolved_dids.insert(handle.clone(), did);
                 }
-                // Failed resolutions silently skipped - no facet will be created
+                // A failed resolution is skipped and produces no facet
             }
         }
 

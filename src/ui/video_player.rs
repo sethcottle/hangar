@@ -38,7 +38,7 @@ const KEY_SEEK_SECONDS: f64 = 5.0;
 /// The scrubber's upper bound is the duration, so dragging fully right asks for
 /// exactly it. With KEY_UNIT the demuxer refuses that seek, and a refused
 /// flushing seek wedges playbin3 in ASYNC with a pending PAUSED that never
-/// resolves - no EOS, no bus message, frozen frame.
+/// resolves. There is no EOS and no bus message; the frame just freezes.
 ///
 /// ACCURATE does not help: seeking to exactly the duration wedged 2/2 runs.
 const SEEK_END_EPSILON: f64 = 0.05;
@@ -83,8 +83,8 @@ pub struct VideoSource {
     /// for a GIF.
     pub playlist_url: String,
     pub alt: Option<String>,
-    /// The post on the web, never the HLS playlist - a browser renders that as
-    /// raw text. `None` builds no browser button.
+    /// The post's web URL. A browser renders the HLS playlist as raw text,
+    /// so that never goes here. `None` builds no browser button.
     pub fallback_url: Option<String>,
     pub kind: MediaKind,
 }
@@ -102,7 +102,7 @@ impl VideoSource {
     /// A GIF, which has no HLS playlist and no audio track.
     ///
     /// Separate from [`Self::from_embed`]: a GIF arrives as an external link
-    /// card, not a [`crate::atproto::VideoEmbed`]. See
+    /// card and never has a [`crate::atproto::VideoEmbed`]. See
     /// [`crate::atproto::gif::detect`].
     pub fn from_gif(
         gif: &crate::atproto::GifEmbed,
@@ -132,8 +132,8 @@ pub enum Chrome {
 /// Everything about a player that is not the stream itself.
 pub struct PlayerConfig {
     pub chrome: Chrome,
-    /// Perceptual 0..=1. Passed in, not read from disk - inline players are
-    /// built on scroll.
+    /// Perceptual 0..=1. Supplied by the caller; inline players are built on
+    /// scroll, so this must not come from a disk read.
     pub volume: f64,
     /// Applied before the pipeline reaches PLAYING, so a muted start cannot
     /// leak a burst of audio.
@@ -329,9 +329,9 @@ impl VideoPlayer {
                 page.upcast()
             }
             Chrome::Inline => {
-                // Over the picture, not under it: the row's height is already
-                // derived from the video's aspect ratio, and a 40px bar beneath
-                // would grow the embed past it.
+                // The transport sits over the picture. The row's height is
+                // already derived from the video's aspect ratio, and a 40px
+                // bar beneath would grow the embed past it.
                 //
                 // GtkOverlay does not measure overlay children (measure-overlay
                 // defaults false), so the strip's minimum width never reaches
@@ -371,7 +371,7 @@ impl VideoPlayer {
                 crate::ui::external::open_url(btn, &url, "post");
             });
         } else {
-            // No URL, no button.
+            // Without a fallback URL the button stays hidden.
             open_btn.set_visible(false);
         }
 
@@ -440,8 +440,8 @@ impl VideoPlayer {
         });
 
         player.connect_controls();
-        // Set the toggle, not just the pipeline, so the icon and the m shortcut
-        // stay in step.
+        // Going through the toggle keeps the pipeline, the icon, and the m
+        // shortcut in step.
         if start_muted {
             player.mute_btn.set_active(true);
         }
@@ -456,7 +456,8 @@ impl VideoPlayer {
     ///
     /// Inline is width-constrained: 34 (play) + ~40 (scale) + ~70 (time) + 34
     /// (volume) + 34 (fullscreen) against a 495px column measured in a 700px
-    /// window - which is why volume is a popover, not a 110px slider.
+    /// window. That budget is why volume is a popover instead of a 110px
+    /// slider.
     fn build_transport(
         chrome: Chrome,
         play_btn: &gtk4::Button,
@@ -554,7 +555,7 @@ impl VideoPlayer {
 
     /// Attach Space / arrows / M to `widget`.
     ///
-    /// Dialog only - an inline player must not swallow the feed's keys. Inline
+    /// Dialog only. An inline player must not swallow the feed's keys. Inline
     /// gets its keyboard from ordinary focusable widgets instead: Tab walks
     /// play, scrubber, volume, fullscreen, and arrows scrub the focused
     /// GtkScale through the same `request_seek` path a drag uses.
@@ -788,9 +789,9 @@ impl VideoPlayer {
             MessageView::Eos(..) => {
                 if self.source.kind == MediaKind::Gif {
                     // playbin3 has no loop property, so seek back on EOS.
-                    // wants_playing stays true so PLAYING follows. This is the
-                    // bus watch, dropped with the player - no timer to outlive
-                    // it.
+                    // wants_playing stays true so PLAYING follows. This runs
+                    // in the bus watch, which drops with the player, so no
+                    // timer outlives it.
                     self.seek_to(0.0);
                     let _ = playbin.set_state(gst::State::Playing);
                 } else {
@@ -1126,7 +1127,7 @@ impl VideoPlayer {
             _ => seconds.max(0.0),
         };
 
-        // ACCURATE, not KEY_UNIT. KEY_UNIT alone snaps to the keyframe before
+        // ACCURATE is deliberate. KEY_UNIT alone snaps to the keyframe before
         // the target: on a 6-second-keyframe stream, asking for 10s landed at
         // 5.75s and the handle jumped backwards after every drag. Adding
         // SNAP_NEAREST fixes that but snaps forward past the middle of the last

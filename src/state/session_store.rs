@@ -89,7 +89,7 @@ impl FileSessionStore {
     /// `Ok(None)` means the session cannot be refreshed at all: either there is
     /// no row, or it was written before Hangar recorded the binding and the
     /// original `client_id` is gone for good. Callers must treat that as
-    /// "sign in again", not as a transient failure.
+    /// "sign in again"; retrying will never succeed.
     pub fn client_binding(&self, did: &Did) -> Result<Option<(String, Vec<Scope>)>, StoreError> {
         let guard = self.inner.lock().map_err(|_| StoreError::Lock)?;
         let Some(row) = guard.get(did) else {

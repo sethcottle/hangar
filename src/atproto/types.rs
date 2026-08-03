@@ -315,7 +315,7 @@ pub struct LinkCardData {
     pub thumb: Option<(Vec<u8>, String)>,
 }
 
-/// Threadgate configuration — controls who can reply to a post.
+/// Threadgate configuration. Controls who can reply to a post.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ThreadgateConfig {
     /// Which groups are allowed to reply. Empty vec = nobody can reply.
@@ -335,7 +335,7 @@ pub enum ThreadgateRule {
     FollowersRule,
 }
 
-/// Postgate configuration — controls quoting of a post.
+/// Postgate configuration. Controls quoting of a post.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PostgateConfig {
     /// If true, quoting this post is disabled.

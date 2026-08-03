@@ -117,7 +117,7 @@ impl Sidebar {
         // Accessible label for the navigation landmark
         self.update_property(&[gtk4::accessible::Property::Label("Main navigation")]);
 
-        // Avatar at top — clickable MenuButton with popover for Settings & Sign Out
+        // Avatar at top: a MenuButton whose popover holds Settings and Sign Out
         let avatar_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         avatar_box.set_margin_top(12);
         avatar_box.set_margin_bottom(8);

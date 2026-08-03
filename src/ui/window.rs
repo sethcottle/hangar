@@ -483,7 +483,7 @@ impl HangarWindow {
         let feed_list = gtk4::ListBox::new();
         feed_list.set_selection_mode(gtk4::SelectionMode::None);
 
-        // Connect row activation - close popover first, then fire callback
+        // Row activation closes the popover first, then fires the callback
         let popover_weak = popover.downgrade();
         feed_list.connect_row_activated(glib::clone!(
             #[weak(rename_to = window)]
@@ -686,9 +686,9 @@ impl HangarWindow {
 
         let scrolled = gtk4::ScrolledWindow::new();
         scrolled.set_vexpand(true);
-        // Never, not Automatic. This is a backstop - Never hands the rows'
-        // minimum width to the window instead of scrolling, so the ellipsized
-        // labels in PostRow are what keep it small.
+        // Horizontal policy Never is a backstop: it hands the rows' minimum
+        // width to the window instead of scrolling, so the ellipsized labels
+        // in PostRow are what keep it small.
         scrolled.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
         scrolled.set_child(Some(&clamp));
         overlay.set_child(Some(&scrolled));
@@ -783,7 +783,7 @@ impl HangarWindow {
                 let upper = adj.upper();
                 let page_size = adj.page_size();
 
-                // Re-arm, not elect: this fires per scroll frame.
+                // This fires per scroll frame, so only re-arm the debounce here.
                 win.schedule_video_election();
 
                 // Auto-hide "new posts" banner when user scrolls to top
@@ -819,9 +819,9 @@ impl HangarWindow {
 
     /// Make a `PostRow` factory give up its video when a row is recycled.
     ///
-    /// Every `PostRow` factory needs this, not just the timeline's: a video
-    /// started on the Likes page and scrolled past would otherwise keep its
-    /// decoder and bus watch bound to a rebound row. `release_video` is
+    /// Every `PostRow` factory needs this, the timeline's and the rest: a
+    /// video started on the Likes page and scrolled past would otherwise keep
+    /// its decoder and bus watch bound to a rebound row. `release_video` is
     /// idempotent.
     ///
     /// Fires constantly now that the lists virtualize. The own profile page
@@ -1061,7 +1061,7 @@ impl HangarWindow {
                 }
             }
 
-            // Clear and rebuild - this resets the ListView state properly
+            // Clear and rebuild to reset the ListView state
             model.remove_all();
             for post in all_posts {
                 let post_object = PostObject::new(post);
@@ -1358,7 +1358,7 @@ impl HangarWindow {
         }
     }
 
-    /// Switch to a top-level page (Home, Mentions, etc.) - no animation
+    /// Switch to a top-level page (Home, Mentions, etc.) with no animation.
     ///
     /// Each section keeps its own NavigationView, so selecting the section
     /// again has to unwind it. Without that, switching the GtkStack is a no-op
@@ -1380,7 +1380,7 @@ impl HangarWindow {
         content_box.set_hexpand(true);
 
         let header = adw::HeaderBar::new();
-        // Hide default title buttons - we'll add explicit window controls
+        // Hide the default title buttons; explicit window controls come later
         header.set_show_start_title_buttons(false);
         header.set_show_end_title_buttons(false);
 
@@ -1417,8 +1417,8 @@ impl HangarWindow {
             .cloned()
             .unwrap_or_else(|| main_post.clone());
 
-        // Create scrollable content - use a simple Box instead of multiple ListViews
-        // to avoid height calculation issues with nested scrolling
+        // Scrollable content in a single Box. Multiple ListViews had height
+        // calculation issues with nested scrolling.
         let scroll_content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         scroll_content.add_css_class("background");
 
@@ -1490,7 +1490,7 @@ impl HangarWindow {
                     .map(|cb| cb(post_clone.clone()));
             });
 
-            // Post click callback — always set so embedded quotes can navigate.
+            // The post click callback is always set so embedded quotes can navigate.
             // When !clickable (main post in thread), the row body click is
             // disabled via set_not_clickable(), but quote cards still fire this.
             {
@@ -1528,13 +1528,13 @@ impl HangarWindow {
             post_row
         };
 
-        // Add parent posts (if any) - these are clickable to navigate to them
+        // Parent posts, when present. Clicking one navigates to it.
         for post in parent_posts {
             let post_row = create_post_row(self, post);
             scroll_content.append(&post_row);
         }
 
-        // Add the main post - body click disabled since we're already viewing it
+        // The main post. Body click is disabled since we are already viewing it.
         let main_row = create_post_row(self, the_main_post.clone());
         main_row.set_not_clickable();
         scroll_content.append(&main_row);
@@ -1594,12 +1594,12 @@ impl HangarWindow {
 
         let scrolled = gtk4::ScrolledWindow::new();
         scrolled.set_vexpand(true);
-        // Disable horizontal scrolling - content should wrap/clip within the clamp
+        // No horizontal scrolling; content wraps or clips within the clamp
         scrolled.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
         scrolled.set_child(Some(&clamp));
         content_box.append(&scrolled);
 
-        // Don't set a tag - each thread is unique and we want to allow multiple in the stack
+        // No tag. Each thread is unique and several may sit in the stack.
         adw::NavigationPage::new(&content_box, "Thread")
     }
 
@@ -3641,8 +3641,8 @@ impl HangarWindow {
                 eprintln!("Failed to save settings: {e}");
             }
 
-            // No refetch, unlike Hide Replies: this changes behaviour, not
-            // contents. The director applies it live.
+            // No refetch needed here, unlike Hide Replies. The feed
+            // contents are the same and the director applies this live.
             if let Some(window) = window_weak.upgrade() {
                 let director = window.imp().video_director.borrow().clone();
                 if let Some(director) = director {
@@ -4060,9 +4060,9 @@ impl HangarWindow {
             }
         }
 
-        // `show_page`, not `switch_to_page`: returning from settings is not a
-        // section switch, so a thread or profile the user opened settings from
-        // has to survive the trip.
+        // `show_page` here. Returning from settings is not a section switch,
+        // so a thread or profile the user opened settings from has to survive
+        // the trip; `switch_to_page` would unwind it.
         self.show_page(&previous);
     }
 
@@ -4091,8 +4091,8 @@ impl HangarWindow {
 
         let scale = font_size.scale_factor();
 
-        // Scale text labels only — NOT the container itself, which would cause
-        // horizontal overflow from fixed-width child widgets (action buttons, etc.)
+        // Scale only the text labels. Scaling the container causes horizontal
+        // overflow from fixed-width child widgets such as the action buttons.
         let css = format!(
             r#"
 .post-row label {{
@@ -4708,7 +4708,7 @@ mod activity_row {
                 }
             }
 
-            // Action label - use Pango markup for bold name
+            // Action label, Pango markup so the name is bold
             if let Some(label) = imp.action_label.borrow().as_ref() {
                 let action_suffix = match notification.reason.as_str() {
                     "like" => "liked your post",
@@ -4968,7 +4968,7 @@ mod conversation_row {
         pub fn bind(&self, conversation: &Conversation, my_did: Option<&str>) {
             let imp = self.imp();
 
-            // Get the other participant(s) - filter out ourselves
+            // The other participants, with ourselves filtered out
             let other_member = conversation
                 .members
                 .iter()
@@ -5114,7 +5114,7 @@ mod tests {
         }
     }
 
-    /// The smallest `Post` that binds: no embed, no counts.
+    /// The smallest `Post` that binds; it has no embed and no counts.
     fn a_post(id: &str) -> Post {
         Post {
             uri: format!("at://did:plc:test/app.bsky.feed.post/{id}"),
@@ -5163,7 +5163,7 @@ mod tests {
     ///
     /// Two bubbling gestures, avatar and row. Bubble is walked
     /// descendants-first, so the avatar's is reached first and is the one that
-    /// claims. Checked structurally - the avatar's gesture must sit strictly
+    /// claims. The check is structural: the avatar's gesture must sit strictly
     /// deeper and nothing between may capture. Whether `set_state(Claimed)` is
     /// called needs synthesised input, which GTK4 does not expose.
     #[test]

@@ -120,7 +120,7 @@ impl OAuthManager {
     /// 1. Binds a localhost callback server on a random port
     /// 2. Creates an OAuthClient with that port's redirect URI
     /// 3. Gets the authorization URL
-    /// 4. Returns (auth_url, client, callback_rx) — caller opens browser and waits
+    /// 4. Returns (auth_url, client, callback_rx); the caller opens the browser and waits
     pub async fn start_auth(
         handle: &str,
         session_store: FileSessionStore,
@@ -144,9 +144,9 @@ impl OAuthManager {
         let redirect_uri = format!("http://127.0.0.1:{port}/callback");
         let scopes = Self::requested_scopes();
 
-        // atrium writes the session row itself when it exchanges the code, so
-        // the store has to be carrying the binding before the client is built
-        // -- there is no later point at which we could attach it to that row.
+        // atrium writes the session row itself when it exchanges the code.
+        // The store has to carry the binding before the client is built,
+        // because we never see that row again to attach it later.
         let session_store = session_store.with_client_binding(&redirect_uri, &scopes);
 
         // Build OAuth client with this specific redirect URI
@@ -199,7 +199,7 @@ impl OAuthManager {
                     }
                 }
                 Ok(None) | Err(_) => {
-                    // Timeout or error — server drops, caller will see channel disconnect
+                    // Timeout or error. The server drops and the caller sees the channel disconnect.
                 }
             }
         });
