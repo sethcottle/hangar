@@ -34,6 +34,21 @@ pub(crate) fn with_gtk<F: FnOnce() + Send + 'static>(body: F) {
     static WORKER: OnceLock<Option<gtk4::glib::ThreadPool>> = OnceLock::new();
 
     let worker = WORKER.get_or_init(|| {
+        // These tests open real windows. GTK prefers Wayland, so if
+        // WAYLAND_DISPLAY is set they end up on the actual desktop even under
+        // xvfb-run. Use ./scripts/test, or HANGAR_TEST_ON_THIS_DISPLAY=1 to
+        // watch them run.
+        if std::env::var_os("HANGAR_TEST_ON_THIS_DISPLAY").is_none()
+            && (std::env::var_os("WAYLAND_DISPLAY").is_some()
+                || std::env::var("DISPLAY").is_ok_and(|d| d == ":0" || d == ":0.0"))
+        {
+            eprintln!(
+                "refusing to open test windows on your session. \
+                 use ./scripts/test, or HANGAR_TEST_ON_THIS_DISPLAY=1 to override"
+            );
+            return None;
+        }
+
         let pool = gtk4::glib::ThreadPool::exclusive(1).ok()?;
         let (tx, rx) = mpsc::sync_channel(1);
         pool.push(move || {

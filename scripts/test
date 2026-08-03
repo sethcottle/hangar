@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Run the tests headless. GTK prefers Wayland, so xvfb alone isn't enough;
+# WAYLAND_DISPLAY has to go too or the windows land on the real session.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+command -v cargo >/dev/null || PATH="$HOME/.cargo/bin:$PATH"
+
+if command -v xvfb-run >/dev/null; then
+    exec env -u WAYLAND_DISPLAY GDK_BACKEND=x11 xvfb-run -a cargo test "$@"
+fi
+
+echo "xvfb-run not found. Install xvfb, or set HANGAR_TEST_ON_THIS_DISPLAY=1" >&2
+echo "to run against your own session." >&2
+exit 1
