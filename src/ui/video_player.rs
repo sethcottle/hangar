@@ -1,17 +1,12 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! A video player driven by Hangar's own GStreamer pipeline.
+//! GStreamer-backed video player widget: picture, transport, error page.
 //!
-//! The widget is a self-contained `GtkBox`: picture, transport controls, and an
-//! error page it switches to when the pipeline gives up. Keeping the chrome
-//! here rather than in the dialog is what lets a post row embed the same player
-//! inline without any of this being rewritten.
-//!
-//! [`Chrome`] is the one axis that differs between the two. A dialog is 900x620
-//! and can hold a transport bar and an `AdwStatusPage`; a timeline row is as
-//! wide as the window and sits in a scroller with no horizontal valve, so its
-//! transport has to be an *unmeasured* overlay and its failures have to be
-//! handed back to the row rather than drawn here. See [`Self::build_controls`].
+//! [`Chrome`] is the only axis that differs between the dialog and an inline
+//! row. A dialog is 900x620 and can hold a transport bar and an AdwStatusPage;
+//! a row sits in a scroller with no horizontal scrollbar, so its transport is
+//! an unmeasured overlay and its failures go back to the row. See
+//! [`VideoPlayer::build_controls`].
 
 use crate::media::{self, MediaError};
 use crate::state::{AppSettings, VideoVolume};
@@ -28,50 +23,35 @@ use std::time::Duration;
 /// How often the position slider and time label are refreshed.
 const TICK: Duration = Duration::from_millis(250);
 
-/// How long a slider drag has to settle before the pipeline is actually sought.
-///
-/// Every seek on an HLS stream is a flushing one that costs a segment fetch, so
-/// following the handle sample by sample would stall the whole drag.
+/// Drag settle before the pipeline is sought. Every HLS seek is a flushing one
+/// that costs a segment fetch.
 const SEEK_SETTLE: Duration = Duration::from_millis(150);
 
-/// How long the volume has to sit still before it is written to disk.
-///
-/// A slider drag emits a value per pixel; the level is app-wide, so it is worth
-/// persisting, but not worth a settings write per frame.
+/// Coalesce volume writes; a drag emits one value per pixel.
 const VOLUME_SETTLE: Duration = Duration::from_millis(500);
 
 /// How far the arrow keys move through a video.
 const KEY_SEEK_SECONDS: f64 = 5.0;
 
-/// How far short of the duration a seek is allowed to land.
+/// How far short of the duration a seek may land.
 ///
-/// Dragging the scrubber fully right asks for exactly the duration, because the
-/// adjustment's upper bound *is* the duration. Under the KEY_UNIT flags this
-/// player used to pass, the demuxer refuses that seek, and a refused flushing
-/// seek leaves playbin3 wedged in ASYNC with a pending PAUSED that nothing ever
-/// resolves: no EOS, no bus message, a frozen frame, a Pause icon that lies,
-/// and no way out but closing the dialog.
+/// The scrubber's upper bound is the duration, so dragging fully right asks for
+/// exactly it. With KEY_UNIT the demuxer refuses that seek, and a refused
+/// flushing seek wedges playbin3 in ASYNC with a pending PAUSED that never
+/// resolves - no EOS, no bus message, frozen frame.
 ///
-/// ACCURATE does not rescue the exact-duration case: measured with the clamp
-/// skipped, an ACCURATE seek to exactly the duration wedged the pipeline
-/// permanently, 2 runs out of 2 — `Ok(Async)` with a pending PAUSED that never
-/// resolved, position frozen, no EOS. This epsilon is the whole fix, not belt
-/// and braces. Stopping a frame short of the end is invisible either way.
+/// ACCURATE does not help: seeking to exactly the duration wedged 2/2 runs.
 const SEEK_END_EPSILON: f64 = 0.05;
 
-/// How many ticks a seek may stay outstanding before the handle is handed back.
+/// Ticks a seek may stay outstanding before the handle is handed back.
 ///
-/// ASYNC_DONE is the real signal that a seek has landed. This only covers the
-/// case where that message never arrives: without it a lost ASYNC_DONE would
-/// pin the handle to a position the pipeline is not at for as long as the
-/// dialog stays open. Eight ticks is two seconds, against a worst measured
-/// seek of 437ms on a 10-minute HLS stream, so it cannot fire on a seek that
-/// is merely slow.
+/// ASYNC_DONE is the real signal; this covers a lost one. Eight ticks is two
+/// seconds, against a worst measured seek of 437ms on a 10-minute HLS stream.
 const SEEK_LOST_TICKS: u32 = 8;
 
 /// Modifiers that mean a keypress belongs to somebody else.
 ///
-/// Shift is deliberately absent: `M` is Shift+m.
+/// Shift is absent: `M` is Shift+m.
 const FOREIGN_MODIFIERS: gdk::ModifierType = gdk::ModifierType::CONTROL_MASK
     .union(gdk::ModifierType::ALT_MASK)
     .union(gdk::ModifierType::SUPER_MASK)
@@ -83,8 +63,7 @@ const FOREIGN_MODIFIERS: gdk::ModifierType = gdk::ModifierType::CONTROL_MASK
 pub enum MediaKind {
     /// A Bluesky video: audio, a scrubber, and it stops at the end.
     Video,
-    /// A GIF that reached us as an MP4. Silent, looping, no transport chrome —
-    /// anything else would be a video player wrapped around a reaction image.
+    /// A GIF delivered as MP4. Silent, looping, no transport.
     Gif,
 }
 
@@ -104,12 +83,8 @@ pub struct VideoSource {
     /// for a GIF.
     pub playlist_url: String,
     pub alt: Option<String>,
-    /// Where to send someone when playback fails: the post on the web, never
-    /// the playlist, which a browser renders as a page of raw text.
-    ///
-    /// `None` when no post URL is known. The error page then offers no browser
-    /// button at all, which is honest, rather than quietly handing over the
-    /// playlist and reproducing the raw-text bug this player exists to fix.
+    /// The post on the web, never the HLS playlist - a browser renders that as
+    /// raw text. `None` builds no browser button.
     pub fallback_url: Option<String>,
     pub kind: MediaKind,
 }
@@ -126,9 +101,9 @@ impl VideoSource {
 
     /// A GIF, which has no HLS playlist and no audio track.
     ///
-    /// Separate from [`Self::from_embed`] because a GIF is not a
-    /// [`crate::atproto::VideoEmbed`] at all — it arrives as an external link
-    /// card and is recognised by [`crate::atproto::gif::detect`].
+    /// Separate from [`Self::from_embed`]: a GIF arrives as an external link
+    /// card, not a [`crate::atproto::VideoEmbed`]. See
+    /// [`crate::atproto::gif::detect`].
     pub fn from_gif(
         gif: &crate::atproto::GifEmbed,
         alt: Option<String>,
@@ -157,32 +132,26 @@ pub enum Chrome {
 /// Everything about a player that is not the stream itself.
 pub struct PlayerConfig {
     pub chrome: Chrome,
-    /// Perceptual 0..=1. Passed in rather than read from disk here: inline
-    /// players are built on scroll, and a settings file read per pipeline is a
-    /// disk read per video somebody scrolled past.
+    /// Perceptual 0..=1. Passed in, not read from disk - inline players are
+    /// built on scroll.
     pub volume: f64,
-    /// Applied before the pipeline ever reaches PLAYING, so a muted start
-    /// cannot leak a burst of audio.
+    /// Applied before the pipeline reaches PLAYING, so a muted start cannot
+    /// leak a burst of audio.
     pub muted: bool,
     /// Seconds to resume from, once the stream admits to having a duration.
     /// `0.0` starts at the beginning and issues no seek at all.
     pub start_at: f64,
-    /// Called with a one-line message instead of showing an error page.
+    /// Report failure to the owner instead of showing an error page.
     ///
-    /// How an inline player fails: the row drops the player, puts its thumbnail
-    /// back and shows a compact banner. An `AdwStatusPage` has a minimum width
-    /// well over 300px, and a row's normal child *is* measured, so rendering
-    /// one inline would widen the whole window through a scroller that has no
-    /// horizontal valve.
+    /// AdwStatusPage has a minimum width over 300px and a row's normal child is
+    /// measured, so an inline error page would widen the window.
     ///
-    /// The callback may drop the player. Every path into [`VideoPlayer::fail`]
-    /// holds a strong `Rc` across the call for exactly that reason — the local
-    /// upgrade in the bus-error idle, and the constructor's own binding when a
-    /// pipeline fails to build. Do not call `fail` from anywhere that does not.
+    /// The callback may drop the player: every path into [`VideoPlayer::fail`]
+    /// holds a strong `Rc` across the call.
     pub on_fail: Option<Box<dyn Fn(String)>>,
     /// Called with the current position when the fullscreen button is pressed.
-    /// `None` builds no such button, which is what the dialog wants — it is
-    /// already the thing an inline player hands off *to*.
+    /// `None` builds no fullscreen button (the dialog is what inline hands off
+    /// to).
     pub on_expand: Option<Box<dyn Fn(f64)>>,
 }
 
@@ -230,9 +199,8 @@ pub struct VideoPlayer {
     source: VideoSource,
     /// `None` before the pipeline is built and after it is torn down.
     playbin: RefCell<Option<gst::Element>>,
-    /// Alive for exactly as long as the pipeline, so `media::live_pipelines`
-    /// counts what is actually running. Taken in [`Self::stop`] beside the
-    /// playbin it belongs to.
+    /// Alive for exactly as long as the pipeline. Taken in [`Self::stop`]
+    /// beside the playbin.
     pipeline_token: RefCell<Option<media::PipelineToken>>,
     /// Dropping this removes the bus watch, so it has to outlive the pipeline.
     bus_watch: RefCell<Option<gst::bus::BusWatchGuard>>,
@@ -242,40 +210,34 @@ pub struct VideoPlayer {
     /// touches widgets, so `stop` has to be able to cancel it.
     error_report: RefCell<Option<glib::SourceId>>,
     pending_seek: Cell<Option<f64>>,
-    /// Where the handle belongs while somebody other than the pipeline owns it.
+    /// Where the handle sits until a seek lands.
     ///
     /// Between asking for a seek and the pipeline arriving, a position query
-    /// still answers with the old time. Writing that back into the scale is
-    /// what pulled the handle out from under the cursor mid-drag, so the tick
-    /// shows this instead until the seek lands.
+    /// still answers with the old time. Writing that back into the scale pulled
+    /// the handle out from under the cursor mid-drag.
     seek_target: Cell<Option<f64>>,
-    /// Whether a seek has been handed to the pipeline and not yet come back.
+    /// Whether a seek is outstanding.
     ///
-    /// Set when `seek_simple` is accepted, cleared by the ASYNC_DONE that
-    /// belongs to it. ASYNC_DONE is also how preroll and every
-    /// buffering-driven PAUSED/PLAYING transition announce themselves, so
-    /// without this there is no way to tell a seek arriving from either of
-    /// those, and the handle gets yanked to the playhead mid-drag.
+    /// Set when `seek_simple` is accepted, cleared by its ASYNC_DONE. Preroll
+    /// and every buffering trip through PAUSED post ASYNC_DONE too, so without
+    /// this the handle gets yanked to the playhead mid-drag.
     seek_inflight: Cell<bool>,
     /// Ticks spent waiting for that ASYNC_DONE, for [`SEEK_LOST_TICKS`].
     seek_waited: Cell<u32>,
     volume_save: RefCell<Option<glib::SourceId>>,
     /// Volume waiting to be written to disk, if any.
     pending_volume: Cell<Option<f64>>,
-    /// What the person last asked for. Buffering only resumes PLAYING if set,
-    /// so a rebuffer never restarts a video someone deliberately paused.
+    /// What the user last asked for. Buffering only resumes PLAYING if set, so
+    /// a rebuffer never restarts a paused video.
     wants_playing: Cell<bool>,
     duration: Cell<Option<f64>>,
-    /// Where to resume from, until the first duration arrives and it is used.
-    ///
-    /// Seeking before that point asks an HLS stream to seek before its demuxer
-    /// has the playlist, which answers "unseekable" — so the resume has to wait
-    /// for the one moment the stream is known to be ready, not for a timer.
+    /// Resume position, used at the first duration. Seeking before the demuxer
+    /// has the playlist answers "unseekable".
     pending_start: Cell<Option<f64>>,
 }
 
 impl VideoPlayer {
-    /// Build a player wearing `config`'s chrome and start loading `source`.
+    /// Build a player with `config`'s chrome and start loading `source`.
     ///
     /// Must be called on the GTK main thread: the sink hands out its paintable
     /// only there.
@@ -353,10 +315,8 @@ impl VideoPlayer {
             &volume,
             config.on_expand.is_some(),
         );
-        // A GIF has nothing to scrub, nothing to mute and nowhere to stop, so
-        // it gets no transport. The widgets are still built and still wired up
-        // — the keyboard shortcuts and the tick both go through them, and a
-        // hidden widget is a great deal less trouble than a set of Options.
+        // A GIF has no transport. The widgets are still built and wired so the
+        // tick and shortcuts need no Options.
         transport
             .controls
             .set_visible(source.kind != MediaKind::Gif);
@@ -369,17 +329,13 @@ impl VideoPlayer {
                 page.upcast()
             }
             Chrome::Inline => {
-                // The transport goes *over* the picture, not under it: the row
-                // already committed to a height derived from the video's aspect
-                // ratio before this player existed, and a 40px bar beneath
+                // Over the picture, not under it: the row's height is already
+                // derived from the video's aspect ratio, and a 40px bar beneath
                 // would grow the embed past it.
                 //
-                // It is also what keeps the strip's width off the window.
-                // `GtkOverlay` does not measure its overlay children —
-                // `measure-overlay` defaults to false — so the strip's minimum
-                // width never reaches the row, the `AdwClamp` or the
-                // (Never, Automatic) scroller above it. Never call
-                // `set_measure_overlay(true)` here.
+                // GtkOverlay does not measure overlay children (measure-overlay
+                // defaults false), so the strip's minimum width never reaches
+                // the AdwClamp. Never set_measure_overlay(true) here.
                 let page = gtk4::Overlay::new();
                 page.set_hexpand(true);
                 page.set_vexpand(true);
@@ -394,21 +350,18 @@ impl VideoPlayer {
         error_detail.add_css_class("monospace");
         error_detail.add_css_class("caption");
         error_detail.set_wrap(true);
-        // GStreamer's debug string is one long run of element paths joined by
-        // ":" and "_", and Pango's default `Word` mode has nowhere to break in
-        // that — the label's minimum width becomes the width of the whole run,
-        // and past about 84 characters it drags the dialog wider than the
-        // window it is presented over. `WordChar` breaks mid-token when a token
-        // cannot fit; the character cap keeps the natural width to a readable
-        // monospace measure so the details do not stretch the dialog either.
+        // GStreamer's debug string is one run of element paths joined by ":" and
+        // "_", and Pango's default Word mode has nowhere to break it: the
+        // label's minimum width becomes the whole run, and past ~84 characters
+        // it drags the dialog wider than the window. WordChar breaks mid-token;
+        // the character cap holds the natural width down.
         error_detail.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
         error_detail.set_max_width_chars(64);
         error_detail.set_selectable(true);
         error_detail.set_xalign(0.0);
         error_detail.set_margin_top(8);
 
-        // The browser is offered, never taken: an earlier version launched one
-        // from a timeout and people got tabs they had not asked for.
+        // Never auto-launch. An earlier version opened a browser from a timeout.
         let open_btn = gtk4::Button::with_label("Open in Browser");
         open_btn.add_css_class("suggested-action");
         open_btn.add_css_class("pill");
@@ -418,7 +371,7 @@ impl VideoPlayer {
                 crate::ui::external::open_url(btn, &url, "post");
             });
         } else {
-            // Nothing worth opening, so do not offer to open anything.
+            // No URL, no button.
             open_btn.set_visible(false);
         }
 
@@ -441,17 +394,14 @@ impl VideoPlayer {
         stack.set_hexpand(true);
         stack.set_vexpand(true);
         stack.add_named(&video_page, Some("video"));
-        // The status page is only ever put in a dialog's tree. An inline player
-        // hands its failure back through `on_fail` instead, so the widget whose
-        // minimum width would widen the window is not merely hidden inline —
-        // it is not there. See `PlayerConfig::on_fail`.
+        // Dialog only. Inline reports through on_fail; the status page is never
+        // built. See `PlayerConfig::on_fail`.
         if chrome == Chrome::Dialog {
             stack.add_named(&error_page, Some("error"));
         }
         root.append(&stack);
 
-        // A GIF is silent by definition; an autoplayed video starts muted when
-        // the setting says so.
+        // GIFs are always muted; autoplay is muted per setting.
         let start_muted = config.muted || source.kind == MediaKind::Gif;
 
         let player = Rc::new(Self {
@@ -490,9 +440,8 @@ impl VideoPlayer {
         });
 
         player.connect_controls();
-        // Setting the toggle rather than only muting the pipeline keeps the
-        // button, the icon and the `m` shortcut agreeing with what is actually
-        // coming out of the speakers.
+        // Set the toggle, not just the pipeline, so the icon and the m shortcut
+        // stay in step.
         if start_muted {
             player.mute_btn.set_active(true);
         }
@@ -505,13 +454,9 @@ impl VideoPlayer {
 
     /// Assemble the transport for `chrome` out of controls the caller owns.
     ///
-    /// The two layouts differ only in arrangement, never in behaviour: the same
-    /// `play_btn`, the same position `Scale` with its settle-coalesced seeks,
-    /// the same mute toggle. What inline changes is width. Budgeted against the
-    /// 495px content column measured in a 700px window: 34 (play) + ~40 (scale
-    /// minimum) + ~70 (time) + 34 (volume) + 34 (fullscreen) + spacing, which
-    /// is why the volume slider moves into a popover — inline it would have
-    /// been 110px of the strip on its own.
+    /// Inline is width-constrained: 34 (play) + ~40 (scale) + ~70 (time) + 34
+    /// (volume) + 34 (fullscreen) against a 495px column measured in a 700px
+    /// window - which is why volume is a popover, not a 110px slider.
     fn build_transport(
         chrome: Chrome,
         play_btn: &gtk4::Button,
@@ -541,19 +486,16 @@ impl VideoPlayer {
         controls.add_css_class("osd");
         controls.set_valign(gtk4::Align::End);
         controls.set_halign(gtk4::Align::Fill);
-        // Clicking the strip's padding must not reach the row body, which would
-        // open the thread. A bubble-phase gesture on the strip is walked
-        // descendants-first, so it claims before the row's own gesture sees the
-        // release — the same mechanism the quote card relies on.
+        // Clicking the strip's padding must not reach the row body and open the
+        // thread. A bubble-phase gesture is walked descendants-first, so this
+        // claims before the row's gesture sees the release.
         let claim = gtk4::GestureClick::new();
         claim.connect_released(|gesture, _, _, _| {
             gesture.set_state(gtk4::EventSequenceState::Claimed);
         });
         controls.add_controller(claim);
 
-        // Bluesky caps video at three minutes, so "0:12 / 2:58" never truncates
-        // — only a hypothetical hour-long stream would, and an ellipsis beats
-        // an eleventh character of clock pushing the window wider.
+        // Bluesky caps video at three minutes, so "0:12 / 2:58" fits.
         time_label.set_max_width_chars(11);
         time_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
 
@@ -576,8 +518,8 @@ impl VideoPlayer {
         volume_menu.set_tooltip_text(Some("Volume"));
         volume_menu.update_property(&[gtk4::accessible::Property::Label("Volume")]);
 
-        // Only the scrubber expands; everything else keeps its natural width so
-        // the strip's total stays the sum budgeted above.
+        // Only the scrubber expands; the rest keep their natural width so the
+        // strip's total stays the sum budgeted above.
         play_btn.set_hexpand(false);
         position.set_hexpand(true);
         time_label.set_hexpand(false);
@@ -610,17 +552,12 @@ impl VideoPlayer {
         &self.root
     }
 
-    /// Attach Space / arrow / M shortcuts to `widget`.
+    /// Attach Space / arrows / M to `widget`.
     ///
-    /// Left to the caller rather than wired up in `new`, because a player sat
-    /// in a feed must not swallow the keys the feed itself uses. An inline
-    /// player never calls this and installs no key controller at all: `Space`
-    /// already activates whichever button or quote card has focus, `Left` and
-    /// `Right` belong to the list and to the focused scrubber, and with several
-    /// videos realized at once `M` has no unambiguous target. Everything an
-    /// inline transport needs from the keyboard falls out of ordinary focusable
-    /// widgets — Tab walks play, scrubber, volume, fullscreen; arrows scrub the
-    /// focused `GtkScale` through the same `request_seek` path a drag uses.
+    /// Dialog only - an inline player must not swallow the feed's keys. Inline
+    /// gets its keyboard from ordinary focusable widgets instead: Tab walks
+    /// play, scrubber, volume, fullscreen, and arrows scrub the focused
+    /// GtkScale through the same `request_seek` path a drag uses.
     ///
     /// [`crate::ui::media_viewer::show_video`] is the only caller.
     pub fn install_shortcuts(self: &Rc<Self>, widget: &impl IsA<gtk4::Widget>) {
@@ -631,9 +568,7 @@ impl VideoPlayer {
                 let Some(player) = weak.upgrade() else {
                     return glib::Propagation::Proceed;
                 };
-                // Once the pipeline has given up, the error page owns the
-                // keyboard: swallowing Left and Right there would leave no way
-                // to move focus between its button and its expander.
+                // The error page needs Left/Right for focus.
                 if player.stack.visible_child_name().as_deref() != Some("video") {
                     return glib::Propagation::Proceed;
                 }
@@ -676,16 +611,14 @@ impl VideoPlayer {
         if let Some(id) = self.seek_settle.borrow_mut().take() {
             id.remove();
         }
-        // Every source this player owns has to go, not just the timers: the
-        // error report is an idle, and an idle that outlives the widget tree
-        // sets a visible child on a stack nobody is showing any more.
+        // The error report is an idle, and one that outlives the widget tree
+        // sets a visible child on a dead stack.
         if let Some(id) = self.error_report.borrow_mut().take() {
             id.remove();
         }
         self.pending_seek.set(None);
         self.release_seek_hold();
-        // The volume timer belongs to this player, so it goes with it — and a
-        // level someone set a moment before closing is still worth keeping.
+        // The volume timer goes with the player, but flush its pending level.
         if let Some(id) = self.volume_save.borrow_mut().take() {
             id.remove();
         }
@@ -693,35 +626,27 @@ impl VideoPlayer {
         if let Some(playbin) = self.playbin.borrow_mut().take() {
             let _ = playbin.set_state(gst::State::Null);
         }
-        // After NULL and after the bus watch, so the count only drops once the
-        // pipeline really has nothing left running.
+        // After NULL and after the bus watch, so the count drops only once
+        // nothing is left running.
         self.bus_watch.borrow_mut().take();
         self.pipeline_token.borrow_mut().take();
         self.pending_start.set(None);
         self.picture.set_paintable(gdk::Paintable::NONE);
     }
 
-    /// Whether the audio is currently off.
-    ///
-    /// The director reads this as a video is torn down: someone who unmuted an
-    /// autoplay has said what they want the next one to do.
+    /// Whether the audio is off. Read by the director on teardown to carry the
+    /// mute state forward.
     pub fn is_muted(&self) -> bool {
         self.mute_btn.is_active()
     }
 
-    /// The perceptual 0..=1 level the slider is sat at.
-    ///
-    /// Lets the director keep its cached volume current without a settings read
-    /// per video, which is the whole reason the level is passed in rather than
-    /// loaded here.
+    /// The slider's perceptual 0..=1 level, so the director need not re-read
+    /// settings.
     pub fn volume_level(&self) -> f64 {
         self.volume.value()
     }
 
-    /// Where the stream is now, in seconds. `0.0` when there is no pipeline.
-    ///
-    /// For handing a position to the full viewer, which is the only reason a
-    /// caller outside this file needs it.
+    /// Current position in seconds; `0.0` with no pipeline.
     pub fn position(&self) -> f64 {
         self.playbin()
             .and_then(|p| p.query_position::<gst::ClockTime>())
@@ -775,8 +700,8 @@ impl VideoPlayer {
         self.playbin.borrow().clone()
     }
 
-    /// `muted` is applied before the pipeline ever reaches PLAYING, so neither a
-    /// GIF nor a muted autoplay can leak a burst of audio.
+    /// `muted` is applied before the pipeline reaches PLAYING, so a muted start
+    /// cannot leak a burst of audio.
     fn start(self: &Rc<Self>, volume: f64, muted: bool) {
         let pipeline = match media::build_pipeline(
             &self.source.playlist_url,
@@ -808,8 +733,7 @@ impl VideoPlayer {
         }
 
         self.playbin.replace(Some(pipeline.playbin));
-        // Beside the playbin, and taken beside it in `stop`: that pairing is
-        // the whole reason `media::live_pipelines` can be trusted.
+        // Taken beside the playbin in `stop`.
         self.pipeline_token.replace(Some(pipeline.token));
         self.start_tick();
         self.play();
@@ -835,10 +759,8 @@ impl VideoPlayer {
                 let weak = Rc::downgrade(self);
                 let id = glib::idle_add_local_once(move || {
                     if let Some(player) = weak.upgrade() {
-                        // Forget the id before reporting: `fail` calls `stop`,
-                        // and this source is mid-dispatch, so leaving it there
-                        // would have `stop` remove a source that is already on
-                        // its way out.
+                        // Forget the id first: `fail` calls `stop`, and this
+                        // source is mid-dispatch.
                         player.error_report.replace(None);
                         player.fail(error);
                     }
@@ -850,10 +772,9 @@ impl VideoPlayer {
                 eprintln!("hangar: gstreamer warning: {} ({:?})", w.error(), w.debug());
             }
             MessageView::Buffering(b) => {
-                // Percent runs backwards across an adaptive-bitrate switch and
-                // arrives long before PLAYING is ever reached, so this gates on
-                // the buffering mode and on what the person actually asked for
-                // rather than trusting 100% to mean "go".
+                // Percent runs backwards across an ABR switch and arrives long
+                // before PLAYING, so gate on the mode and on wants_playing
+                // instead of trusting 100% to mean "go".
                 if b.mode() == gst::BufferingMode::Stream {
                     let filling = b.percent() < 100;
                     self.set_busy(filling);
@@ -866,20 +787,14 @@ impl VideoPlayer {
             }
             MessageView::Eos(..) => {
                 if self.source.kind == MediaKind::Gif {
-                    // Loop, because a GIF that stops after one pass is not a
-                    // GIF. `playbin3` has no loop property, so the only way is
-                    // to seek back on EOS; `wants_playing` stays true so the
-                    // seek is followed by PLAYING rather than parking.
-                    //
-                    // No timer involved, deliberately. This is the pipeline's
-                    // own bus watch, which `stop` already drops with the
-                    // player, so there is nothing here that can outlive the
-                    // widget the way a `glib::timeout` would.
+                    // playbin3 has no loop property, so seek back on EOS.
+                    // wants_playing stays true so PLAYING follows. This is the
+                    // bus watch, dropped with the player - no timer to outlive
+                    // it.
                     self.seek_to(0.0);
                     let _ = playbin.set_state(gst::State::Playing);
                 } else {
-                    // Park at the start rather than looping: the dialog is
-                    // somewhere people go to watch one video, not a feed.
+                    // Dialog: park at the start rather than loop.
                     self.wants_playing.set(false);
                     let _ = playbin.set_state(gst::State::Paused);
                     self.seek_to(0.0);
@@ -895,27 +810,17 @@ impl VideoPlayer {
                 }
             }
             MessageView::DurationChanged(..) => {
-                // The demuxer has revised its answer, so the cached one is
-                // stale. This says nothing at all about any seek.
+                // Duration changed; nothing to do with a seek.
                 self.duration.set(None);
                 self.refresh_position();
             }
             MessageView::AsyncDone(..) => {
-                // A flushing seek finishes with ASYNC_DONE, which is the point
-                // the pipeline can answer for its new position again.
-                //
-                // Only for a seek, though. Preroll ends with one too — landing
-                // at the moment the scrubber first becomes sensitive — and so
-                // does every buffering-driven trip through PAUSED and back.
-                // Releasing the handle for those is how a drag lost it to the
-                // playhead partway through.
-                //
-                // A drag still in progress keeps the handle regardless. Pausing
-                // mid-drag to look at a frame is long enough for the settle
-                // timer to fire, so the drag resumes with that seek in flight;
-                // its own ASYNC_DONE would then hand the scrubber back to the
-                // playhead under the user's cursor. Measured at up to 3.5s of
-                // travel lost, for any pause between roughly 150ms and 580ms.
+                // Preroll and every buffering trip through PAUSED also end in
+                // ASYNC_DONE, so only release the handle for a seek. A drag in
+                // progress keeps it either way: a mid-drag pause lets the
+                // settle timer fire, and that seek's ASYNC_DONE moves the
+                // scrubber under the cursor. Cost up to 3.5s of travel for
+                // pauses of ~150-580ms.
                 let dragging = self.seek_settle.borrow().is_some();
                 if self.seek_inflight.get() && !dragging {
                     self.release_seek_hold();
@@ -984,8 +889,8 @@ impl VideoPlayer {
                     let Some(player) = weak.upgrade() else {
                         return;
                     };
-                    // Read the position before handing over: the callback is
-                    // going to tear this player down.
+                    // Read the position first; the callback tears this player
+                    // down.
                     let at = player.position();
                     if let Some(cb) = player.on_expand.as_ref() {
                         cb(at);
@@ -1058,8 +963,8 @@ impl VideoPlayer {
             "audio-volume-high-symbolic"
         };
         self.mute_btn.set_icon_name(icon);
-        // Inline, the toggle is inside a popover nobody has open. The button
-        // that stands in for it has to say the same thing.
+        // Inline the toggle is in a closed popover; keep the stand-in button's
+        // icon in step.
         if let Some(menu) = self.volume_menu.as_ref() {
             menu.set_icon_name(icon);
         }
@@ -1109,8 +1014,8 @@ impl VideoPlayer {
             return;
         };
 
-        // HLS reports no duration until the demuxer has the playlist, so this
-        // keeps asking instead of assuming the stream is unseekable.
+        // HLS reports no duration until the demuxer has the playlist, so keep
+        // asking rather than assuming the stream is unseekable.
         if self.duration.get().is_none()
             && let Some(total) = playbin
                 .query_duration::<gst::ClockTime>()
@@ -1120,11 +1025,8 @@ impl VideoPlayer {
             self.duration.set(Some(total));
             self.position.set_range(0.0, total);
             self.position.set_sensitive(true);
-            // The first duration is the first moment the demuxer has the
-            // playlist, and so the first moment a seek can land. Resuming any
-            // earlier gets "unseekable" back from HLS and starts at zero
-            // anyway; resuming from a timer would be the fifth instance of the
-            // bug this file has had four times.
+            // The first duration is the first moment a seek can land. Earlier
+            // gets "unseekable" from HLS.
             if let Some(at) = self.pending_start.take() {
                 self.seek_to(at);
             }
@@ -1136,23 +1038,17 @@ impl VideoPlayer {
             .unwrap_or(0.0);
         let total = self.duration.get().unwrap_or(0.0);
 
-        // Who owns the handle right now: the person, or the pipeline?
-        //
-        // The person owns it while the settle timer is armed, which is exactly
-        // as long as change-value keeps arriving, and then on until the seek
-        // that drag produced has landed. How *far* the handle is from the
-        // playhead says nothing about either: a drag begins with the handle sat
-        // on the playhead, and a drag that travels back past it is briefly
-        // indistinguishable from a seek arriving. Reading proximity as arrival
-        // is what snapped the handle back at the start of every drag.
+        // The user owns the handle while the settle timer is armed and until
+        // that drag's seek lands. Proximity to the playhead means nothing -
+        // reading it as arrival snapped the handle back at the start of every
+        // drag.
         let dragging = self.seek_settle.borrow().is_some();
         if dragging {
             self.seek_waited.set(0);
         } else if self.seek_inflight.get() {
             self.seek_waited.set(self.seek_waited.get() + 1);
             if self.seek_waited.get() >= SEEK_LOST_TICKS {
-                // No ASYNC_DONE, and none coming. One visible jump beats a
-                // handle pinned somewhere the pipeline never reached.
+                // No ASYNC_DONE coming; hand the handle back.
                 self.release_seek_hold();
             }
         }
@@ -1167,8 +1063,8 @@ impl VideoPlayer {
             None => actual,
         };
 
-        // Close to the end a position query can answer past the duration, and
-        // "10:01 / 10:00" reads as a bug even though nothing is wrong.
+        // Near the end a position query can answer past the duration, which
+        // reads as "10:01 / 10:00".
         let shown = if total > 0.0 {
             position.clamp(0.0, total)
         } else {
@@ -1194,15 +1090,12 @@ impl VideoPlayer {
 
     fn request_seek(self: &Rc<Self>, seconds: f64) {
         self.pending_seek.set(Some(seconds));
-        // Hold the handle where the drag put it, so the tick has something
-        // truthful to draw while the pipeline is still somewhere else. Nothing
-        // has been asked of the pipeline yet, so this is not a seek in flight;
-        // the armed settle timer below is what keeps the tick off the handle.
+        // Hold the handle where the drag put it. Not a seek in flight yet; the
+        // settle timer below is what keeps the tick off the handle.
         self.seek_target.set(Some(seconds));
-        // Restart the clock on every sample. Keeping the first timer instead
-        // throttled the drag to one flushing seek every SEEK_SETTLE, each one
-        // costing a segment fetch, when the whole point is to issue exactly one
-        // seek after the handle stops moving.
+        // Restart the settle timer on every sample. Keeping the first one
+        // throttled the drag to a flushing seek every SEEK_SETTLE, each a
+        // segment fetch.
         if let Some(id) = self.seek_settle.borrow_mut().take() {
             id.remove();
         }
@@ -1233,15 +1126,13 @@ impl VideoPlayer {
             _ => seconds.max(0.0),
         };
 
-        // ACCURATE rather than KEY_UNIT. KEY_UNIT alone snaps to the keyframe
-        // *before* the target -- measured on a 6-second-keyframe stream, asking
-        // for 10s landed at 5.75s, so the handle jumped backwards after every
-        // drag and a 5-second arrow press could rewind. Adding SNAP_NEAREST
-        // fixes that but makes the end far worse: for any target past the
-        // middle of the last segment it snaps *forward* onto the end of the
-        // stream, which the demuxer refuses, and a refused flushing seek wedges
-        // the pipeline permanently. ACCURATE never snaps, so it has neither
-        // problem: measured landings are exact to the millisecond.
+        // ACCURATE, not KEY_UNIT. KEY_UNIT alone snaps to the keyframe before
+        // the target: on a 6-second-keyframe stream, asking for 10s landed at
+        // 5.75s and the handle jumped backwards after every drag. Adding
+        // SNAP_NEAREST fixes that but snaps forward past the middle of the last
+        // segment, onto the end of the stream, which the demuxer refuses and
+        // which wedges the pipeline. ACCURATE never snaps and lands within a
+        // millisecond.
         let result = playbin.seek_simple(
             gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
             gst::ClockTime::from_nseconds((target * 1_000_000_000.0) as u64),
@@ -1250,14 +1141,13 @@ impl VideoPlayer {
         match result {
             Ok(()) => {
                 self.seek_target.set(Some(target));
-                // Held until the ASYNC_DONE that belongs to *this* seek, or
-                // until SEEK_LOST_TICKS gives up on one ever arriving.
+                // Held until this seek's own ASYNC_DONE, or until
+                // SEEK_LOST_TICKS gives up on one arriving.
                 self.seek_inflight.set(true);
                 self.seek_waited.set(0);
             }
             Err(e) => {
-                // Nothing moved, so stop claiming it did and let the next tick
-                // put the handle back where the pipeline actually is.
+                // Nothing moved; let the next tick put the handle back.
                 eprintln!("hangar: could not seek to {target:.3}s: {e}");
                 self.release_seek_hold();
                 self.refresh_position();
@@ -1269,9 +1159,7 @@ impl VideoPlayer {
         eprintln!("hangar: video playback failed: {}", error.detail());
         self.stop();
         self.set_busy(false);
-        // Inline, the owner is told and this player is on its way out; the
-        // row puts its thumbnail back and says so in one line. Only a dialog
-        // has room for the status page and its technical details.
+        // Inline: tell the owner. Dialog: show the status page.
         if let Some(cb) = self.on_fail.as_ref() {
             cb(error.user_message());
             return;

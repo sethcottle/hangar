@@ -2,15 +2,13 @@
 
 //! GStreamer plumbing for video playback.
 //!
-//! GTK's own `GtkMediaFile` cannot play Bluesky's video: it marks the stream
-//! prepared and only then fails inside `GstHLSDemux2`, which is what produced a
-//! black frame with no usable error. The very same playlist plays under
-//! `playbin3` with the host's stock plugins, so Hangar drives its own pipeline
-//! and renders through a `GdkPaintable` handed out by `gtk4paintablesink`.
+//! `GtkMediaFile` cannot play Bluesky's video: it marks the stream prepared and
+//! then fails inside `GstHLSDemux2`, giving a black frame and no usable error.
+//! The same playlist plays under `playbin3` with stock plugins, so Hangar drives
+//! its own pipeline and renders through `gtk4paintablesink`'s `GdkPaintable`.
 //!
-//! The sink is registered statically from inside the process rather than being
-//! looked up in the system registry, so nobody has to install
-//! `gstreamer1.0-gtk4` to get a picture.
+//! The sink is registered statically rather than looked up in the system
+//! registry, so nobody has to install `gstreamer1.0-gtk4`.
 
 use gst::prelude::*;
 use gstreamer as gst;
@@ -18,15 +16,11 @@ use gtk4::gdk;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// How many pipelines this process currently owns.
+/// How many pipelines this process owns.
 ///
-/// Not a statistic: it is the check on the one invariant inline video rests on.
-/// A recycled `GtkListView` row that arms a pipeline and is then rebound under
-/// it leaks a decoder, an audio sink and a bus watch, and the symptom people
-/// report is "the app got slow" a hundred rows later rather than anything
-/// pointing at a video. Counting them makes the leak assertable — see
-/// `ui::inline_video::tests` — and, with `HANGAR_DEBUG_PIPELINES=1` set,
-/// watchable while scrolling a real feed.
+/// A rebound `GtkListView` row leaks a decoder, an audio sink and a bus watch;
+/// the symptom is the app getting slow a hundred rows later. Assertable in
+/// `ui::inline_video::tests`, and watchable with `HANGAR_DEBUG_PIPELINES=1`.
 static LIVE_PIPELINES: AtomicUsize = AtomicUsize::new(0);
 
 /// How many pipelines are alive right now.
@@ -34,13 +28,10 @@ pub fn live_pipelines() -> usize {
     LIVE_PIPELINES.load(Ordering::Relaxed)
 }
 
-/// Proof that one pipeline exists, and the thing that says so when it stops.
+/// RAII token proving one pipeline exists.
 ///
-/// Deliberately an RAII token rather than a pair of counter calls: whoever owns
-/// the pipeline owns this, so the count cannot drift when a teardown path is
-/// added later and forgets to decrement. `gst::Element` is a refcounted GObject
-/// that gets cloned all over a player, so the count cannot hang off the element
-/// itself.
+/// `gst::Element` is a refcounted GObject cloned all over a player, so the count
+/// cannot hang off the element itself.
 pub struct PipelineToken {
     _private: (),
 }
@@ -96,9 +87,7 @@ impl MediaError {
 
     /// The unabridged GStreamer text, for the details expander and stderr.
     ///
-    /// A missing element is nearly always a packaging problem rather than a bug
-    /// in the stream, so name the packages that carry the HLS chain instead of
-    /// making people search for them.
+    /// A missing element is a packaging problem, so name the packages.
     pub fn detail(&self) -> String {
         match self {
             Self::Init(e) => e.clone(),
@@ -124,15 +113,15 @@ impl MediaError {
 pub struct VideoPipeline {
     pub playbin: gst::Element,
     pub paintable: gdk::Paintable,
-    /// Held for as long as the pipeline is; dropping it is what decrements
-    /// [`live_pipelines`]. Never clone the playbin *instead* of keeping this.
+    /// Held as long as the pipeline is; dropping it decrements
+    /// [`live_pipelines`]. Cloning the playbin does not stand in for it.
     pub token: PipelineToken,
 }
 
 /// Initialize GStreamer and register `gtk4paintablesink`, once per process.
 ///
-/// Deliberately called on first playback rather than from `main`: `gst::init`
-/// scans the plugin registry, and most sessions never open a video at all.
+/// Called on first playback rather than from `main`: `gst::init` scans the
+/// plugin registry, and most sessions never open a video.
 ///
 /// Must run on the GTK main thread, because the caller goes on to read the
 /// sink's `paintable` property, which is main-thread only.
@@ -156,17 +145,15 @@ fn make(name: &'static str) -> Result<gst::Element, MediaError> {
 /// Build a `playbin3` for `uri` rendering into a fresh `gtk4paintablesink`.
 ///
 /// `volume` is linear (see [`linear_volume`]) and `muted` is applied before the
-/// pipeline ever reaches PLAYING, so a muted start never leaks a burst of audio.
+/// pipeline reaches PLAYING, so a muted start cannot leak a burst of audio.
 ///
 /// Must be called on the GTK main thread.
 pub fn build_pipeline(uri: &str, volume: f64, muted: bool) -> Result<VideoPipeline, MediaError> {
     ensure_initialized()?;
 
-    // No `reconfigure-on-window-resize` here: "overlay-only" is already the
-    // property's default, and it only does anything once something feeds the
-    // sink its window-width/window-height, which only the sink's own
-    // RenderWidget does. Hangar draws the paintable in a plain GtkPicture, so
-    // setting it would buy nothing.
+    // No reconfigure-on-window-resize: "overlay-only" is already the default,
+    // and it only matters for the sink's own RenderWidget. Hangar draws the
+    // paintable in a plain GtkPicture.
     let sink = gst::ElementFactory::make("gtk4paintablesink")
         .build()
         .map_err(|_| MediaError::MissingElement("gtk4paintablesink"))?;
@@ -220,9 +207,9 @@ pub fn build_pipeline(uri: &str, volume: f64, muted: bool) -> Result<VideoPipeli
 
 /// Convert a perceptual 0.0..=1.0 slider position to playbin3's linear scale.
 ///
-/// `playbin3` implements `GstStreamVolume`, whose `volume` property is linear,
-/// while a slider people can reason about is cubic. GStreamer's own cubic to
-/// linear conversion is exactly x^3, so no audio bindings are needed for it.
+/// `playbin3` implements `GstStreamVolume`, whose `volume` property is linear;
+/// a volume slider wants a cubic scale. GStreamer's own cubic-to-linear
+/// conversion is x^3, so this needs no audio bindings.
 pub fn linear_volume(slider: f64) -> f64 {
     let s = slider.clamp(0.0, 1.0);
     s * s * s

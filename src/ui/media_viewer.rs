@@ -2,9 +2,9 @@
 
 //! Full-size image and video viewers.
 //!
-//! Post embeds render thumbnails, which are small and often cropped. This
-//! presents the fullsize variant in a dialog so a post's images can actually
-//! be read, with the alt text alongside where the author supplied one.
+//! Post embeds render the thumbnail, which is small and usually cropped. This
+//! shows the fullsize variant in a dialog, with the alt text where the author
+//! supplied one.
 
 use crate::atproto::ImageEmbed;
 use crate::ui::avatar_cache;
@@ -20,23 +20,16 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 /// One notch of zoom.
-///
-/// Small enough that holding a key does not shoot past what you were aiming
-/// at, large enough that a single press is worth pressing.
 const ZOOM_STEP: f64 = 1.25;
 
-/// Past eight screen pixels per image pixel there is nothing left to see, and
-/// the cap keeps a held key from asking GTK for a widget a million pixels wide.
-///
-/// There is no matching minimum: zooming out stops at the fitted view, which
-/// is as far out as the whole image being visible.
+/// 8 screen pixels per image pixel. Also stops a held key asking GTK for a
+/// million-pixel widget. No minimum - zooming out stops at fitted.
 const ZOOM_MAX: f64 = 8.0;
 
 /// Modifiers that mean a keypress belongs to somebody else.
 ///
-/// Control is deliberately absent, unlike the video player's list: Ctrl+plus,
-/// Ctrl+minus and Ctrl+0 are the conventional zoom bindings, so Control on
-/// those keys is ours to answer.
+/// Control is absent, unlike the video player's list: Ctrl+plus, Ctrl+minus and
+/// Ctrl+0 are the conventional zoom bindings.
 const FOREIGN_MODIFIERS: gdk::ModifierType = gdk::ModifierType::ALT_MASK
     .union(gdk::ModifierType::SUPER_MASK)
     .union(gdk::ModifierType::META_MASK)
@@ -44,24 +37,18 @@ const FOREIGN_MODIFIERS: gdk::ModifierType = gdk::ModifierType::ALT_MASK
 
 /// Play a video embed in a dialog.
 ///
-/// Bluesky serves video as an HLS playlist. Handing that URL to the browser is
-/// what produced a page of raw playlist text rather than a video, so play it
-/// here instead, through Hangar's own GStreamer pipeline rather than
-/// `GtkMediaFile`, which cannot decode these streams.
-///
-/// A failure keeps the dialog open and offers the post on the web behind a
-/// button. Opening a browser without being asked is what the old code did, from
-/// a timer that could not tell a slow stream from a broken one.
+/// Bluesky serves HLS, which a browser renders as raw playlist text and
+/// `GtkMediaFile` cannot decode. A failure keeps the dialog open with a browser
+/// button.
 pub fn show_video(parent: &impl IsA<gtk4::Widget>, source: VideoSource) {
     show_video_at(parent, source, 0.0);
 }
 
-/// Play a video embed in a dialog, resuming `start_at` seconds in.
+/// Play a video embed in a dialog, resuming `start_at` seconds in, for the
+/// inline fullscreen button.
 ///
-/// The resume path exists for the inline transport's fullscreen button: going
-/// to the viewer should not mean watching the first forty seconds again. The
-/// seek waits for the first duration the stream reports rather than being
-/// issued up front — see `VideoPlayer::refresh_position`.
+/// The seek waits for the first duration the stream reports; see
+/// `VideoPlayer::refresh_position`.
 pub fn show_video_at(parent: &impl IsA<gtk4::Widget>, source: VideoSource, start_at: f64) {
     let root = match parent
         .as_ref()
@@ -72,15 +59,9 @@ pub fn show_video_at(parent: &impl IsA<gtk4::Widget>, source: VideoSource, start
         None => return,
     };
 
-    // One pipeline in the process. Whatever the feed was playing goes now, and
-    // stays gone until this dialog closes — otherwise the fullscreen handoff,
-    // or simply pressing play on a profile page, gives you two videos and two
-    // audio streams.
-    //
-    // The hold is counted, so this and the `dialog_closed` below have to come
-    // in pairs: a quoted video and a GIF both reach this function from any
-    // page, and when the hold was a flag the first dialog to close handed the
-    // feed back to the election while the second was still playing.
+    // One pipeline per process: stop whatever the feed is playing. The hold is
+    // a count, so this and the `dialog_closed` below must pair - a quoted video
+    // and a GIF both reach here from any page.
     let director = crate::ui::inline_video::director();
     if let Some(director) = director.as_ref() {
         director.dialog_opened();
@@ -104,8 +85,8 @@ pub fn show_video_at(parent: &impl IsA<gtk4::Widget>, source: VideoSource, start
             ..PlayerConfig::dialog()
         },
     );
-    // The dialog is the one place `Space`, the arrows and `M` have exactly one
-    // video to mean anything about. See `install_shortcuts`.
+    // The dialog has exactly one video, so shortcuts are unambiguous. See
+    // `install_shortcuts`.
     player.install_shortcuts(&dialog);
 
     toolbar.set_content(Some(player.widget()));
@@ -116,23 +97,19 @@ pub fn show_video_at(parent: &impl IsA<gtk4::Widget>, source: VideoSource, start
     toasts.set_child(Some(&toolbar));
     dialog.set_child(Some(&toasts));
 
-    // Tear the pipeline down with the dialog, otherwise it keeps fetching
-    // segments and playing audio into a window nobody can see.
+    // Tear the pipeline down with the dialog, or it keeps fetching segments and
+    // playing audio.
     dialog.connect_closed({
         let player = player.clone();
-        // The hold is a count, so it has to come off exactly once. `closed`
-        // is emitted again if a dialog is presented again, and while `stop` is
-        // idempotent, a second `dialog_closed` would let go of another
-        // dialog's hold.
+        // `closed` is emitted again if the dialog is presented again, and a
+        // second `dialog_closed` would let go of another dialog's hold.
         let released = Cell::new(false);
         move |_| {
             if released.replace(true) {
                 return;
             }
             player.stop();
-            // The dialog may have written a new volume on its way out, so the
-            // director re-reads it rather than arming the next inline video at
-            // a level the person has already changed.
+            // The dialog may have written a new volume.
             if let Some(director) = director.as_ref() {
                 director.refresh_volume();
                 director.dialog_closed();
@@ -143,8 +120,7 @@ pub fn show_video_at(parent: &impl IsA<gtk4::Widget>, source: VideoSource, start
     dialog.present(Some(&root));
 }
 
-/// What the picture is showing, which is a different question from whether it
-/// has a paintable on it.
+/// Whether the picture is showing the current image.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LoadState {
     /// The current image's bytes have not arrived. The picture is blank.
@@ -156,11 +132,7 @@ enum LoadState {
     Failed,
 }
 
-/// A full-size image, plus everything you can do with the one on screen.
-///
-/// The actions arrived after the viewer was a single function passing five
-/// cloned widgets into every closure. One struct behind an `Rc`, the way
-/// `VideoPlayer` does it, is what stops the next action from adding a sixth.
+/// A full-size image and the actions on it.
 struct ImageViewer {
     images: Vec<ImageEmbed>,
     index: Cell<usize>,
@@ -170,16 +142,10 @@ struct ImageViewer {
     zoom: Cell<Option<f64>>,
     /// Whether the picture is showing `images[index]` yet.
     ///
-    /// One `Picture` serves every image in the gallery, so "there is a
-    /// paintable on the widget" answers a question nobody asked: it stays true
-    /// across a page to an image that has not loaded. Every action in the menu
-    /// is about `images[index]`, so they all read this instead.
+    /// One `Picture` serves the whole gallery, so a paintable on the widget can
+    /// still be the previous image. Every menu action reads this.
     load_state: Cell<LoadState>,
-    /// The load the picture is waiting on, held so it can be cancelled.
-    ///
-    /// Dropping it is what guarantees the previous image can no longer paint
-    /// itself over the current one, and what stops its poll running on after
-    /// the dialog is closed.
+    /// The in-flight load, held so it can be cancelled on page or close.
     load: RefCell<Option<avatar_cache::ImageLoad>>,
     picture: gtk4::Picture,
     scroller: gtk4::ScrolledWindow,
@@ -215,15 +181,11 @@ impl ImageViewer {
         let alt_label = gtk4::Label::new(None);
         alt_label.add_css_class("dim-label");
         alt_label.set_wrap(true);
-        // Alt text is arbitrary text off the wire and nothing sits between this
-        // label and the dialog to absorb it. Plain `Word` wrapping makes a
-        // label's minimum width its longest unbreakable run, so one long URL in
-        // somebody's alt text would set the dialog's minimum width to the width
-        // of that URL. `WordChar` breaks mid-token when a token cannot fit,
-        // which puts the minimum back at one character.
+        // WordChar: a long URL in alt text would otherwise set the dialog's
+        // minimum width. See video_player.rs.
         alt_label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
-        // And a cap on the natural width, so a paragraph of alt text sets its
-        // own comfortable measure instead of stretching across a 1000px dialog.
+        // Cap the natural width so a paragraph of alt text does not stretch
+        // across a 1000px dialog.
         alt_label.set_max_width_chars(80);
         alt_label.set_justify(gtk4::Justification::Center);
         alt_label.set_margin_start(12);
@@ -263,8 +225,7 @@ impl ImageViewer {
                 viewer.zoom_by(1.0 / ZOOM_STEP)
             }),
         );
-        // A visible way back to fitted: without it, the only exit from a zoom
-        // is a keyboard shortcut nobody was told about.
+        // Otherwise the only way back to fitted is the keyboard shortcut.
         zoom_box.append(
             &self.zoom_button("zoom-fit-best-symbolic", "Fit to window", |viewer| {
                 viewer.zoom_reset()
@@ -317,19 +278,16 @@ impl ImageViewer {
         let toolbar = adw::ToolbarView::new();
         toolbar.add_top_bar(&header);
 
-        // The dialog covers the window, so a toast raised from in here would
-        // come up behind it on the window's own overlay. Same reasoning as the
-        // video dialog above.
+        // The dialog covers the window's toast overlay, so give it one of its
+        // own.
         let toasts = adw::ToastOverlay::new();
         toasts.set_child(Some(&content));
         toolbar.set_content(Some(&toasts));
 
         self.dialog.set_child(Some(&toolbar));
 
-        // A load in flight is a timer holding this dialog's picture, and the
-        // picture holds the rest of the tree. Dropping the viewer would take it
-        // with it, but only for as long as nothing else holds a strong
-        // reference; cancelling here does not depend on that being true.
+        // Cancel the in-flight load; do not rely on the viewer being the last
+        // strong ref.
         self.dialog.connect_closed({
             let weak = Rc::downgrade(self);
             move |_| {
@@ -360,13 +318,10 @@ impl ImageViewer {
         button
     }
 
-    /// The overflow menu of everything you can do with the image on screen.
+    /// The overflow menu for the image on screen.
     ///
-    /// There is no Share item because there is nothing honest to put behind
-    /// one: xdg-desktop-portal has no share interface, and neither GTK 4.14
-    /// nor libadwaita 1.5 offers a share sheet. Sharing on this platform means
-    /// handing the link to the clipboard or to a browser, so the menu says
-    /// exactly that instead of naming a picker that will never appear.
+    /// No Share item: xdg-desktop-portal has no share interface, and neither
+    /// GTK 4.14 nor libadwaita 1.5 has a share sheet.
     fn build_menu(self: &Rc<Self>) -> gtk4::MenuButton {
         let popover_box = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
         popover_box.set_margin_top(6);
@@ -418,8 +373,7 @@ impl ImageViewer {
         let popover = popover.clone();
         let weak = Rc::downgrade(self);
         item.connect_clicked(move |_| {
-            // Close the menu first: it sits over the image, and every one of
-            // these actions is about the image underneath it.
+            // The menu covers the image these act on.
             popover.popdown();
             if let Some(viewer) = weak.upgrade() {
                 action(&viewer);
@@ -432,10 +386,8 @@ impl ImageViewer {
         let total = self.images.len();
 
         let key = gtk4::EventControllerKey::new();
-        // Capture rather than bubble. Now that the header has buttons, a
-        // focused button claims Left and Right for focus navigation before a
-        // bubbling controller on the dialog ever sees them, which is exactly
-        // how the existing prev/next keys would have stopped working.
+        // Capture, not bubble: a focused header button claims Left and Right
+        // for focus navigation before a bubbling controller sees them.
         key.set_propagation_phase(gtk4::PropagationPhase::Capture);
         key.connect_key_pressed({
             let weak = Rc::downgrade(self);
@@ -491,13 +443,10 @@ impl ImageViewer {
                 if dy == 0.0 || !dy.is_finite() {
                     return glib::Propagation::Proceed;
                 }
-                // Scale by how far the wheel or the fingers actually moved. A
-                // mouse wheel reports whole notches, so `dy` of -1 is exactly
-                // one `ZOOM_STEP` in, same as the keyboard. A touchpad reports
-                // fractions of a notch dozens of times per gesture: taking a
-                // full step off the sign alone ran one flick straight to
-                // `ZOOM_MAX`, and one flick the other way straight back to
-                // fitted, with nothing usable in between.
+                // Scale by how far the wheel or fingers moved. A wheel reports
+                // whole notches, so dy of -1 is one ZOOM_STEP. A touchpad
+                // reports fractions dozens of times per gesture, and taking a
+                // full step off the sign alone ran one flick to ZOOM_MAX.
                 let factor = ZOOM_STEP.powf(-dy);
                 if let Some(viewer) = weak.upgrade() {
                     viewer.zoom_by(factor);
@@ -512,12 +461,8 @@ impl ImageViewer {
         &self.images[self.index.get()]
     }
 
-    /// The decoded image on screen, if what is on screen is the current image.
-    ///
-    /// Copy, Save and the zoom arithmetic all read this, and all of them are
-    /// about `images[index]`, so it deliberately answers `None` while the
-    /// picture still holds an earlier image or nothing at all. Ask
-    /// [`Self::not_ready_message`] which of those it was.
+    /// The decoded current image, or `None` while the picture still holds an
+    /// earlier one. [`Self::not_ready_message`] says which case it was.
     fn texture(&self) -> Option<gdk::Texture> {
         if self.load_state.get() != LoadState::Shown {
             return None;
@@ -537,12 +482,8 @@ impl ImageViewer {
 
     /// Show the image at `index`, with its alt text and title.
     fn apply(self: &Rc<Self>) {
-        // Whatever the outgoing image's load was doing, it is not about this
-        // image. Dropping the handle stops its poll before it can paint over
-        // the new one; blanking the picture is what makes `texture` tell the
-        // truth in the gap before the new bytes arrive, and what stops a failed
-        // load leaving the reader looking at the image they just paged away
-        // from while every menu item acts on this one.
+        // Drop the old load and blank the picture, so `texture` is None until
+        // the new bytes land.
         self.load.replace(None);
         self.picture.set_paintable(gdk::Paintable::NONE);
         self.load_state.set(LoadState::Loading);
@@ -561,15 +502,12 @@ impl ImageViewer {
         self.dialog.set_title(&title);
         self.title.set_title(&title);
 
-        // A new image opens fitted. Carrying the last one's pixel zoom over
-        // would drop the reader somewhere in the middle of a picture they have
-        // not seen the whole of yet.
+        // A new image opens fitted.
         self.zoom.set(None);
         self.apply_zoom();
 
-        // Started last, and the handle stored last, because a cached image
-        // finishes inside this call: everything the callback reads has to be
-        // settled before it can run.
+        // Started last: a cached image finishes inside this call, so everything
+        // the callback reads must already be set.
         let handle = avatar_cache::load_image_into_picture_tracked(
             self.picture.clone(),
             image.fullsize.clone(),
@@ -587,9 +525,8 @@ impl ImageViewer {
                             viewer.apply_zoom();
                         }
                         avatar_cache::ImageLoadResult::Failed => {
-                            // The picture stays blank, which on its own reads as
-                            // an image that is taking a while. Say that it is
-                            // not coming.
+                            // A blank picture on its own looks like a slow
+                            // load, so say the image failed.
                             viewer.load_state.set(LoadState::Failed);
                             external::toast(&viewer.picture, "Couldn't load image");
                         }
@@ -600,10 +537,7 @@ impl ImageViewer {
         self.load.replace(Some(handle));
     }
 
-    /// Step `delta` images, wrapping around.
-    ///
-    /// With at most four images, stopping dead at an edge is more annoying
-    /// than useful.
+    /// Step `delta` images. Wraps; there are at most four.
     fn go(self: &Rc<Self>, delta: isize) {
         let total = self.images.len() as isize;
         if total < 2 {
@@ -614,11 +548,8 @@ impl ImageViewer {
         self.apply();
     }
 
-    /// Screen pixels per image pixel once the image is fitted to the viewport.
-    ///
-    /// Also the floor for zooming out. The viewport never hands the picture
-    /// less than the visible area, so a smaller number could not be drawn and
-    /// would only make the subtitle lie.
+    /// Fitted scale, and the floor for zooming out - the viewport never hands
+    /// the picture less than the visible area.
     fn fit_scale(&self) -> Option<f64> {
         let texture = self.texture()?;
         let (width, height) = (texture.width() as f64, texture.height() as f64);
@@ -638,9 +569,7 @@ impl ImageViewer {
         };
         let target = (self.zoom.get().unwrap_or(fit) * factor).min(ZOOM_MAX);
         if target <= fit {
-            // All the way back out is just the fitted view. Landing on the
-            // real state rather than an equivalent number keeps the subtitle
-            // and the "Fit to window" button agreeing with each other.
+            // All the way out is the fitted state, not an equivalent number.
             self.zoom_reset();
             return;
         }
@@ -660,13 +589,10 @@ impl ImageViewer {
                     (texture.width() as f64 * zoom).round() as i32,
                     (texture.height() as f64 * zoom).round() as i32,
                 );
-                // Centre while zoomed. The viewport rounds the request up to
+                // Centre while zoomed: the viewport rounds the request up to
                 // the visible area in whichever direction the image does not
-                // fill, and up to the image's own size below 1:1; centring
-                // leaves that slack as margin. Contain -- set once, never
-                // changed -- draws inside it at the smaller of the two ratios,
-                // which is the zoom that was asked for. Fill would stretch the
-                // image into the slack instead, badly on a tall or wide one.
+                // fill, and centring leaves that slack as margin. Contain draws
+                // inside it at the zoom asked for; Fill would stretch.
                 self.picture.set_halign(gtk4::Align::Center);
                 self.picture.set_valign(gtk4::Align::Center);
             }
@@ -712,10 +638,8 @@ impl ImageViewer {
 
     fn save_image(self: &Rc<Self>) {
         // Prefer the bytes the CDN served over a re-encode: no generation loss,
-        // and no PNG bloat on what was already a JPEG.
-        // Both arms are keyed on the current image: the cache lookup by its own
-        // URL, the fallback by `texture`, which is `None` unless the picture is
-        // showing this image. Neither can hand back the one before it.
+        // and no PNG bloat on what was already a JPEG. Both arms are keyed on
+        // the current image.
         let bytes = match avatar_cache::cached_bytes(&self.current().fullsize) {
             Some(bytes) => bytes,
             None => match self.texture() {
@@ -769,10 +693,7 @@ impl ImageViewer {
     /// window mid-save.
     fn write_image(&self, file: gio::File, bytes: Vec<u8>) {
         let picture = self.picture.clone();
-        // A save outlives the dialog it was started from, and a closed dialog's
-        // overlay cannot show anything ever again. Hold the window too, so both
-        // the confirmation and the error still have somewhere to land. Weakly:
-        // a toast that outlived the window has nobody left to tell.
+        // A save outlives its dialog, so hold the window (weakly) for the toast.
         let window = self.root_window();
         let saved = file.clone();
         file.replace_contents_async(
@@ -783,8 +704,7 @@ impl ImageViewer {
             gio::Cancellable::NONE,
             // The buffer is handed back either way; it has done its job.
             move |result| {
-                // Logged before anything else: the toast needs somewhere to go
-                // and may not find one, but the log always takes it.
+                // Log first; the toast may have no overlay left.
                 if let Err((_, e)) = &result {
                     eprintln!("Failed to save image: {e}");
                 }
@@ -814,14 +734,10 @@ impl ImageViewer {
     }
 }
 
-/// Where a toast about work that can outlive the dialog should be raised.
+/// Where to raise a toast about work that can outlive the dialog.
 ///
-/// The picture while the viewer is up, so the toast comes up on the dialog's
-/// own overlay rather than behind it. Once the dialog is closed the picture is
-/// unmapped and a toast added there is queued against a tree that will never be
-/// shown again — which is how a save that finished a moment too late used to
-/// report nothing at all, success or failure. The window outlives the dialog,
-/// so fall back to that.
+/// The picture while the dialog is up, the window after. A toast queued on an
+/// unmapped tree is never shown.
 fn toast_target(
     picture: &gtk4::Picture,
     window: &glib::WeakRef<gtk4::Window>,
@@ -834,11 +750,9 @@ fn toast_target(
 
 /// Reveal `file` in the file manager, and say so when that does not work.
 ///
-/// Under Flatpak this is a portal call: no file manager installed, a denied
-/// request, and a path the portal cannot resolve all come back as an error, and
-/// throwing that error away made all three indistinguishable from a button that
-/// does nothing. The window goes in as the parent so the portal has something
-/// to be modal to rather than floating loose.
+/// Under Flatpak this is a portal call: no file manager, a denied request and an
+/// unresolvable path all come back as an error. The window goes in as the parent
+/// so the portal has something to be modal to.
 fn show_in_files(file: &gio::File, picture: &gtk4::Picture, window: &glib::WeakRef<gtk4::Window>) {
     let parent = window.upgrade();
     let picture = picture.clone();
@@ -872,8 +786,7 @@ fn menu_item(icon_name: &str, label: &str) -> gtk4::Button {
 /// `…/bafkrei…@jpeg` → `bafkrei….jpg`.
 ///
 /// Bluesky's CDN names the format after an `@` rather than with an extension,
-/// which no file manager understands. The CID in front of it is at least
-/// unique, so it beats offering to save every image as "image".
+/// which no file manager understands.
 fn suggested_filename(url: &str) -> String {
     let last = url.rsplit('/').next().unwrap_or_default();
     let (stem, format) = last.split_once('@').unwrap_or((last, "jpeg"));
@@ -906,12 +819,8 @@ pub fn show_images(parent: &impl IsA<gtk4::Widget>, images: Vec<ImageEmbed>, sta
 
     let viewer = ImageViewer::new(images, start);
 
-    // Every control in the viewer holds only a weak reference back to it, so
-    // that the widgets it owns and the closures they carry do not pin each
-    // other alive. That leaves the one strong reference with nowhere to live
-    // once this function returns -- the dialog would come up with every button
-    // dead. Park it on `closed`, which both keeps it for as long as the dialog
-    // is up and lets go the moment it is not.
+    // Every control holds a Weak back to the viewer, so the one strong ref
+    // needs somewhere to live once this returns. Park it on `closed`.
     let held = RefCell::new(Some(Rc::clone(&viewer)));
     viewer.dialog.connect_closed(move |_| {
         held.borrow_mut().take();
@@ -938,8 +847,8 @@ mod tests {
         }
     }
 
-    /// A solid PNG of a given size. Size is the identity: which image is on
-    /// screen is read straight off the texture's width.
+    /// A solid PNG of a given size. Which image is on screen is read off the
+    /// texture's width.
     fn png(size: i32) -> Vec<u8> {
         let pixbuf =
             gdk::gdk_pixbuf::Pixbuf::new(gdk::gdk_pixbuf::Colorspace::Rgb, false, 8, size, size)
@@ -967,8 +876,8 @@ mod tests {
         std::thread::spawn(move || {
             for request in server.incoming_requests() {
                 let (prompt, slow) = (prompt.clone(), slow.clone());
-                // One thread per request: the point of the slow image is that
-                // it is still outstanding while another one is asked for.
+                // One thread per request, so the slow image is still
+                // outstanding while another is asked for.
                 std::thread::spawn(move || {
                     // The query string is only there to give each phase of the
                     // test its own key in the process-wide image cache.
@@ -1006,12 +915,10 @@ mod tests {
         }
     }
 
-    /// Everything the viewer says about the image on screen has to be about the
-    /// image the reader is actually on.
+    /// The picture and every menu action must be about the current image.
     ///
     /// All three phases share one test because GTK may only be used from the
-    /// thread that initialised it, and the test harness gives each `#[test]` a
-    /// thread of its own.
+    /// thread that initialised it.
     #[test]
     fn viewer_never_shows_or_acts_on_the_previous_image() {
         // On the GTK thread, or skipped where there is no display: see
@@ -1026,11 +933,9 @@ mod tests {
 
         // ---- Phase 1: page out to a slow image and back before it lands ----
         //
-        // Open image 1, press Right, press Left. Image 2's fetch is still
-        // running and finishes last. Before the fix its poll was still
-        // installed, still holding this same Picture, and called set_paintable
-        // unconditionally — so the dialog ended up showing image 2 while the
-        // header said "Image 1 of 2" and every menu action used image 1's URL.
+        // Right then Left. Image 2's fetch finishes last, and its poll used to
+        // call set_paintable unconditionally on the same Picture: the dialog
+        // showed image 2 under the header "Image 1 of 2".
         let images = vec![embed(url("prompt.png?a")), embed(url("slow.png?b"))];
         let viewer = ImageViewer::new(images, 0);
 
@@ -1050,11 +955,8 @@ mod tests {
 
         // ---- Phase 2: page to an image that will never arrive ----
         //
-        // No race needed for this one. Before the fix the picture kept the
-        // previous image, and `texture()` — which is what the "still loading"
-        // guards in Copy Image and Save Image As read — happily handed it over.
-        // Copy Image copied the wrong image; Save Image As wrote the wrong
-        // image's pixels into a file named after this one's CID.
+        // The picture kept the previous image and `texture()` handed it to Copy
+        // and Save, which wrote the wrong pixels under this image's CID.
         let images = vec![embed(url("prompt.png?c")), embed(url("gone.png?d"))];
         let viewer = ImageViewer::new(images, 0);
         pump(600);
@@ -1075,10 +977,8 @@ mod tests {
 
         // ---- Phase 3: the load does not outlive the viewer ----
         //
-        // The third instance of this bug in the tree: the poll held a strong
-        // clone of the Picture and was tied to nothing but the fetch, so it
-        // kept the whole widget chain alive past the dialog and then painted
-        // into it.
+        // The poll held a strong clone of the Picture, so it kept the widget
+        // chain alive past the dialog and painted into it.
         let images = vec![embed(url("slow.png?e"))];
         let viewer = ImageViewer::new(images, 0);
         let picture = viewer.picture.clone();

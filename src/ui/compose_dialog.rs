@@ -385,10 +385,9 @@ impl ComposeDialog {
 
             let header = gtk4::Label::new(Some(&format!("@{}", context.author_handle)));
             header.set_halign(gtk4::Align::Start);
-            // A handle is a domain name off the wire and Pango does not break
-            // on the dots, so without this the quote preview's minimum width is
-            // the whole handle. Same treatment, and the same measure, as the
-            // handle label in the mention picker above.
+            // A handle is a domain name and Pango does not break on the dots,
+            // so without this the quote preview's minimum width is the whole
+            // handle. Same measure as the mention picker above.
             header.set_ellipsize(gtk4::pango::EllipsizeMode::End);
             header.set_max_width_chars(22);
             header.add_css_class("dim-label");
@@ -551,14 +550,11 @@ impl ComposeDialog {
         tag_table.add(&url_tag);
 
         // Emoji tag: fix vertical line overlap and horizontal overshoot.
-        // line_height(1.4) prevents emoji from overlapping adjacent lines.
-        // letter_spacing adds trailing space after the emoji glyph so the
-        // next character doesn't render under the emoji's right edge.
-        // Base is 6px (6144 Pango units), scaled by the font size setting so
-        // the gap stays proportional at larger text sizes. Note that Pango
-        // splits letter_spacing across both sides of the glyph, so higher
-        // values also increase the left gap. 6px is the best compromise
-        // between right-side clearance and left-side inflation.
+        // line_height(1.4) stops emoji overlapping adjacent lines.
+        // letter_spacing adds trailing space so the next character does not
+        // render under the emoji's right edge. Base 6px (6144 Pango units),
+        // scaled by the font size setting. Pango splits letter_spacing across
+        // both sides of the glyph, so a larger value also inflates the left gap.
         let font_scale = AppSettings::load().font_size.scale_factor();
         let emoji_spacing = (6144.0 * font_scale) as i32;
         let emoji_tag = gtk4::TextTag::new(Some(TAG_EMOJI));
@@ -1633,10 +1629,7 @@ impl ComposeDialog {
             "Help the blind and vision impaired to understand your posts by adding descriptive text to your images.",
         ));
         desc_label.set_wrap(true);
-        // Pango's default `Word` mode makes a wrapping label's minimum width
-        // its longest unbreakable token. Static text today, but the rule the
-        // rest of the tree follows is that no label gets to set a window's
-        // minimum width, and the exceptions are how it stopped being followed.
+        // WordChar: no label sets the window's minimum width.
         desc_label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
         desc_label.set_halign(gtk4::Align::Start);
         desc_label.add_css_class("dim-label");

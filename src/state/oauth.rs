@@ -45,10 +45,9 @@ pub struct OAuthManager;
 impl OAuthManager {
     /// The scopes we ask for at authorization.
     ///
-    /// Single source of truth on purpose: a loopback `client_id` is derived
-    /// from the scope list as much as from the redirect URI, so editing this
-    /// in one place and not the other would hand the authorization server two
-    /// different clients for the same sign-in.
+    /// Single source of truth: a loopback `client_id` is derived from the scope
+    /// list as much as from the redirect URI, so two copies would hand the
+    /// authorization server two different clients for one sign-in.
     fn requested_scopes() -> Vec<Scope> {
         vec![
             Scope::Known(KnownScope::Atproto),
@@ -96,8 +95,8 @@ impl OAuthManager {
     /// atrium derives a loopback `client_id` from the redirect URI and scopes
     /// and sends it with every token request, refreshes included, so restoring
     /// with a placeholder URI produces a client the authorization server will
-    /// refuse to refresh for. The binding therefore has to come from the store,
-    /// and its absence is a hard failure rather than something to guess at.
+    /// refuse to refresh for. The binding comes from the store, and its absence
+    /// is a hard failure.
     pub fn build_restore_client(
         session_store: FileSessionStore,
         did: &atrium_api::types::string::Did,
@@ -107,11 +106,9 @@ impl OAuthManager {
             .map_err(|e| OAuthError::OAuth(e.to_string()))?
             .ok_or(OAuthError::MissingClientBinding)?;
 
-        // Anything the stored binding fails validation on -- a URI atrium no
-        // longer accepts as loopback, a scope list it will not serialize --
-        // means the original client_id is unreconstructible, which is the same
-        // dead end as never having recorded it. Send it down the re-auth path
-        // instead of surfacing as a client-construction failure.
+        // A binding that fails validation means the original client_id cannot
+        // be rebuilt. Send it down the re-auth path rather than reporting a
+        // client-construction failure.
         Self::build_client(&redirect_uri, scopes, session_store).map_err(|e| {
             eprintln!("hangar: stored OAuth client binding is unusable: {e}");
             OAuthError::MissingClientBinding

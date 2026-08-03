@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Actions that finish outside Hangar.
-//!
-//! Handing a URL to a browser or writing the clipboard leaves nothing behind in
-//! the window, so a click that silently failed and one that worked look exactly
-//! alike. Every hand-off out of the app goes through here and says what it did.
+//! Browser and clipboard hand-offs, each with a toast.
 
 use crate::ui::HangarWindow;
 use gtk4::prelude::*;
@@ -14,16 +10,13 @@ use libadwaita as adw;
 /// raised.
 const TOAST_TIMEOUT: u32 = 3;
 
-/// Longer than a plain toast, matching `HangarWindow::show_toast_with_action`:
-/// a button nobody had time to read is the same as no button.
+/// Matches `HangarWindow::show_toast_with_action`.
 const ACTION_TOAST_TIMEOUT: u32 = 5;
 
 /// The toast overlay nearest `widget`.
 ///
-/// Nearest rather than the window's own: an AdwDialog draws over the window
-/// content, so a toast added to the window while a dialog is up would come up
-/// behind it. Dialogs that report external actions carry their own overlay,
-/// and the window is the fallback for anything that does not.
+/// Nearest, not the window's own: an AdwDialog draws over the window content,
+/// so a toast added to the window while a dialog is up comes up behind it.
 fn nearest_overlay(widget: &gtk4::Widget) -> Option<adw::ToastOverlay> {
     widget
         .ancestor(adw::ToastOverlay::static_type())
@@ -45,9 +38,7 @@ pub fn toast(widget: &impl IsA<gtk4::Widget>, message: &str) {
     }
 }
 
-/// Show `message` with a button offering the one thing worth doing next.
-///
-/// Same overlay rules as [`toast`].
+/// Show `message` with an action button. Same overlay rules as [`toast`].
 pub fn toast_with_action(
     widget: &impl IsA<gtk4::Widget>,
     message: &str,
@@ -75,8 +66,7 @@ pub fn toast_with_action(
 pub fn open_url(widget: &impl IsA<gtk4::Widget>, url: &str, what: &str) {
     match open::that(url) {
         Ok(()) => toast(widget, &format!("Opened {what} in your browser")),
-        // Without this, no browser installed and a dead link look identical:
-        // you click, the app does nothing, and you cannot tell which it was.
+        // Otherwise no browser installed and a dead link look identical.
         Err(_) => toast(widget, &format!("Couldn't open {what} in your browser")),
     }
 }

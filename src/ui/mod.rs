@@ -16,20 +16,15 @@ pub use login_dialog::LoginDialog;
 pub use sidebar::NavItem;
 pub use window::HangarWindow;
 
-/// Run a test body on the one thread that owns GTK, or skip it if there is no
-/// display to build widgets on.
+/// Run a test body on the one GTK thread, or skip if there is no display.
 ///
 /// GTK may only be used from the thread that initialised it, and the harness
-/// gives every `#[test]` a thread of its own — `gtk4::init` from a second one
-/// panics outright. The tests that predate this helper called `init` directly
-/// and appeared to pass only because they raced: whichever thread lost failed
-/// to acquire the default main context, got an `Err` back, and quietly skipped
-/// itself as though the machine were headless. So every widget test now runs
-/// here instead, on a single-thread pool that initialises GTK exactly once.
+/// gives every `#[test]` its own - `gtk4::init` from a second panics. Tests that
+/// called `init` directly raced: the loser got an `Err` and skipped itself as
+/// though headless.
 ///
-/// Skipping on no display is deliberate and is why this is not just
-/// `#[gtk4::test]`: that macro panics when GTK cannot start, and headless CI
-/// has nothing to assert rather than a failure to report.
+/// Not `#[gtk4::test]`: that panics when GTK cannot start, and headless CI has
+/// nothing to assert.
 #[cfg(test)]
 pub(crate) fn with_gtk<F: FnOnce() + Send + 'static>(body: F) {
     use std::sync::{OnceLock, mpsc};

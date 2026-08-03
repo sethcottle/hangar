@@ -73,10 +73,9 @@ impl Eq for FontSize {}
 
 /// Video playback volume, 0.0..=1.0 on a perceptual scale.
 ///
-/// A newtype for the same reason `FontSize` is one: a bare `f64` field would
-/// take `f64`'s `Default` of 0.0 both from `AppSettings::default()` and from
-/// serde's missing-field path, so every existing settings file would silently
-/// mean silence. The hand-written `Default` below is what both use.
+/// A newtype because a bare `f64` would take 0.0 from both `Default` and
+/// serde's missing-field path. The hand-written `Default` below is what both
+/// use.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct VideoVolume(pub f64);
 
@@ -99,19 +98,14 @@ impl Default for VideoVolume {
 
 impl Eq for VideoVolume {}
 
-/// Whether videos in the main timeline start on their own, and with what audio.
+/// Whether timeline videos start on their own, and with what audio.
 ///
-/// Three variants rather than a bool because a bool has to silently pick a
-/// meaning: "autoplay at the app-wide volume" makes scrolling the feed blast
-/// audio, and "autoplay always muted" leaves the person who wanted sound with
-/// no way to ask for it.
+/// Three variants rather than a bool. Autoplay at the app volume means
+/// scrolling the feed plays audio; autoplay always muted gives no way to turn
+/// sound on.
 ///
-/// `Never` carries `#[default]`, which is what makes `AppSettings::default()`
-/// and serde's missing-field path the *same function* — unlike a bare `bool` or
-/// `f64` field, an enum with an explicit `#[default]` variant cannot have the
-/// two disagree, which is exactly what [`VideoVolume`]'s hand-written `Default`
-/// exists to prevent. The ordering is load-bearing for readers, not for
-/// correctness: do not reorder without moving `#[default]`.
+/// `#[default]` on `Never` is what makes `AppSettings::default()` and serde's
+/// missing-field path the same function. Do not reorder without moving it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VideoAutoplay {
     #[default]
@@ -163,17 +157,13 @@ impl ColorScheme {
 /// Persistent application settings
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppSettings {
-    /// Text scale factor. `FontSize`'s hand-written `Default` is 1.0, which is
-    /// what the missing-field default resolves to.
+    /// Text scale factor. `FontSize::default()` is 1.0.
     ///
-    /// This was the one field without `#[serde(default)]`, and it mattered far
-    /// beyond the font size: [`Self::load`] is `from_str(..).unwrap_or_default()`,
-    /// so a `settings.json` written without this key — by an older build, a
-    /// hand edit, or a partial write — was a parse *error*, and the whole file
-    /// was silently replaced by defaults. Colour scheme, reduce-motion,
-    /// threadgate and postgate defaults, hide-replies, volume and autoplay all
-    /// reverted with it. Every field here carries the attribute now, and
-    /// [`no_single_missing_field_resets_the_others`] fails if a new one does not.
+    /// This was the one field without `#[serde(default)]`, and [`Self::load`]
+    /// is `unwrap_or_default()` - so a file missing this key was a parse error
+    /// and every other setting reverted.
+    /// [`no_single_missing_field_resets_the_others`] fails if a new field
+    /// forgets it.
     #[serde(default)]
     pub font_size: FontSize,
     /// When true, disable animations/transitions regardless of system setting
@@ -193,24 +183,17 @@ pub struct AppSettings {
     pub default_postgate: Option<crate::atproto::PostgateConfig>,
     /// Hide replies in the main feed.
     ///
-    /// Bluesky hides replies by default; Hangar has always shown them, and
-    /// showing them stays the default so the feed does not quietly change for
-    /// anyone already using the app. Phrased as "hide" rather than "show" so
-    /// that `Default` and serde's missing-field default agree on false without
-    /// needing a hand-written Default impl.
+    /// Bluesky hides replies by default; Hangar shows them. Phrased as "hide"
+    /// so `Default` and serde agree on false without a hand-written impl.
     #[serde(default)]
     pub hide_replies_in_feed: bool,
     /// Volume for in-app video, shared by every video rather than reset each
     /// time a viewer opens.
     #[serde(default)]
     pub video_volume: VideoVolume,
-    /// Whether timeline videos start on their own. Off by default: a feed that
-    /// starts making noise the moment it loads is a feed people turn off.
+    /// Whether timeline videos start on their own. Off by default.
     ///
-    /// `#[serde(default)]` is not optional here, and what it prevents is worse
-    /// than one field defaulting wrong: [`Self::load`] is
-    /// `from_str(..).unwrap_or_default()`, so a missing-field *parse error*
-    /// would silently discard the user's whole settings file.
+    /// `#[serde(default)]` is required - see [`Self::font_size`].
     #[serde(default)]
     pub video_autoplay: VideoAutoplay,
 }
@@ -260,20 +243,13 @@ impl AppSettings {
 mod tests {
     use super::*;
 
-    /// Both paths into `video_autoplay` have to agree on "off".
-    ///
-    /// The legacy-blob case is the one that catches a forgotten
-    /// `#[serde(default)]`: `AppSettings::load` swallows a parse error into
-    /// `unwrap_or_default()`, so a required field would not fail loudly — it
-    /// would quietly reset a real user's font size, colour scheme and threadgate
-    /// defaults the first time they opened the app.
+    /// Both paths into `video_autoplay` agree on "off".
     #[test]
     fn autoplay_defaults_to_never_from_both_paths() {
         assert_eq!(AppSettings::default().video_autoplay, VideoAutoplay::Never);
 
-        // Every field is optional now — see
-        // `no_single_missing_field_resets_the_others` — so this is a file
-        // carrying only the field that used to be mandatory.
+        // Every field is optional now; this file carries only the one that used
+        // to be mandatory.
         let minimal: AppSettings =
             serde_json::from_str(r#"{"font_size":1.0}"#).expect("a minimal settings file loads");
         assert_eq!(minimal.video_autoplay, VideoAutoplay::Never);
@@ -283,34 +259,25 @@ mod tests {
         )
         .expect("a settings file written before autoplay existed still loads");
         assert_eq!(legacy.video_autoplay, VideoAutoplay::Never);
-        // The rest of the file survived, which is the actual stake.
+        // The rest of the file survived.
         assert_eq!(legacy.font_size, FontSize(1.3));
         assert!(legacy.reduce_motion);
         assert_eq!(legacy.video_volume, VideoVolume(0.5));
         assert!(legacy.hide_replies_in_feed);
     }
 
-    /// Dropping any one key from a settings file must cost only that key.
+    /// Dropping any one key must cost only that key.
     ///
-    /// This is the general form of the bug `font_size` had: because
     /// [`AppSettings::load`] funnels a parse error into `unwrap_or_default()`,
-    /// one field without `#[serde(default)]` turns *every* other setting into
-    /// collateral damage the first time a file shows up without it. A missing
-    /// key is not exotic — it is what an older build wrote, and what a hand
-    /// edit or an interrupted write leaves behind.
+    /// so a field without `#[serde(default)]` resets every other setting.
     ///
-    /// The loop is driven by the serialized object rather than a hand-written
-    /// list of fields, so a field added later is covered the day it is added:
-    /// this test goes red if it lands without the attribute.
-    ///
-    /// Compared through `serde_json::Value` because `AppSettings` derives no
-    /// `PartialEq`, and cannot cheaply — `ThreadgateConfig` and
-    /// `PostgateConfig` do not either. Round-tripping the survivors back to
-    /// JSON compares them without new derives on public API.
+    /// Driven by the serialized object, not a field list, so a new field is
+    /// covered the day it lands. Compared through `serde_json::Value` because
+    /// `AppSettings` derives no `PartialEq`.
     #[test]
     fn no_single_missing_field_resets_the_others() {
-        // Every field deliberately away from its default, so "was reset to the
-        // default" and "survived" cannot be confused for one another.
+        // Every field away from its default, so "reset" and "survived" cannot
+        // be confused.
         let populated = AppSettings {
             font_size: FontSize(1.35),
             reduce_motion: true,
@@ -341,8 +308,8 @@ mod tests {
             let mut partial = full.clone();
             partial.remove(dropped);
 
-            // The load path's own contract: this must be `Ok`. If it is not,
-            // `AppSettings::load` would swallow it and hand back defaults.
+            // Must be `Ok`, or `AppSettings::load` swallows it and hands back
+            // defaults.
             let loaded: AppSettings = serde_json::from_value(serde_json::Value::Object(partial))
                 .unwrap_or_else(|e| {
                     panic!(
@@ -372,8 +339,7 @@ mod tests {
     /// The missing-field default for `font_size` is 1.0, not `f64`'s 0.0.
     ///
     /// `#[serde(default)]` calls `FontSize::default()`, not `Default` on the
-    /// inner `f64` — a 0.0 scale factor would render the app unreadable, so
-    /// this pins which of the two it is.
+    /// inner `f64`, which would be a 0.0 scale factor.
     #[test]
     fn a_settings_file_with_no_font_size_reads_as_the_default_scale() {
         let empty: AppSettings = serde_json::from_str("{}").expect("an empty settings file loads");

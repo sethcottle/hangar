@@ -12,20 +12,11 @@ use libadwaita as adw;
 
 use crate::atproto::Profile;
 
-/// Width of the post content column at the timeline's 800px `AdwClamp`.
+/// Post content column width at the timeline's 800px `AdwClamp`.
 ///
-/// Media embeds derive their height from this and their own aspect ratio. The
-/// timeline's rows are allocated their *minimum* height, so a height request on
-/// a media widget is not a floor, it is the height - which means an embed sized
-/// independently of its aspect ratio ends up with slack that GtkPicture always
-/// centres, and centred media next to left-aligned text reads as misaligned.
-///
-/// An estimate, unavoidably: the real column measures 495px in a 700px window
-/// with the sidebar, 633 at 820, and settles near 684 once the clamp binds, and
-/// the height has to be requested before any of that is known. Tuned toward the
-/// narrow end, because guessing high costs visible dead space above and below
-/// an embed while guessing low only means the image stops short of the column
-/// edge. The clamp in [`PostRow::embed_height`] bounds the error either way.
+/// An estimate: the real column is 495px in a 700px window, 633 at 820, ~684
+/// once the clamp binds - and the height has to be requested before any of that
+/// is known. Tuned narrow; [`PostRow::embed_height`] clamps the error.
 const CONTENT_WIDTH: f64 = 540.0;
 
 mod imp {
@@ -84,11 +75,8 @@ mod imp {
         pub mention_clicked_callback: RefCell<Option<Box<dyn Fn(String) + 'static>>>,
         // Main box for cursor control
         pub main_box: RefCell<Option<gtk4::Box>>,
-        /// The row's video embed, while it has one.
-        ///
-        /// The only strong reference to it in the process: the director keeps
-        /// `Weak`s. Dropping it — on rebind, on unbind, or with the row — is
-        /// what guarantees the pipeline goes with it.
+        /// The row's video embed. Only strong ref in the process; the director
+        /// holds `Weak`s.
         pub video_slot: RefCell<Option<std::rc::Rc<crate::ui::inline_video::VideoSlot>>>,
     }
 
@@ -200,13 +188,9 @@ impl PostRow {
         let repost_label = gtk4::Label::new(None);
         repost_label.add_css_class("dim-label");
         repost_label.add_css_class("caption");
-        // A label with neither wrap nor ellipsize reports the full pixel width
-        // of its text as its *minimum*, and a minimum travels out through
-        // ListView, AdwClamp and Viewport untouched -- the clamp caps natural
-        // width only. So one long display name, in any row the ListView has
-        // bound rather than any row on screen, widens the entire feed past the
-        // window. Every label in this file carrying text off the wire is
-        // ellipsized for that reason.
+        // A label with no wrap or ellipsize reports its full text width as its
+        // minimum, and AdwClamp caps natural width only, so one long display
+        // name widens the feed. Every wire-text label here is ellipsized.
         repost_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         repost_btn_content.append(&repost_label);
         repost_btn.set_child(Some(&repost_btn_content));
@@ -390,9 +374,8 @@ impl PostRow {
         let post_row = self.clone();
         gesture.connect_released(move |_, _, _, _| {
             let imp = post_row.imp();
-            // The focused post of a thread is the subject of the page already;
-            // letting the body navigate would push an identical thread page,
-            // repeatable without limit.
+            // Already the subject of this page; navigating would push an
+            // identical one.
             if imp.is_focused_post.get() {
                 return;
             }
@@ -790,8 +773,8 @@ impl PostRow {
     ///
     /// Used for the main post in a thread view. This previously only cleared
     /// the pointer cursor, so the post still navigated on click and you could
-    /// descend into the same thread indefinitely. The click callback stays in
-    /// place because embedded quote cards depend on it.
+    /// descend into the same thread indefinitely. The click callback stays
+    /// because embedded quote cards depend on it.
     pub fn set_not_clickable(&self) {
         let imp = self.imp();
         imp.is_focused_post.set(true);
@@ -899,9 +882,8 @@ impl PostRow {
 
         // Render embed content
         if let Some(container) = imp.embed_container.borrow().as_ref() {
-            // Before the widgets go, not after: this row may be a recycled one
-            // that was playing a video, and the pipeline belongs to the post
-            // that is being replaced rather than to the widget tree.
+            // Before the widgets go: a recycled row's pipeline belongs to the
+            // old post.
             self.release_video();
 
             // Clear previous embeds
@@ -1097,21 +1079,16 @@ impl PostRow {
     /// old embed's widgets go. Public because a `SignalListItemFactory` has
     /// nothing but the row to call.
     pub fn release_video(&self) {
-        // Taken rather than borrowed: dropping the last `Rc` runs `VideoSlot`'s
-        // `Drop`, which tears the pipeline down, and doing that while this
-        // `RefCell` is still borrowed would be a panic waiting for the first
-        // person to add a slot lookup to that path.
+        // Taken, not borrowed: dropping the last `Rc` runs `VideoSlot::drop`,
+        // which can re-enter this `RefCell`.
         let slot = self.imp().video_slot.borrow_mut().take();
         drop(slot);
     }
 
     /// Render embed content into the container
     ///
-    /// `inline_allowed` is false inside a quote card. The card is a focusable,
-    /// Space-activatable box with a bubble-phase claim-on-release gesture, and
-    /// nesting a transport and a drag-scrubber in it is a keyboard and gesture
-    /// mess for an embed that small. A quoted video keeps the thumbnail that
-    /// opens the viewer, which is what every embed did before this.
+    /// `inline_allowed` is false inside a quote card: a quoted video keeps its
+    /// thumbnail and opens the viewer.
     fn render_embed(&self, container: &gtk4::Box, embed: &Embed, inline_allowed: bool) {
         match embed {
             Embed::Images(images) => {
@@ -1143,9 +1120,8 @@ impl PostRow {
         match images.len() {
             0 => return,
             1 => {
-                // Single image - height follows the image's own aspect ratio so
-                // it fills the content column edge to edge instead of sitting
-                // letterboxed and centred inside a fixed 400px box.
+                // Height from the image's own aspect ratio, not a fixed 400px
+                // box.
                 let img = &images[0];
 
                 let frame = gtk4::Frame::new(None);
@@ -1159,17 +1135,13 @@ impl PostRow {
                 let picture = gtk4::Picture::new();
                 picture.set_hexpand(true);
                 picture.set_vexpand(true);
-                // The only reason a Picture's minimum width is 0. Without it the
-                // minimum is the image's intrinsic width and, with no horizontal
-                // scroll valve on the timeline, that widens the whole window.
+                // Without can_shrink the minimum width is the image's full
+                // width, which widens the window - the timeline has no
+                // horizontal scrollbar.
                 picture.set_can_shrink(true);
-                // Contain, so a lone image is shown whole. Cover crops to fill,
-                // which is right for a grid cell where the neighbours have to
-                // line up, but a single image has nothing to line up with and
-                // cropping it is just losing the picture: measured at a 700px
-                // window, Cover discarded 57% of a 2:3 portrait and 27% of a
-                // 16:9 landscape. The height clamp below is an upper bound, so
-                // whatever slack Contain leaves is at most a few pixels.
+                // Contain: a lone image has nothing to line up with. Cover
+                // discarded 57% of a 2:3 portrait and 27% of a 16:9 landscape
+                // at a 700px window.
                 picture.set_content_fit(gtk4::ContentFit::Contain);
 
                 frame.set_child(Some(&picture));
@@ -1267,9 +1239,8 @@ impl PostRow {
         frame.set_overflow(gtk4::Overflow::Hidden);
         frame.add_css_class("post-embed-image");
 
-        // Cover fills the cell and crops the overflow. Fill, which this used to
-        // use, ignores the intrinsic aspect ratio and maps the image onto the
-        // allocation - a 2:3 portrait in a 338x240 cell came out 2.4x too wide.
+        // Cover fills the cell. Fill ignored the aspect ratio - a 2:3 portrait
+        // in a 338x240 cell came out 2.4x too wide.
         let picture = gtk4::Picture::new();
         picture.set_hexpand(true);
         picture.set_vexpand(true);
@@ -1284,9 +1255,8 @@ impl PostRow {
 
     /// Render an external link card (clickable to open URL)
     fn render_external_card(&self, container: &gtk4::Box, ext: &crate::atproto::ExternalEmbed) {
-        // A GIF is not a link card. It only arrives dressed as one, because
-        // Bluesky has no GIF embed type — see `atproto::gif`. Anything not
-        // recognised falls through and is rendered as the link card it is.
+        // Bluesky has no GIF embed type; GIFs arrive as external cards. See
+        // `atproto::gif`. Anything unrecognised falls through as a link card.
         if let Some(gif) = crate::atproto::gif::detect(&ext.uri) {
             self.render_gif(container, ext, &gif);
             return;
@@ -1410,13 +1380,9 @@ impl PostRow {
 
     /// Render an animated GIF that arrived as an external embed.
     ///
-    /// A still frame plus a badge and a play button, not an inline pipeline.
-    /// One `playbin3` per visible GIF in a recycled `ListView` is a great many
-    /// pipelines and a great many bus watches bound to rows that get rebound
-    /// under them, and this file's history is four separate bugs where exactly
-    /// that kind of thing outlived the widget that armed it. Clicking hands the
-    /// URL to the media viewer, which already owns a player with a documented
-    /// teardown path.
+    /// Still frame + badge + play button, not an inline pipeline - one
+    /// `playbin3` per visible GIF in a recycled `ListView` is a pipeline per
+    /// row. Clicking opens the media viewer.
     fn render_gif(
         &self,
         container: &gtk4::Box,
@@ -1427,9 +1393,8 @@ impl PostRow {
         overlay.add_css_class("video-embed");
         overlay.set_hexpand(true);
 
-        // The GIF hosts state the exact pixel size in the link's own query
-        // string, so unlike most embeds this one never has to fall back to
-        // 16:9. Same clamp as a single image, since that is what it is.
+        // The GIF hosts state the exact pixel size in the link's query string,
+        // so this never falls back to 16:9. Same clamp as a single image.
         let frame = gtk4::Frame::new(None);
         frame.set_hexpand(true);
         frame.set_overflow(gtk4::Overflow::Hidden);
@@ -1439,9 +1404,8 @@ impl PostRow {
         let thumb = gtk4::Picture::new();
         thumb.set_hexpand(true);
         thumb.set_vexpand(true);
-        // Without this the thumbnail's intrinsic width becomes the row's
-        // minimum, and with no horizontal scroll valve on the timeline that
-        // widens the whole window.
+        // Without can_shrink the thumbnail's full width becomes the row's
+        // minimum.
         thumb.set_can_shrink(true);
         thumb.set_content_fit(gtk4::ContentFit::Contain);
         if let Some(alt) = Self::gif_alt(ext) {
@@ -1453,7 +1417,7 @@ impl PostRow {
         frame.set_child(Some(&thumb));
         overlay.set_child(Some(&frame));
 
-        // Says out loud what the still frame cannot: this moves.
+        // The GIF badge.
         let badge = gtk4::Label::new(Some("GIF"));
         badge.add_css_class("gif-badge");
         badge.set_halign(gtk4::Align::Start);
@@ -1476,10 +1440,8 @@ impl PostRow {
         let link = ext.uri.clone();
         let post_row = self.clone();
         play_btn.connect_clicked(move |btn| {
-            // The post on the web if the pipeline fails, falling back to the
-            // GIF's own page. Neither is the re-encoded MP4: handing a browser
-            // a bare video URL is the same mistake as handing it an HLS
-            // playlist.
+            // The post on the web, else the GIF's own page. Never the
+            // re-encoded MP4.
             let fallback = post_row
                 .imp()
                 .post
@@ -1497,15 +1459,11 @@ impl PostRow {
         container.append(&overlay);
     }
 
-    /// Render a video embed
+    /// Render a video embed: clipping frame at the video's aspect ratio,
+    /// thumbnail, centre play button.
     ///
-    /// The widgets are the same whether or not the video can play here: a
-    /// clipping frame at the video's own aspect ratio, a thumbnail, and a
-    /// centre play button. What `inline_allowed` decides is who the button
-    /// talks to — a [`crate::ui::inline_video::VideoSlot`], which swaps a
-    /// player into the frame, or the media viewer's dialog. Until something is
-    /// armed, an inline-capable embed is byte for byte the widget tree this
-    /// function built before inline playback existed.
+    /// `inline_allowed` decides whether the button arms a
+    /// [`crate::ui::inline_video::VideoSlot`] or opens the media viewer.
     fn render_video(
         &self,
         container: &gtk4::Box,
@@ -1516,10 +1474,9 @@ impl PostRow {
         overlay.add_css_class("video-embed");
         overlay.set_hexpand(true);
 
-        // Thumbnail - fills the content column at the video's own aspect ratio.
-        // The height goes on a clipping frame rather than the Picture: a
-        // Picture given more width than its Contain-scaled image needs centres
-        // the result, and there is no property to align it left.
+        // The height goes on a clipping frame, not the Picture: a Picture given
+        // more width than its Contain-scaled image needs centres the result,
+        // and there is no property to align it left.
         let frame = gtk4::Frame::new(None);
         frame.set_hexpand(true);
         frame.set_overflow(gtk4::Overflow::Hidden);
@@ -1530,13 +1487,9 @@ impl PostRow {
         thumb.set_hexpand(true);
         thumb.set_vexpand(true);
         thumb.set_can_shrink(true);
-        // Contain, exactly as a lone image gets. A video embed is always
-        // standalone — there is no video grid — so it has nothing to line up
-        // with, and Cover was simply throwing away the edges of the frame
-        // somebody chose as the thumbnail. The frame's height already comes
-        // from this video's own aspect ratio, so for anything between the
-        // clamp's bounds Contain fills it edge to edge and crops nothing.
-        // Grid cells keep Cover: see `create_image_cell`.
+        // Contain, same as a lone image - the frame's height already comes from
+        // this video's aspect ratio, so it fills edge to edge. Grid cells keep
+        // Cover; see `create_image_cell`.
         thumb.set_content_fit(gtk4::ContentFit::Contain);
         if let Some(alt) = video
             .alt
@@ -1562,9 +1515,7 @@ impl PostRow {
         play_btn.set_tooltip_text(Some("Play video"));
         play_btn.update_property(&[gtk4::accessible::Property::Label("Play video")]);
 
-        // The post on the web, or nothing. Falling back to the playlist would
-        // hand a browser the page of raw text the player exists to avoid, so
-        // the failure path drops the button instead.
+        // The post on the web, or no button. Never the playlist.
         let fallback = self
             .imp()
             .post
@@ -1579,7 +1530,7 @@ impl PostRow {
             let slot = crate::ui::inline_video::VideoSlot::new(
                 &overlay, &frame, &thumb, &play_btn, source,
             );
-            // The row is the slot's only owner, and the slot is the pipeline's.
+            // The row owns the slot; the slot owns the pipeline.
             self.imp().video_slot.replace(Some(slot));
         } else {
             play_btn.connect_clicked(move |btn| {
@@ -1592,18 +1543,14 @@ impl PostRow {
 
     /// Render a quote post card (clickable to open quoted post)
     fn render_quote(&self, container: &gtk4::Box, quote: &crate::atproto::QuoteEmbed) {
-        // Deliberately a Box and not a Button. A GtkButton runs its click
-        // gesture in the CAPTURE phase and claims the sequence on release, and
-        // capture is walked ancestors-first - so a button wrapping the whole
-        // card claims the release before any control *inside* the card can see
-        // it, cancels their gestures, and stops propagation. That is why the
-        // play button, images and link card in a quoted post navigated instead
-        // of activating. A bubble-phase gesture on a plain Box is walked
-        // descendants-first, so every interactive child gets first refusal and
-        // this only fires for the parts of the card that nothing else claimed.
+        // A Box, not a Button. GtkButton's click gesture runs in CAPTURE and
+        // claims on release, and capture is walked ancestors-first - so a button
+        // wrapping the card claimed the release before the play button, images
+        // or link card inside it, and they navigated instead of activating. A
+        // bubble-phase gesture on a Box is walked descendants-first.
         //
-        // The accessible role has to be set at construction: GTK documents that
-        // it cannot be changed once set.
+        // The accessible role must be set at construction; GTK cannot change it
+        // later.
         let card_btn = glib::Object::builder::<gtk4::Box>()
             .property("orientation", gtk4::Orientation::Vertical)
             .property("accessible-role", gtk4::AccessibleRole::Button)
@@ -1698,11 +1645,9 @@ impl PostRow {
         let imp = self.imp();
 
         let gesture = gtk4::GestureClick::new();
-        // Claim on RELEASE, never on press. Claiming on press would deny every
-        // descendant before they are given the release and reproduce the bug
-        // this replaced. Claiming at all is still required: without it the row
-        // body's own gesture also fires and one click opens both the quoted
-        // post and the parent thread.
+        // Claim on RELEASE, never on press: claiming on press would deny every
+        // descendant. Without claiming at all, the row body's gesture fires too
+        // and one click opens both the quoted post and the parent thread.
         gesture.connect_released(glib::clone!(
             #[weak]
             imp,
@@ -1762,23 +1707,17 @@ impl PostRow {
 
     /// Fold every run of whitespace, newlines included, into a single space.
     ///
-    /// `gtk_label_set_lines` is implemented as a negative Pango layout height,
-    /// which means "N lines *per paragraph*". An App Store description is
-    /// thirty newline-separated bullets, so a two-line clamp allows sixty
-    /// lines - and because that is the label's *minimum* height, nothing
-    /// downstream can take it back. Collapsing to one paragraph is what makes
-    /// the clamp bind.
+    /// `gtk_label_set_lines` is a negative Pango layout height, so it clamps N
+    /// lines per paragraph. A thirty-bullet App Store description got sixty
+    /// lines out of set_lines(2), and that is the label's minimum height.
     fn collapse_whitespace(text: &str) -> String {
         text.split_whitespace().collect::<Vec<_>>().join(" ")
     }
 
-    /// Pixel height for a media embed of `aspect_ratio`, clamped to `[min, max]`.
+    /// Pixel height for `aspect_ratio`, clamped to `[min, max]`.
     ///
-    /// Sized so the embed fills [`CONTENT_WIDTH`] exactly at the timeline's
-    /// clamp width. Narrower windows crop rather than reintroduce dead space,
-    /// which is deliberate: the height cannot track the width without a tick
-    /// callback or a custom layout manager, and a repeating callback outliving
-    /// its row is a bug this codebase has already had three times.
+    /// Sized to fill [`CONTENT_WIDTH`] at the clamp width; the height cannot
+    /// track the width without a tick callback or a custom layout manager.
     fn embed_height(aspect_ratio: Option<(u32, u32)>, min: i32, max: i32) -> i32 {
         let (w, h) = aspect_ratio
             .filter(|(w, h)| *w > 0 && *h > 0)
@@ -1786,27 +1725,14 @@ impl PostRow {
         ((CONTENT_WIDTH * f64::from(h) / f64::from(w)).round() as i32).clamp(min, max)
     }
 
-    /// Put post text on `label`, linkified, and never blank.
+    /// Set post text on `label`, linkified, with a plain-text fallback.
     ///
-    /// `gtk_label_set_markup` given markup it cannot parse does not fall back
-    /// to showing the text. It emits a `Gtk-WARNING` and returns having changed
-    /// nothing at all — so the label keeps whatever it had, which is empty on a
-    /// fresh row and, because `ListView` recycles rows, *the previous post's
-    /// text* on a reused one. Either way the post the reader is looking at is
-    /// not on screen, and nothing but that warning says so.
+    /// `gtk_label_set_markup` on markup it cannot parse emits a `Gtk-WARNING`
+    /// and changes nothing, so a recycled row keeps the previous post's text.
+    /// Clear, set markup, and if nothing arrived set it unformatted.
     ///
-    /// So: clear the label to a known state, set the markup, and if the text
-    /// did not arrive, put it on unformatted. Links stop being clickable, which
-    /// is a great deal better than the post disappearing or impersonating
-    /// another one.
-    ///
-    /// [`Self::format_post_text`] is meant to make the fallback unreachable.
-    /// This stays anyway. It costs two property sets per bind, against the only
-    /// alternative way of noticing the next escaping bug being a user reporting
-    /// an empty post. Checking through the label rather than by re-parsing the
-    /// markup is deliberate: `pango::parse_markup` is only the *second* of the
-    /// two parsers `GtkLabel` runs — it rejects the `<a>` tags that GtkLabel's
-    /// own first pass strips out — so it cannot answer this question.
+    /// Checked through the label, not `pango::parse_markup`: GtkLabel runs its
+    /// own parser first and strips the `<a>` tags Pango would reject.
     fn set_post_markup(label: &gtk4::Label, text: &str) {
         let markup = Self::format_post_text(text);
         label.set_text("");
@@ -1820,7 +1746,7 @@ impl PostRow {
         }
     }
 
-    /// One linkified span, as byte offsets into the *raw* post text.
+    /// One linkified span, as byte offsets into the raw post text.
     fn text_links(text: &str) -> Vec<(std::ops::Range<usize>, String)> {
         use std::sync::LazyLock;
 
@@ -1877,14 +1803,12 @@ impl PostRow {
     /// markup. URLs become `<a>` tags; mentions use the `bsky-mention://`
     /// scheme and hashtags `bsky-tag://`, both handled in `connect_activate_link`.
     ///
-    /// Every span is found in the **raw** text and escaped on the way out. The
-    /// order matters and used to be the other way round: the text was escaped
-    /// first and the patterns then run over the result, so a pattern could
-    /// match *inside* an entity the escaper had just produced. GLib escapes a
-    /// control character as a numeric reference — U+001F becomes `&#x1f;` — and
-    /// the hashtag pattern happily took `#x1f` out of the middle of it, leaving
-    /// `&<a href="bsky-tag://x1f">#x1f</a>;`. Pango then rejected the lot with
-    /// "Entity did not end with a semicolon" and the post rendered blank.
+    /// Spans are found in the raw text and escaped on the way out, never the
+    /// other way round: with escaping first, a pattern can match inside an
+    /// entity the escaper just produced. GLib escapes U+001F as `&#x1f;`, the
+    /// hashtag pattern took `#x1f` out of the middle, and Pango then rejected
+    /// the whole string with "Entity did not end with a semicolon" - blank
+    /// post.
     fn format_post_text(text: &str) -> String {
         let links = Self::text_links(text);
         let mut out = String::with_capacity(text.len() + links.len() * 48);
@@ -1893,9 +1817,7 @@ impl PostRow {
         for (range, href) in &links {
             out.push_str(&glib::markup_escape_text(&text[cursor..range.start]));
             out.push_str("<a href=\"");
-            // The href is wire text too, and an unescaped `&` or `"` in a URL
-            // query string closes the attribute just as effectively as it
-            // breaks the body.
+            // The href is wire text too.
             out.push_str(&glib::markup_escape_text(href));
             out.push_str("\">");
             out.push_str(&glib::markup_escape_text(&text[range.clone()]));
@@ -1957,10 +1879,8 @@ mod tests {
 
     #[test]
     fn collapse_whitespace_folds_paragraphs_so_the_line_clamp_binds() {
-        // `Label::set_lines` is a negative Pango layout height, which means
-        // N lines *per paragraph*. A thirty-bullet App Store description was
-        // therefore allowed sixty lines, as the label's *minimum* height, and
-        // one post filled the window.
+        // set_lines clamps per paragraph, so a thirty-bullet App Store
+        // description was allowed sixty lines.
         let bullets = (1..=30)
             .map(|i| format!("• Feature bullet {i}"))
             .collect::<Vec<_>>()
@@ -1980,9 +1900,7 @@ mod tests {
 
     #[test]
     fn embed_height_tracks_the_aspect_ratio_and_clamps() {
-        // Derived from CONTENT_WIDTH rather than written out, so tuning that
-        // estimate does not turn this into a failing test about a number
-        // nobody chose deliberately.
+        // Derived from CONTENT_WIDTH so tuning it doesn't break this test.
         let expect = |w: f64, h: f64| (CONTENT_WIDTH * h / w).round() as i32;
 
         let sixteen_nine = expect(16.0, 9.0);
@@ -2009,12 +1927,9 @@ mod tests {
 
     /// Whatever the post says, it has to end up on the label.
     ///
-    /// Asserted through a real `GtkLabel` rather than by re-parsing the markup,
-    /// because `GtkLabel` runs *two* parsers — its own, which extracts the `<a>`
-    /// tags, and then Pango's — and only the label answers for both. The label
-    /// showing the post text back is the whole property: `set_markup` on markup
-    /// either parser rejects leaves the label untouched, and every case below
-    /// was a post that rendered blank.
+    /// Asserted through a real `GtkLabel`: it runs two parsers, its own for the
+    /// `<a>` tags and then Pango's, and only the label answers for both. Every
+    /// case below was a post that rendered blank.
     #[test]
     fn every_kind_of_post_text_ends_up_on_the_label() {
         crate::ui::with_gtk(every_kind_of_post_text_ends_up_on_the_label_body);
@@ -2178,11 +2093,7 @@ mod tests {
         }
     }
 
-    /// Every kind of standalone media embed is shown whole, at its own shape.
-    ///
-    /// Three separate bugs meet here: a GIF that rendered as nothing at all, a
-    /// GIF that would otherwise render as a link card, and a video cropped to
-    /// fill a frame it was never measured for.
+    /// Standalone media is shown whole at its own aspect ratio.
     #[test]
     fn standalone_media_is_shown_whole_and_a_gif_is_playable() {
         crate::ui::with_gtk(standalone_media_is_shown_whole_and_a_gif_is_playable_body);
@@ -2362,13 +2273,10 @@ mod tests {
         })
     }
 
-    /// A recycled row must not carry the last post's pipeline into the next one.
+    /// A recycled row must not carry the old post's pipeline.
     ///
-    /// This is the leak in a `GtkListView` feed, and it has two doors: the
-    /// factory's `unbind`, and `bind` itself when a row is reused for a
-    /// different post. Both are exercised here against the live pipeline count,
-    /// because "we call release in bind" is a claim about code and this is a
-    /// claim about the process.
+    /// Two paths: the factory's `unbind`, and `bind` reusing a row. Checked
+    /// against `live_pipelines`.
     #[test]
     fn a_recycled_row_gives_up_its_video() {
         crate::ui::with_gtk(a_recycled_row_gives_up_its_video_body);
@@ -2439,12 +2347,7 @@ mod tests {
         assert_eq!(crate::media::live_pipelines(), 0);
     }
 
-    /// A quoted video keeps the thumbnail that opens the viewer.
-    ///
-    /// Nesting a transport and a drag-scrubber inside a focusable,
-    /// Space-activatable card with a claim-on-release gesture is a keyboard and
-    /// gesture mess for an embed that small — and halving the slot count is a
-    /// bonus rather than the reason.
+    /// A quoted video keeps its thumbnail and opens the viewer.
     #[test]
     fn a_quoted_video_does_not_play_inline() {
         crate::ui::with_gtk(a_quoted_video_does_not_play_inline_body);
@@ -2476,21 +2379,12 @@ mod tests {
         row.release_video();
     }
 
-    /// A quote card must not out-rank the controls inside it.
-    ///
-    /// A `GtkButton` runs its click gesture in the CAPTURE phase and claims the
-    /// sequence on release. Capture is walked ancestors-first, so a button
-    /// wrapping the whole card answered the release before the play button, the
-    /// image cells or the link card ever saw it - it claimed, GTK cancelled
-    /// their gestures and stopped propagating, and the app navigated to the
-    /// quoted thread instead of activating what was clicked.
-    ///
-    /// GTK's ordering rules make this structural, so the test is structural:
-    /// nothing enclosing the card's interior may run a capture-phase gesture.
+    /// A quote card must not out-rank the controls inside it. See
+    /// `render_quote`: nothing enclosing the card's interior may run a
+    /// capture-phase gesture.
     ///
     /// Video, images, the link card and a nested quote share one test because
-    /// GTK may only be used from the thread that initialised it, and the test
-    /// harness gives each `#[test]` a thread of its own.
+    /// GTK may only be used from the thread that initialised it.
     #[test]
     fn quote_card_does_not_pre_empt_the_controls_inside_it() {
         // On the GTK thread, or skipped where there is no display: see

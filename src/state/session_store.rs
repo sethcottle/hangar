@@ -14,18 +14,17 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-/// One row of `oauth-sessions.json`: atrium's session plus the two
-/// authorization-time facts atrium derives `client_id` from.
+/// One row of `oauth-sessions.json`: atrium's session plus the redirect URI and
+/// scopes it derives `client_id` from.
 ///
 /// A loopback OAuth client has no registered `client_id`; atrium rebuilds one
-/// from the redirect URI and the scope list on *every* token request, refreshes
-/// included. A refresh that does not reproduce both byte for byte presents a
-/// `client_id` the refresh token was never issued to and the authorization
-/// server rejects it. atrium's own `Session` records neither, so we do.
+/// from those two on every token request, refreshes included, and the server
+/// rejects a refresh whose `client_id` does not match byte for byte. atrium's
+/// `Session` stores neither.
 ///
-/// The extra keys sit beside atrium's own rather than nesting them, so a file
-/// written by a build that predates them still loads (the fields default to
-/// `None`) and a file written here still loads in such a build.
+/// The keys sit beside atrium's own rather than nested, so a file written by a
+/// build that predates them still loads (they default to `None`), and one
+/// written here still loads in that build.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct StoredSession {
     #[serde(flatten)]
@@ -96,8 +95,7 @@ impl FileSessionStore {
         let Some(row) = guard.get(did) else {
             return Ok(None);
         };
-        // Both or neither: they are written together, and half a binding
-        // rebuilds a `client_id` as wrong as no binding at all.
+        // Both or neither; a half binding rebuilds the wrong client_id.
         Ok(row.redirect_uri.clone().zip(row.scopes.clone()))
     }
 
@@ -129,24 +127,11 @@ impl FileSessionStore {
 
     /// Backdate a stored session's expiry so the next refresh actually runs.
     ///
-    /// atrium-oauth refreshes lazily: on a DPoP `invalid_token` response it
-    /// calls into the session registry, which returns the cached session
-    /// untouched if `expires_at` is still in the future and only performs a
-    /// real refresh once the clock has passed it.
-    ///
-    /// That leaves no way out when the server rejects a token that has not
-    /// expired by our clock -- revoked, rotated, or bound to a DPoP key the
-    /// server no longer honours. The refresh is skipped, the retry replays the
-    /// same dead token, and restarting does not help because the session is
-    /// restored from this file without a refresh either. The app is stuck with
-    /// every authenticated call failing until the recorded expiry passes.
-    ///
-    /// Treating our cached expiry as untrustworthy costs nothing when the
-    /// token is good: no request fails, so no refresh is ever attempted. It
-    /// only matters when a call does come back rejected, and then it lets the
-    /// refresh do real work instead of short-circuiting. Orthogonal to the
-    /// stored client binding: this decides whether a refresh is *attempted*,
-    /// the binding decides whether it is *accepted*.
+    /// atrium-oauth refreshes lazily: on a DPoP `invalid_token` it returns the
+    /// cached session untouched while `expires_at` is in the future. A token
+    /// the server has revoked or rotated is therefore replayed forever, and a
+    /// restart does not help because the session is restored from this file
+    /// unrefreshed.
     pub fn invalidate_cached_expiry(&self, did: &Did) -> Result<(), StoreError> {
         let mut guard = self.inner.lock().map_err(|_| StoreError::Lock)?;
         let Some(row) = guard.get_mut(did) else {
@@ -161,10 +146,9 @@ impl FileSessionStore {
 
     /// Attach the client binding to a session on its way to disk.
     ///
-    /// atrium writes back through `set` after every successful refresh, from a
-    /// store handle that knows nothing about the original authorization. Taking
-    /// the existing row's binding when this handle has none keeps that write
-    /// from erasing it and breaking the *next* refresh.
+    /// atrium writes back through `set` after every refresh, from a handle that
+    /// knows nothing about the original authorization. Take the existing row's
+    /// binding when this handle has none, or that write erases it.
     fn bind(&self, session: Session, existing: Option<&StoredSession>) -> StoredSession {
         StoredSession {
             session,
@@ -266,8 +250,7 @@ mod tests {
         }
     }
 
-    /// The flattened layout has to stay readable both ways, or shipping this
-    /// change would strand every session written before it.
+    /// The flattened layout must stay readable both ways.
     #[test]
     fn legacy_row_loads_without_a_binding() {
         let row: StoredSession = serde_json::from_str(LEGACY_ROW).expect("legacy row parses");
@@ -301,9 +284,8 @@ mod tests {
         assert_eq!(bare.token_set.access_token, "access");
     }
 
-    /// The regression that would silently reintroduce the original bug: atrium
-    /// writes back through `set` after a successful refresh with no pending
-    /// binding, and dropping it there breaks the refresh after next.
+    /// atrium calls `set` after a refresh with no pending binding; it must not
+    /// drop the stored one.
     #[test]
     fn refresh_write_keeps_the_existing_binding() {
         let legacy: StoredSession = serde_json::from_str(LEGACY_ROW).unwrap();

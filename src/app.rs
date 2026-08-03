@@ -28,13 +28,11 @@ static API_SEMAPHORE: Lazy<Arc<Semaphore>> = Lazy::new(|| Arc::new(Semaphore::ne
 
 /// Why a stored session could not be resumed on launch.
 ///
-/// The two arms need different handling and used to get none: the receiving end
-/// discarded the error and put up a bare login dialog either way, so a session
-/// the server had permanently refused looked exactly like a first run.
+/// The receiving end used to discard the error and put up a bare login dialog
+/// either way, so a permanently refused session looked like a first run.
 enum RestoreFailure {
-    /// The session is dead and waiting will not revive it — the tokens were
-    /// refused, or the `client_id` they were issued under cannot be rebuilt.
-    /// What is in the keyring is worthless and has to go with it.
+    /// Dead session: the tokens were refused, or the `client_id` they were
+    /// issued under cannot be rebuilt. Clear the keyring too.
     Reauth,
     /// Everything else: nothing stored yet, the keyring unavailable, the
     /// network down mid-restore. The stored session may well still be good.
@@ -317,10 +315,8 @@ impl HangarApplication {
                     .map_err(|e| RestoreFailure::Other(e.to_string()))?;
                 match client.resume_session(&session).await {
                     Ok(()) => Ok(session),
-                    // Kept apart from every other failure all the way to the
-                    // UI: this one is permanent, and it is the only one where
-                    // the right thing to do is throw the stored session away
-                    // and ask for a new sign-in.
+                    // Permanent: drop the stored session and ask for a new
+                    // sign-in.
                     Err(ClientError::ReauthRequired) => Err(RestoreFailure::Reauth),
                     Err(e) => Err(RestoreFailure::Other(e.to_string())),
                 }
@@ -363,10 +359,9 @@ impl HangarApplication {
                 Ok(Err(failure)) => {
                     let notice = match &failure {
                         RestoreFailure::Reauth => {
-                            // The OAuth row on disk has already been dropped as
-                            // unusable, but the keyring copy is what makes the
-                            // app try again on the next launch and land in the
-                            // same place. Clear it, or this repeats forever.
+                            // The OAuth row on disk is already gone, but the
+                            // keyring copy makes the next launch land here
+                            // again. Clear it, or this repeats forever.
                             thread::spawn(move || {
                                 if let Err(e) = runtime::block_on(SessionManager::clear()) {
                                     eprintln!("hangar: could not clear the expired session: {e}");
@@ -378,10 +373,8 @@ impl HangarApplication {
                             )
                         }
                         RestoreFailure::Other(e) => {
-                            // Not fatal to the account, so the dialog says
-                            // nothing: it is the ordinary "no session stored
-                            // yet" case as often as it is a real fault. The log
-                            // is where the difference lives.
+                            // Often just "nothing stored yet", so the dialog
+                            // says nothing. See the log.
                             eprintln!("hangar: could not restore the saved session: {e}");
                             None
                         }
@@ -404,17 +397,14 @@ impl HangarApplication {
 
     /// Sign out: clear session, close window, and restart fresh
     fn sign_out(&self) {
-        // Drop the live agent first. Closing the window does not: the client
-        // and the 30-second new-posts poll both hang off the application, so
-        // the old account's agent would otherwise keep issuing requests right
-        // through the next sign-in — refreshing tokens, and writing its own row
-        // back over the session file the new sign-in is writing into.
+        // Drop the live agent first; closing the window does not. The client
+        // and the 30-second poll both hang off the application, so the old
+        // account's agent would keep refreshing tokens and writing its own row
+        // over the session file the new sign-in is writing into.
         self.client().sign_out();
 
-        // Per-account state that outlives the window with it. `newest_post_uri`
-        // in particular is the only thing the poll checks before it does any
-        // work, so clearing it is what actually quiets the poll down until a
-        // new timeline has arrived.
+        // Per-account state that outlives the window. The poll checks
+        // `newest_post_uri` before doing anything, so clearing it quiets it.
         let imp = self.imp();
         imp.newest_post_uri.replace(None);
         imp.timeline_cursor.replace(None);
@@ -437,12 +427,11 @@ impl HangarApplication {
         gio::prelude::ApplicationExt::activate(self.upcast_ref::<gio::Application>());
     }
 
-    /// Say so, once, if a request has just died of an expired session.
+    /// Say so once when a request died of an expired session.
     ///
-    /// The client latches a refusal it could not refresh past, because nothing
+    /// The client latches a refusal it could not refresh past: nothing
     /// downstream of `e.to_string()` can tell that apart from the server being
-    /// briefly unreachable. Consuming the latch here is what turns "the
-    /// timeline silently stopped updating" into something with an answer.
+    /// briefly unreachable.
     fn report_session_expiry(&self) {
         if !self.client().take_session_expired() {
             return;
@@ -456,11 +445,7 @@ impl HangarApplication {
         self.show_login_dialog_with_notice(window, None);
     }
 
-    /// Show the login dialog, optionally saying why it came up.
-    ///
-    /// A dialog that appears out of nowhere on launch is indistinguishable from
-    /// never having been signed in, which is the wrong story to tell somebody
-    /// whose session has just been refused.
+    /// Show the login dialog, with a reason when there is one.
     fn show_login_dialog_with_notice(&self, window: &HangarWindow, notice: Option<&str>) {
         let dialog = LoginDialog::new();
 
@@ -1566,10 +1551,9 @@ impl HangarApplication {
                 Ok(Err(e)) => {
                     app.imp().checking_new_posts.replace(false);
                     eprintln!("Failed to check for new posts: {}", e);
-                    // The poll is the only thing still talking to the server on
-                    // an idle window, so it is where a session dying mid-use
-                    // shows up first — as the timeline quietly never updating
-                    // again.
+                    // The poll is the only thing talking to the server on an
+                    // idle window, so a session dying mid-use shows up here
+                    // first.
                     app.report_session_expiry();
                     glib::ControlFlow::Break
                 }

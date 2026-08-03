@@ -1,37 +1,20 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Recognising the animated GIFs that arrive disguised as link cards.
+//! GIFs, which Bluesky sends as link cards.
 //!
-//! Bluesky has no GIF embed. A GIF posted from the composer's picker arrives as
-//! an ordinary [`app.bsky.embed.external`][ext] view whose `uri` points at a GIF
-//! host, with `title`, `description` and a still `thumb` filled in exactly as a
-//! news link would have them. Rendering that as a link card is what every other
-//! client's fallback does, and it is what Hangar did before this module existed
-//! — a static thumbnail, a title, and an "ALT: …" description, with nothing to
-//! say the thing is animated.
+//! There is no GIF embed in the lexicon. A GIF from the composer's picker
+//! arrives as an `app.bsky.embed.external` view whose `uri` points at a GIF
+//! host, with `title`, `description` and a still `thumb`.
 //!
-//! Two hosts matter:
+//! Two hosts: Klipy (`static.klipy.com`) and Tenor, still in older posts. All
+//! 2,390 GIFs sampled from `whats-hot` and `hot-classic` were Klipy.
 //!
-//! * **Klipy** is the current one. Every GIF in a 2,390-post sample of
-//!   `whats-hot` and `hot-classic` taken while writing this was
-//!   `static.klipy.com`; not one was Tenor.
-//! * **Tenor** is the previous one. Bluesky migrated providers, so Tenor URIs
-//!   survive only in older posts — which is exactly why they still have to be
-//!   handled.
+//! The `uri` is the multi-megabyte `.gif` itself. Both hosts put enough in the
+//! URL to name Bluesky's MP4/WebM re-encode on `*.gifs.bsky.app`, which
+//! [`crate::media::build_pipeline`] can decode and is about six times smaller.
+//! Rewrite rules transcribed from Bluesky's `parseKlipyGif` / `parseTenorGif`.
 //!
-//! Neither host's `uri` is directly playable: it is the multi-megabyte `.gif`
-//! itself. Both, though, carry enough in the URL to name Bluesky's own re-encode
-//! of the same animation as MP4 or WebM behind `*.gifs.bsky.app`, which is what
-//! [`crate::media::build_pipeline`] can actually decode and is around six times
-//! smaller. The rewrite rules below are transcribed from Bluesky's shipping
-//! `parseKlipyGif` / `parseTenorGif`, so a GIF that plays on bsky.app plays
-//! here.
-//!
-//! Giphy is deliberately absent. Bluesky gates it behind explicit user consent
-//! rather than treating it as a first-party GIF source, so Hangar leaves a Giphy
-//! link as the link card it already renders.
-//!
-//! [ext]: https://docs.bsky.app/docs/advanced-guides/posts#website-card-embeds
+//! Giphy needs explicit user consent, so Giphy links stay link cards.
 
 use url::Url;
 
@@ -45,12 +28,9 @@ const METADATA_PARAMS: [&str; 4] = ["hh", "ww", "mp4", "webm"];
 
 /// An animated GIF recovered from an external link card.
 ///
-/// Deliberately *not* a field on [`crate::atproto::ExternalEmbed`] and not a new
-/// [`crate::atproto::Embed`] variant: everything here is a pure function of the
-/// `uri` that embed already carries, so deriving it at render time keeps the
-/// cached-post JSON on disk byte-identical to what earlier versions wrote. A new
-/// non-defaulted field there would make every one of those rows fail to
-/// deserialize, and `cache::posts` drops undeserializable embeds silently.
+/// Derived at render time, not stored on [`crate::atproto::ExternalEmbed`]: a
+/// new non-defaulted field there would fail every cached post's deserialize,
+/// and `cache::posts` drops those silently.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GifEmbed {
     /// An MP4 or WebM of the same animation, which `playbin3` can decode.
@@ -60,10 +40,7 @@ pub struct GifEmbed {
     pub aspect_ratio: (u32, u32),
 }
 
-/// Recognise `uri` as a GIF embed, or `None` to leave it as a link card.
-///
-/// `None` is always a safe answer: the caller renders the external card it would
-/// have rendered anyway.
+/// Recognise `uri` as a GIF embed. `None` leaves it as a link card.
 pub fn detect(uri: &str) -> Option<GifEmbed> {
     let url = Url::parse(uri).ok()?;
     parse_klipy(&url).or_else(|| parse_tenor(&url))
@@ -72,10 +49,8 @@ pub fn detect(uri: &str) -> Option<GifEmbed> {
 /// Klipy: `https://static.klipy.com/ii/<hash>/<a>/<b>/<slug>.gif?hh=&ww=&mp4=&webm=`
 ///
 /// The playable asset is the same path with the host swapped, the metadata
-/// parameters dropped, and the final segment replaced by the per-format slug the
-/// composer recorded in `mp4=` / `webm=`. Without either slug there is nothing
-/// to point a decoder at, and Bluesky itself falls back to the link card — so
-/// this returns `None` rather than inventing a URL that would 404.
+/// parameters dropped, and the final segment replaced by the per-format slug
+/// from `mp4=` / `webm=`. No slug means no playable asset; return `None`.
 fn parse_klipy(url: &Url) -> Option<GifEmbed> {
     if url.host_str()? != "static.klipy.com" || !url.path().starts_with("/ii/") {
         return None;
@@ -89,15 +64,13 @@ fn parse_klipy(url: &Url) -> Option<GifEmbed> {
         (None, Some(webm)) => (webm, "webm"),
         (None, None) => return None,
     };
-    // The slug is wire data being spliced into a URL that gets handed straight
-    // to GStreamer, so it is checked rather than trusted.
+    // Wire data spliced into a URL handed to GStreamer.
     if !is_safe_segment(&slug) {
         return None;
     }
 
     let mut player = url.clone();
-    // Fixed host and scheme, set rather than inherited: the result can only ever
-    // address Bluesky's CDN, whatever the post claimed.
+    // Host and scheme set, not inherited.
     player.set_scheme("https").ok()?;
     player.set_host(Some(KLIPY_PLAYER_HOST)).ok()?;
     strip_metadata_params(&mut player);
@@ -118,11 +91,8 @@ fn parse_klipy(url: &Url) -> Option<GifEmbed> {
 /// Tenor encodes the format in the id rather than in a slug: `AAAAC` is the GIF,
 /// `AAAP1` the MP4, `AAAP3` the WebM.
 ///
-/// Unverified against a live URL: no Tenor GIF survived in any feed sampled
-/// while this was written, so these rules are a transcription of Bluesky's
-/// parser rather than something observed working. A wrong guess degrades to a
-/// broken player rather than a wrong page, and `detect` returning `None` for
-/// anything unrecognised keeps the blast radius to Tenor posts.
+/// Unverified: no Tenor GIF appeared in any sampled feed. Transcribed from
+/// Bluesky's parser.
 fn parse_tenor(url: &Url) -> Option<GifEmbed> {
     if url.host_str()? != "media.tenor.com" {
         return None;
@@ -180,9 +150,8 @@ fn strip_metadata_params(url: &mut Url) {
 
 /// Whether a wire-supplied string is safe to splice into a URL path.
 ///
-/// Real slugs and ids are base62 with the occasional separator. Anything else —
-/// an empty string, a traversal, an encoded slash, a scheme — is refused, and
-/// the post falls back to its link card.
+/// Real slugs and ids are base62 with the occasional separator. Anything else
+/// is refused and the post falls back to its link card.
 fn is_safe_segment(segment: &str) -> bool {
     !segment.is_empty()
         && segment != "."
@@ -208,7 +177,7 @@ mod tests {
             gif.video_url,
             "https://k.gifs.bsky.app/ii/4493325008d34b7bf8cd6813cd5c1619/76/03/UxPaHvFAwuHpj3.mp4"
         );
-        // hh/ww are the whole reason a GIF never has to fall back to 16:9.
+        // hh/ww, so no 16:9 fallback.
         assert_eq!(gif.aspect_ratio, (498, 278));
         // Every metadata parameter is gone, and nothing is left dangling.
         assert!(!gif.video_url.contains('?'));

@@ -59,9 +59,8 @@ pub struct HangarClient {
     oauth_agent: RwLock<Option<OAuthAgentType>>,
     service_url: String,
     /// Set once the server rejects our credentials after atrium has already
-    /// tried to refresh them. Latched rather than reported per call because a
-    /// dead session fails every in-flight request at once and the user should
-    /// be asked to sign in once, not a dozen times.
+    /// tried to refresh them. Latched, because a dead session fails every
+    /// in-flight request at once.
     session_expired: AtomicBool,
 }
 
@@ -131,13 +130,9 @@ impl HangarClient {
     /// Turn an XRPC failure into our own error, noticing a session the server
     /// will not accept any more.
     ///
-    /// Both agents answer a rejected token the same way: refresh, retry once,
-    /// and throw away whatever the refresh itself returned (atrium-oauth's
-    /// `oauth_session/inner.rs`, atrium-api's `atp_agent/inner.rs`). A rejection
-    /// reaching us is therefore the *second* one -- the refresh did not fix it
-    /// and no further in-process retry will. That silence is why this is the
-    /// only signal we get that a session is dead rather than merely stale, so
-    /// latch it here instead of letting it blur into the network errors.
+    /// Both agents refresh, retry once, then discard the refresh error
+    /// (atrium-oauth `oauth_session/inner.rs`, atrium-api `atp_agent/inner.rs`).
+    /// A rejection reaching us is the second one, so latch it.
     fn xrpc_error<E: std::fmt::Debug + std::fmt::Display>(
         &self,
         e: atrium_api::xrpc::Error<E>,
@@ -167,10 +162,7 @@ impl HangarClient {
         ClientError::Network(e.to_string())
     }
 
-    /// Consume the expired-session flag, returning true at most once per death.
-    ///
-    /// The hook the UI needs to prompt for a new sign-in: nothing else in the
-    /// app can tell a session atrium failed to refresh from a working one.
+    /// Consume the expired-session flag. True at most once per dead session.
     pub fn take_session_expired(&self) -> bool {
         self.session_expired.swap(false, Ordering::Relaxed)
     }
@@ -203,12 +195,10 @@ impl HangarClient {
 
     /// Forget whichever session is active.
     ///
-    /// The client outlives the window it was signed in through, so without this
-    /// a sign-out leaves the previous account's agent in place and usable. The
-    /// 30-second new-posts poll is held by the application rather than the
-    /// window and survives too, so that agent goes on making requests — and an
-    /// OAuth agent that refreshes writes the whole session file back as it
-    /// found it, over whatever the next sign-in has since written there.
+    /// The client outlives the window, and so does the 30-second poll, so
+    /// without this the previous account's agent keeps making requests - and an
+    /// OAuth agent that refreshes writes the whole session file back over
+    /// whatever the next sign-in has written.
     pub fn sign_out(&self) {
         *self.credential_agent.write().unwrap() = None;
         *self.oauth_agent.write().unwrap() = None;
@@ -316,16 +306,13 @@ impl HangarClient {
         let oauth_client = match OAuthManager::build_restore_client(store.clone(), &did) {
             Ok(client) => client,
             Err(OAuthError::MissingClientBinding) => {
-                // Unrecoverable and permanent: the client_id this session's
-                // refresh token was issued to was derived from a callback port
-                // that no longer exists anywhere. Drop the row so it stops
-                // presenting itself as a session we could still use.
+                // The callback port is gone, so the client_id cannot be
+                // rebuilt. Drop the row.
                 if let Err(e) = store.del(&did).await {
                     eprintln!("hangar: could not discard the unusable OAuth session: {e}");
                 }
-                // Reported through the return value rather than the latch: the
-                // caller is already waiting on this, and latching as well would
-                // have the UI raise the same thing twice.
+                // Returned, not latched: the caller is already waiting, and
+                // latching as well would raise it twice.
                 return Err(ClientError::ReauthRequired);
             }
             Err(e) => {
@@ -485,9 +472,8 @@ impl HangarClient {
 
         let embed_ref = match embed.as_ref()? {
             Union::Refs(embed_ref) => embed_ref,
-            // A lexicon atrium does not know about. Some of them we can still
-            // read off the raw IPLD; the rest are at least named in the log
-            // rather than becoming a post with a hole in it.
+            // A lexicon atrium does not know. Read what we can off raw IPLD,
+            // log the rest.
             Union::Unknown(unknown) => return Self::extract_unknown_embed(unknown, "post"),
         };
 
@@ -546,12 +532,9 @@ impl HangarClient {
     /// resolved.
     ///
     /// Never `and_then` the two together. A quote can be blocked, deleted or
-    /// detached, and a media half can be a lexicon this build does not know,
-    /// and both of those are ordinary. Requiring both is what made a post whose
-    /// quote had been deleted, or whose media was a GIF, come back as
-    /// `embed: None` — and `PostRow` hides the embed container outright for
-    /// `None`, so the post rendered as an author, a timestamp, an action bar
-    /// and a blank space where the content should be.
+    /// detached, and a media half can be an unknown lexicon. Requiring both
+    /// returned `embed: None`, and `PostRow` hides the embed container for
+    /// `None`, so the post rendered with a blank body.
     fn combine_record_with_media(quote: Option<QuoteEmbed>, media: Option<Embed>) -> Option<Embed> {
         match (quote, media) {
             (Some(quote), Some(media)) => Some(Embed::QuoteWithMedia {
@@ -566,18 +549,13 @@ impl HangarClient {
 
     /// Best effort at an embed whose `$type` is not in this build's lexicons.
     ///
-    /// `app.bsky.embed.gallery` is the multi-image lexicon that supersedes
-    /// `app.bsky.embed.images`, and atrium-api 0.25 — the newest published
-    /// version — has no module for it, so it arrives as `Union::Unknown` and
-    /// used to be dropped on the floor. That was roughly 0.8% of embedded posts
-    /// in a live sample, every one of them rendering as a blank post body. The
-    /// view's items are `{thumbnail, fullsize, alt, aspectRatio}`, which is
-    /// exactly [`ImageEmbed`], so they are read straight off the raw IPLD and
-    /// rendered by the existing image grid.
+    /// `app.bsky.embed.gallery` supersedes `app.bsky.embed.images`, and
+    /// atrium-api 0.25 (the newest published) has no module for it, so it
+    /// arrives as `Union::Unknown`. Dropping it was ~0.8% of embedded posts in
+    /// a live sample, each rendering as a blank body. Its items are
+    /// `{thumbnail, fullsize, alt, aspectRatio}`, which is [`ImageEmbed`].
     ///
-    /// Anything else is named on stderr. A silent `None` here is indistinguish-
-    /// able from a post with no embed, which is what made this class of bug so
-    /// hard to see from the outside.
+    /// Anything else is named on stderr.
     fn extract_unknown_embed(
         unknown: &atrium_api::types::UnknownData,
         context: &str,
@@ -785,12 +763,10 @@ impl HangarClient {
                         .map(|ar| (ar.data.width.get() as u32, ar.data.height.get() as u32)),
                 }))
             }
-            // The third variant of this union, and the one that was missing.
-            // "Quote a post, reply with a GIF" is the single most common shape
-            // a record-with-media takes — GIFs are `external` views, not a
-            // media type of their own — and dropping it here is what produced
-            // the empty post body. Ordinary link cards attached to a quote were
-            // collateral damage from the same line.
+            // The third variant, and the one that was missing. "Quote a post,
+            // reply with a GIF" is the commonest record-with-media shape, since
+            // GIFs are `external` views. Dropping it gave the empty post body,
+            // and took ordinary link cards on a quote with it.
             Union::Refs(ViewMediaRefs::AppBskyEmbedExternalView(external_view)) => {
                 let ext = &external_view.data.external;
                 Some(Embed::External(ExternalEmbed {
@@ -1145,7 +1121,7 @@ impl HangarClient {
                 if let Ok(did) = self.resolve_handle(handle).await {
                     resolved_dids.insert(handle.clone(), did);
                 }
-                // Failed resolutions silently skipped — no facet will be created
+                // Failed resolutions silently skipped - no facet will be created
             }
         }
 
@@ -1211,7 +1187,7 @@ impl HangarClient {
             .await
             .map_err(|e| self.xrpc_error(e))?;
 
-        // Serialize the BlobRef to JSON — atrium's BlobRef implements Serialize.
+        // Serialize the BlobRef to JSON; atrium's BlobRef implements Serialize.
         // The output contains the blob reference we need for embeds.
         let blob_json = serde_json::to_value(&output.data.blob)
             .map_err(|e| ClientError::InvalidResponse(e.to_string()))?;
@@ -2434,7 +2410,7 @@ static HTML_TITLE_RE: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| regex::Regex::new(r"<title[^>]*>([^<]*)</title>").unwrap());
 
 /// Fetch Open Graph metadata from a URL for link card previews.
-/// This is a plain HTTP request — does not require authentication.
+/// This is a plain HTTP request; does not require authentication.
 pub async fn fetch_link_card_meta(url: &str) -> Result<LinkCardData, ClientError> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
@@ -2561,14 +2537,9 @@ mod tests {
         }])
     }
 
-    /// A GIF attached to a quote post is an `external` view, and `external` was
-    /// the one variant of this union that had no arm.
-    ///
-    /// It fell into `_ => None`, the `None` propagated out through
-    /// `extract_embed`, and `PostRow` hides its embed container for a post with
-    /// no embed — an author, a timestamp, an action bar, and nothing in
-    /// between. "Quote a post, reply with a GIF" is the most common shape a
-    /// record-with-media takes, so this was not a corner.
+    /// A GIF attached to a quote is an `external` view, which was the one
+    /// variant of this union with no arm: it fell into `_ => None` and the post
+    /// rendered with a blank body.
     #[test]
     fn an_external_attached_to_a_quote_still_reaches_the_ui() {
         let media: Union<ViewMediaRefs> = serde_json::from_str(

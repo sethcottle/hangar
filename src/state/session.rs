@@ -9,12 +9,8 @@ const SECRET_LABEL: &str = "Hangar Bluesky Session";
 
 #[derive(Error, Debug)]
 pub enum SessionError {
-    /// Nothing on the session bus implements org.freedesktop.secrets.
-    ///
-    /// Worth separating from other failures: it is not a bug or a transient
-    /// problem, it means the desktop has no keyring and the user has to
-    /// install one. Common on Xfce, and on tiling or minimal setups that
-    /// ship no keyring by default.
+    /// Nothing on the session bus implements org.freedesktop.secrets - the
+    /// desktop has no keyring. Common on Xfce and minimal setups.
     #[error(
         "no keyring service is running, so the sign-in could not be saved. \
          Hangar stores credentials in the system keyring over D-Bus. Install and \

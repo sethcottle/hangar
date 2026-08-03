@@ -237,9 +237,8 @@ mod imp {
         pub reduce_motion_css_provider: RefCell<Option<gtk4::CssProvider>>,
         // Track which page was visible before settings (for back button)
         pub previous_page: RefCell<Option<String>>,
-        /// The one thing allowed to start a video, and the only strong
-        /// reference to it. Rows find it through a thread-local `Weak`, so it
-        /// has to die with the window — see `ui::inline_video`.
+        /// Only strong ref; rows find it through a thread-local `Weak`. See
+        /// `ui::inline_video`.
         pub video_director: RefCell<Option<Rc<crate::ui::inline_video::VideoDirector>>>,
     }
 
@@ -374,19 +373,9 @@ impl HangarWindow {
         let settings_page = self.build_settings_page();
         main_stack.add_named(&settings_page, Some("settings"));
 
-        // Leaving the feed stops the feed's video: a `GtkStack` unmaps the page
-        // it hides, and each slot's own unmap guard tears its pipeline down on
-        // the way out. What this adds is the trigger — a page switch changes
-        // what is on screen without scrolling, without touching a model and
-        // without registering a slot, so without this nothing would re-run the
-        // election on the way back either.
-        //
-        // Deliberately not "suspend unless this is home". That refused a
-        // *press of the play button* on Profile, Likes, Search, Mentions and
-        // Activity, which are five ordinary feeds of the same rows, all wired
-        // for inline playback. The election decides what may autoplay by
-        // measuring where rows actually are, and every row of a page the stack
-        // has hidden is unmapped, so a hidden feed has no candidates.
+        // A page switch changes what is on screen without scrolling or a model
+        // change, so re-run the election. Do not suspend on a page switch -
+        // that refused the play button on five feeds.
         main_stack.connect_visible_child_notify(glib::clone!(
             #[weak(rename_to = window)]
             self,
@@ -573,11 +562,8 @@ impl HangarWindow {
         });
         Self::release_video_on_unbind(&factory);
 
-        // Weak, and so is every callback it installs below. The window owns
-        // this `GtkListView`, the list view owns the factory, and the factory
-        // owns this closure — a strong window here is a cycle the window can
-        // never get out of, which would mean `VideoDirector::drop` never runs
-        // and its election source outlives the window it was measuring.
+        // Weak, and so is every callback below: window -> list view -> factory
+        // -> this closure is a cycle, and `VideoDirector::drop` would never run.
         factory.connect_bind(glib::clone!(
             #[weak(rename_to = win)]
             self,
@@ -683,11 +669,9 @@ impl HangarWindow {
 
         let scrolled = gtk4::ScrolledWindow::new();
         scrolled.set_vexpand(true);
-        // Belt and braces behind the ellipsized labels in PostRow, and what the
-        // thread page has always done. A horizontal scrollbar on a feed is a bug
-        // report rather than a feature. It is a backstop and not the fix though:
-        // Never hands the rows' minimum width to the window instead of scrolling
-        // it, so the labels are what keep that minimum small.
+        // Never, not Automatic. This is a backstop - Never hands the rows'
+        // minimum width to the window instead of scrolling, so the ellipsized
+        // labels in PostRow are what keep it small.
         scrolled.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
         scrolled.set_child(Some(&clamp));
         overlay.set_child(Some(&scrolled));
@@ -731,9 +715,8 @@ impl HangarWindow {
 
         timeline_box.append(&overlay);
 
-        // Autoplay is scoped to this one scroller, mirroring
-        // `hide_replies_in_feed`'s main-feed-only scope. Threads, profiles,
-        // likes and search play inline too, but only when asked.
+        // Autoplay is scoped to this scroller. Other feeds play inline only on
+        // a press.
         if let Some(director) = self.imp().video_director.borrow().as_ref() {
             director.set_timeline_scroller(&scrolled);
         }
@@ -783,9 +766,7 @@ impl HangarWindow {
                 let upper = adj.upper();
                 let page_size = adj.page_size();
 
-                // Re-arm the one election source. Not an election: this fires
-                // per frame of a scroll, and the whole point of the settle
-                // delay is that flinging through fifty posts costs nothing.
+                // Re-arm, not elect: this fires per scroll frame.
                 win.schedule_video_election();
 
                 // Auto-hide "new posts" banner when user scrolls to top
@@ -821,12 +802,10 @@ impl HangarWindow {
 
     /// Make a `PostRow` factory give up its video when a row is recycled.
     ///
-    /// Every factory that builds `PostRow`s needs this, not just the timeline's
-    /// — a video started on the Likes page and scrolled past would otherwise
-    /// keep its decoder, its audio sink and its bus watch bound to a row that
-    /// has since been rebound to somebody else's post. `release_video` is
-    /// idempotent, so it costs nothing on the overwhelming majority of rows
-    /// that never had one.
+    /// Every `PostRow` factory needs this, not just the timeline's: a video
+    /// started on the Likes page and scrolled past would otherwise keep its
+    /// decoder and bus watch bound to a rebound row. `release_video` is
+    /// idempotent.
     pub(crate) fn release_video_on_unbind(factory: &gtk4::SignalListItemFactory) {
         factory.connect_unbind(|_, item| {
             if let Some(list_item) = item.downcast_ref::<gtk4::ListItem>()
@@ -837,11 +816,7 @@ impl HangarWindow {
         });
     }
 
-    /// Re-arm the one election timer, if there is a director to arm it.
-    ///
-    /// Every scroll frame, model change and page switch comes through here.
-    /// With autoplay off and nothing playing — the default — it arms nothing
-    /// at all.
+    /// Re-arm the election timer if a director exists.
     fn schedule_video_election(&self) {
         let director = self.imp().video_director.borrow().clone();
         if let Some(director) = director {
@@ -851,10 +826,8 @@ impl HangarWindow {
 
     /// Refetch the timeline, exactly as the refresh button does.
     ///
-    /// For settings that change what a feed batch is allowed to contain: the
-    /// filter runs as posts go into the model, so the posts already in it were
-    /// filtered under the old setting and cannot be re-filtered in place —
-    /// switching replies back on has nothing to switch them back on from.
+    /// `filter_feed_posts` runs as posts enter the model, so posts already in it
+    /// cannot be re-filtered.
     pub fn refresh_feed(&self) {
         if let Some(callback) = self.imp().refresh_callback.borrow().as_ref() {
             callback();
@@ -897,8 +870,7 @@ impl HangarWindow {
     /// Drop replies from a feed batch when the user has asked for a quieter
     /// timeline.
     ///
-    /// Only applies to the main feed. Threads, profiles and likes deliberately
-    /// keep their replies, since a thread without replies is not a thread.
+    /// Main feed only. Threads, profiles and likes keep their replies.
     fn filter_feed_posts(posts: Vec<Post>) -> Vec<Post> {
         if !crate::state::AppSettings::load().hide_replies_in_feed {
             return posts;
@@ -1226,13 +1198,10 @@ impl HangarWindow {
         // Save current scroll position before navigating
         self.save_scroll_position();
 
-        // Tag pages by what they show so revisiting one returns to it instead
-        // of stacking a second copy. A thread legitimately contains posts whose
-        // own threads are worth opening -- a quote with its own replies, say --
-        // but the same post should never appear twice in one stack. Suppressing
-        // the click on the focused row alone was not enough: the same post also
-        // renders as a parent row once you are inside a reply's thread, and
-        // that row is a perfectly ordinary link.
+        // Tag pages by what they show so revisiting one returns to it instead of
+        // stacking a second copy. Suppressing the click on the focused row was
+        // not enough: the same post also renders as a parent row inside a
+        // reply's thread, and that row is an ordinary link.
         let tag = format!("thread:{}", post.uri);
         if nav_view.find_page(&tag).is_some() {
             nav_view.pop_to_tag(&tag);
@@ -1340,11 +1309,8 @@ impl HangarWindow {
         self.nav_view_named(visible_name.as_str())
     }
 
-    /// Make a top-level page visible without touching its navigation stack.
-    ///
-    /// For moves that are not a section switch -- entering and leaving settings
-    /// -- where whatever the user had drilled into has to still be there when
-    /// they come back.
+    /// Show a page without touching its navigation stack (entering and leaving
+    /// settings).
     fn show_page(&self, page_name: &str) {
         if let Some(stack) = self.imp().main_stack.borrow().as_ref() {
             stack.set_visible_child_name(page_name);
@@ -1353,11 +1319,9 @@ impl HangarWindow {
 
     /// Switch to a top-level page (Home, Mentions, etc.) - no animation
     ///
-    /// Each section keeps its own NavigationView, so drilling into a thread or
-    /// profile leaves that page on the section's stack. Selecting the section
-    /// again has to unwind it, otherwise switching the GtkStack is a no-op --
-    /// the section was already visible -- and the drilled-in page stays on
-    /// screen looking like the click did nothing.
+    /// Each section keeps its own NavigationView, so selecting the section
+    /// again has to unwind it. Without that, switching the GtkStack is a no-op
+    /// and the drilled-in page stays on screen.
     pub fn switch_to_page(&self, page_name: &str) {
         if let (Some(nav_view), Some(root_tag)) = (
             self.nav_view_named(page_name),
@@ -1626,9 +1590,8 @@ impl HangarWindow {
         let display_name = profile.display_name.as_deref().unwrap_or(&profile.handle);
         let title = gtk4::Label::new(Some(display_name));
         title.add_css_class("title");
-        // Display names are arbitrary length and a bare label's minimum width is
-        // its full text, which would push the page -- and so the window -- wider
-        // than the screen for a long enough name.
+        // A bare label's minimum width is its full text; a long display name
+        // would push the window past the screen.
         title.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         header.set_title_widget(Some(&title));
 
@@ -3330,8 +3293,7 @@ impl HangarWindow {
         // Load current settings once
         let current_settings = AppSettings::load();
 
-        // Sidebar order. Feed leads because the timeline is what the app mostly
-        // is, and Account trails because it is mostly links out to the website.
+        // Sidebar order.
         let pages = [
             self.build_settings_feed_page(&current_settings),
             self.build_settings_display_page(&current_settings),
@@ -3340,17 +3302,10 @@ impl HangarWindow {
         ];
 
         for page in &pages {
-            // An AdwPreferencesPage carries its own name, title and icon, so the
-            // sidebar row and the stack page it selects are built from one
-            // source and cannot drift apart the way two parallel arrays would.
-            //
-            // The cost of that is that a `build_settings_*_page` which forgets
-            // `set_name` or `set_icon_name` compiles, runs, and quietly drops
-            // its whole category out of both the sidebar and the stack. Skipping
-            // it silently is precisely how the next reshuffle of this page loses
-            // a setting, so say so instead — loudly in a debug build, and in the
-            // log in a release one, where the category is still missing but at
-            // least leaves a trace.
+            // AdwPreferencesPage carries its own name, title and icon, so the
+            // sidebar row and stack page come from one source. A page that
+            // forgets set_name or set_icon_name would silently vanish from
+            // both, so warn instead of skipping.
             let (Some(name), Some(icon_name)) = (page.name(), page.icon_name()) else {
                 debug_assert!(
                     false,
@@ -3453,12 +3408,9 @@ impl HangarWindow {
                 eprintln!("Failed to save settings: {e}");
             }
 
-            // Every other switch on these pages applies as you flip it. This
-            // one used to only write the file: `filter_feed_posts` runs as a
-            // batch goes into the model, so the timeline kept whatever it was
-            // built with until the next fetch, and turning replies back on did
-            // nothing visible at all. Refetch so the setting means something
-            // before the user has left the page.
+            // `filter_feed_posts` runs as a batch enters the model, so writing
+            // the file alone left the timeline as it was until the next fetch.
+            // Refetch.
             if let Some(window) = window_weak.upgrade() {
                 window.refresh_feed();
             }
@@ -3510,11 +3462,8 @@ impl HangarWindow {
                 eprintln!("Failed to save settings: {e}");
             }
 
-            // Deliberately not `refresh_feed`, unlike Hide Replies: this changes
-            // how the feed behaves, not what is in it, and refetching would
-            // throw away the scroll position for nothing. The director applies
-            // it where the user can see it — turning autoplay off stops the
-            // video that is playing, turning it on starts one.
+            // No refetch, unlike Hide Replies: this changes behaviour, not
+            // contents. The director applies it live.
             if let Some(window) = window_weak.upgrade() {
                 let director = window.imp().video_director.borrow().clone();
                 if let Some(director) = director {
@@ -3879,13 +3828,10 @@ impl HangarWindow {
 
     /// Show the settings page (top-level navigation, instant switch)
     pub fn show_settings_page(&self) {
-        // Remember current page so back button can return to it.
-        //
-        // Unless settings is already what is showing: the Settings item lives in
-        // the sidebar's account popover, which stays clickable while the page is
-        // up, and picking it a second time used to record "settings" as the page
-        // to go back to. The back arrow then returned to settings, which reads
-        // as a dead button.
+        // Remember the current page for the back button, unless settings is
+        // already showing: the Settings item stays clickable while the page is
+        // up, and picking it twice recorded "settings" as the page to go back
+        // to, so the back arrow did nothing.
         if let Some(stack) = self.imp().main_stack.borrow().as_ref() {
             if let Some(name) = stack.visible_child_name()
                 && name != "settings"
@@ -4136,13 +4082,10 @@ mod mention_row {
             let avatar_click = gtk4::GestureClick::new();
             let row_weak = self.downgrade();
             avatar_click.connect_released(move |gesture, _, _, _| {
-                // Claim the sequence, or the row's own gesture (added to
-                // `self` further down) also sees this release and one click on
-                // an avatar both opens the profile and opens the thread. Both
-                // gestures bubble, and bubble is walked descendants-first, so
-                // the avatar gets the release first and claiming here is what
-                // cancels the row's. Same rule as the quote card and the image
-                // cells in `post_row`.
+                // Claim, or the row's own gesture also sees this release and one
+                // click opens both the profile and the thread. Both bubble, so
+                // the avatar gets the release first. Same rule as the quote card
+                // in `post_row`.
                 gesture.set_state(gtk4::EventSequenceState::Claimed);
                 if let Some(row) = row_weak.upgrade() {
                     if let Some(cb) = row.imp().profile_clicked_callback.borrow().as_ref() {
@@ -4326,10 +4269,9 @@ mod mention_row {
 
         /// Forget the row-click handler.
         ///
-        /// `ListView` recycles rows, so a binding that leaves the handler alone
+        /// `ListView` recycles rows, so a bind that leaves the handler alone
         /// inherits the previous occupant's. A notification with no post kept
-        /// the closure some *other* notification installed, and clicking it
-        /// opened that unrelated thread.
+        /// an earlier one's closure and opened that unrelated thread on click.
         pub fn clear_clicked(&self) {
             self.imp().clicked_callback.replace(None);
         }
@@ -5013,20 +4955,13 @@ mod tests {
         }
     }
 
-    /// One click on a notification avatar has to mean one thing.
+    /// One click on a notification avatar must not also open the thread.
     ///
-    /// A notification row carries two click gestures: one on the avatar, which
-    /// opens the profile, and one on the row, which opens the post. Both
-    /// bubble, and bubble is walked descendants-first, so a click on the avatar
-    /// reaches the avatar's gesture first — but until it *claims* the sequence
-    /// the row's gesture answers the same release, and the single click both
-    /// opened the profile and navigated to the thread.
-    ///
-    /// GTK's propagation rules make that structural, so the test is structural,
-    /// in the same shape as `post_row`'s quote-card test: the avatar's gesture
-    /// must sit strictly deeper than the row's, and nothing between them may
-    /// capture. Whether `set_state(Claimed)` is then called cannot be observed
-    /// without synthesising input, which GTK4 gives no public way to do.
+    /// Two bubbling gestures, avatar and row. Bubble is walked
+    /// descendants-first, so the avatar's is reached first and is the one that
+    /// claims. Checked structurally - the avatar's gesture must sit strictly
+    /// deeper and nothing between may capture. Whether `set_state(Claimed)` is
+    /// called needs synthesised input, which GTK4 does not expose.
     #[test]
     fn a_notification_avatar_does_not_also_trigger_the_row() {
         crate::ui::with_gtk(a_notification_avatar_does_not_also_trigger_the_row_body);
@@ -5107,29 +5042,19 @@ mod tests {
         assert!(row.imp().clicked_callback.borrow().is_none());
     }
 
-    /// A window that has been closed has to be able to die.
+    /// A closed window must actually drop.
     ///
-    /// The window owns the list views, a list view owns its factory, and a
-    /// factory owns the `bind` closure — so a closure holding the window
-    /// strongly, or installing a row callback that did, was a cycle that
-    /// closing the window could not break. Nothing about that is visible while
-    /// the app is running, and the cost is not the widgets: it is that
-    /// `VideoDirector::drop`, which removes the one election source, would
-    /// never run.
-    ///
-    /// So the assertion is not "no leak" in the abstract. It is that the
-    /// director, which rows reach through a thread-local `Weak`, is gone once
-    /// its window is.
+    /// window -> list view -> factory -> `bind` closure is a cycle if the
+    /// closure holds the window strongly, and then `VideoDirector::drop` never
+    /// runs and its election source outlives the window.
     #[test]
     fn a_closed_window_takes_its_video_director_with_it() {
         crate::ui::with_gtk(a_closed_window_takes_its_video_director_with_it_body);
     }
 
     fn a_closed_window_takes_its_video_director_with_it_body() {
-        // Built without an application on purpose: `setup_ui` runs from
-        // `constructed` either way, and this keeps the one reference to the
-        // window in this function rather than in a `GtkApplication` that would
-        // have to be torn down first to prove anything.
+        // No application: `setup_ui` runs from `constructed` either way, and
+        // this keeps the only reference to the window in this function.
         let window: HangarWindow = glib::Object::builder().build();
         assert!(
             crate::ui::inline_video::director().is_some(),

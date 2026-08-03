@@ -20,9 +20,8 @@ const MAX_CONCURRENT: usize = 8;
 
 /// How often a waiting widget looks to see whether its bytes have landed.
 ///
-/// The fetch happens on another runtime and has no way to reach into GTK, so
-/// the main thread asks. One frame at 60Hz is fast enough that an image out of
-/// the memory cache still looks instant.
+/// The fetch runs on another runtime and cannot reach into GTK, so the main
+/// thread polls. One frame at 60Hz.
 const POLL_INTERVAL: Duration = Duration::from_millis(16);
 
 /// In-memory cache for loaded images (URL → bytes)
@@ -63,9 +62,7 @@ fn apply_avatar_bytes(avatar: &adw::Avatar, bytes: &[u8]) {
 
 /// Decode `bytes` onto `picture`, reporting whether anything was drawn.
 ///
-/// Bytes that arrived intact but are in a format this system has no loader for
-/// are a failed load, not a successful one: callers that go on to act on "the
-/// image on screen" have to be able to tell the difference.
+/// Bytes in a format gdk-pixbuf has no loader for count as a failed load.
 fn apply_bytes_to_picture(picture: &gtk4::Picture, bytes: &[u8]) -> bool {
     let glib_bytes = glib::Bytes::from(bytes);
     let stream = gtk4::gio::MemoryInputStream::from_bytes(&glib_bytes);
@@ -151,9 +148,8 @@ fn spawn_fetch_if_needed(url: &str) -> bool {
 
 /// The bytes fetched for `url`, if its fetch has already finished.
 ///
-/// Callers hand over the same URL they gave `load_image_into_picture`: the JPEG
-/// normalisation that decides the cache key happens in here, so a caller that
-/// looked up the raw URL itself would miss every CDN image.
+/// Pass the same URL given to `load_image_into_picture`: the JPEG normalisation
+/// that decides the cache key happens in here.
 pub fn cached_bytes(url: &str) -> Option<Vec<u8>> {
     AVATAR_CACHE
         .read()
@@ -214,17 +210,11 @@ struct LoadState {
     source: RefCell<Option<glib::SourceId>>,
 }
 
-/// A load that is still running.
+/// A load in flight.
 ///
-/// Dropping it abandons the load: the poll is removed, the widget is left
-/// exactly as its owner last set it, and the completion callback never runs.
-///
-/// That is what makes one `Picture` safe to reuse for several images. Without
-/// it, paging through a gallery leaves one poll per image alive, each holding a
-/// strong reference to the same widget and each calling `set_paintable`
-/// whenever its own bytes happen to land — so the picture ends up showing
-/// whichever image was slowest, regardless of which one the reader is on. It is
-/// also what stops a poll outliving the dialog whose picture it holds.
+/// Dropping it removes the poll and the callback never runs. Without it, paging
+/// a gallery leaves one poll per image, each holding the same `Picture` and
+/// calling `set_paintable` when its bytes land.
 #[must_use = "the load is cancelled the moment this handle is dropped"]
 pub struct ImageLoad {
     state: Rc<LoadState>,
@@ -234,9 +224,8 @@ pub struct ImageLoad {
 impl ImageLoad {
     /// Let the load finish on its own.
     ///
-    /// For a widget that is only ever asked to show one image and lives at
-    /// least as long as it is worth waiting for -- a feed thumbnail -- where
-    /// there is nothing a handle could usefully be cancelled against.
+    /// For a widget that shows one image and outlives the load, like a feed
+    /// thumbnail.
     pub fn detach(mut self) {
         self.cancel_on_drop = false;
     }
@@ -311,9 +300,8 @@ fn start_picture_load(
         let cached = AVATAR_CACHE.read().unwrap().get(&url).cloned();
         let result = match cached {
             Some(bytes) => decode_result(&picture, &bytes),
-            // The fetch inserts into the cache before it clears the in-flight
-            // mark, so "not cached and not in flight" is a fetch that finished
-            // with nothing — a 404, a timeout, a refused connection.
+            // The fetch caches before clearing the in-flight mark, so "not
+            // cached and not in flight" is a fetch that finished with nothing.
             None if IN_FLIGHT.read().unwrap().contains(&url) => {
                 return glib::ControlFlow::Continue;
             }
