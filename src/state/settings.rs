@@ -163,6 +163,18 @@ impl ColorScheme {
 /// Persistent application settings
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppSettings {
+    /// Text scale factor. `FontSize`'s hand-written `Default` is 1.0, which is
+    /// what the missing-field default resolves to.
+    ///
+    /// This was the one field without `#[serde(default)]`, and it mattered far
+    /// beyond the font size: [`Self::load`] is `from_str(..).unwrap_or_default()`,
+    /// so a `settings.json` written without this key — by an older build, a
+    /// hand edit, or a partial write — was a parse *error*, and the whole file
+    /// was silently replaced by defaults. Colour scheme, reduce-motion,
+    /// threadgate and postgate defaults, hide-replies, volume and autoplay all
+    /// reverted with it. Every field here carries the attribute now, and
+    /// [`no_single_missing_field_resets_the_others`] fails if a new one does not.
+    #[serde(default)]
     pub font_size: FontSize,
     /// When true, disable animations/transitions regardless of system setting
     #[serde(default)]
@@ -259,9 +271,9 @@ mod tests {
     fn autoplay_defaults_to_never_from_both_paths() {
         assert_eq!(AppSettings::default().video_autoplay, VideoAutoplay::Never);
 
-        // `font_size` is the one field with no `#[serde(default)]`, so it is
-        // the minimum a file has to carry; everything since has been optional
-        // and autoplay is no exception.
+        // Every field is optional now — see
+        // `no_single_missing_field_resets_the_others` — so this is a file
+        // carrying only the field that used to be mandatory.
         let minimal: AppSettings =
             serde_json::from_str(r#"{"font_size":1.0}"#).expect("a minimal settings file loads");
         assert_eq!(minimal.video_autoplay, VideoAutoplay::Never);
@@ -276,6 +288,97 @@ mod tests {
         assert!(legacy.reduce_motion);
         assert_eq!(legacy.video_volume, VideoVolume(0.5));
         assert!(legacy.hide_replies_in_feed);
+    }
+
+    /// Dropping any one key from a settings file must cost only that key.
+    ///
+    /// This is the general form of the bug `font_size` had: because
+    /// [`AppSettings::load`] funnels a parse error into `unwrap_or_default()`,
+    /// one field without `#[serde(default)]` turns *every* other setting into
+    /// collateral damage the first time a file shows up without it. A missing
+    /// key is not exotic — it is what an older build wrote, and what a hand
+    /// edit or an interrupted write leaves behind.
+    ///
+    /// The loop is driven by the serialized object rather than a hand-written
+    /// list of fields, so a field added later is covered the day it is added:
+    /// this test goes red if it lands without the attribute.
+    ///
+    /// Compared through `serde_json::Value` because `AppSettings` derives no
+    /// `PartialEq`, and cannot cheaply — `ThreadgateConfig` and
+    /// `PostgateConfig` do not either. Round-tripping the survivors back to
+    /// JSON compares them without new derives on public API.
+    #[test]
+    fn no_single_missing_field_resets_the_others() {
+        // Every field deliberately away from its default, so "was reset to the
+        // default" and "survived" cannot be confused for one another.
+        let populated = AppSettings {
+            font_size: FontSize(1.35),
+            reduce_motion: true,
+            color_scheme: ColorScheme::Dark,
+            default_post_language: Some("de".to_string()),
+            default_threadgate: Some(crate::atproto::ThreadgateConfig {
+                allow_rules: vec![crate::atproto::ThreadgateRule::FollowingRule],
+            }),
+            default_postgate: Some(crate::atproto::PostgateConfig {
+                disable_quoting: true,
+            }),
+            hide_replies_in_feed: true,
+            video_volume: VideoVolume(0.25),
+            video_autoplay: VideoAutoplay::WithSound,
+        };
+
+        let full = serde_json::to_value(&populated).expect("settings serialize");
+        let full = full.as_object().expect("settings serialize to an object");
+        let keys: Vec<String> = full.keys().cloned().collect();
+        assert_eq!(
+            keys.len(),
+            9,
+            "field count changed; add the new field to `populated` above so it is \
+             exercised with a non-default value: {keys:?}"
+        );
+
+        for dropped in &keys {
+            let mut partial = full.clone();
+            partial.remove(dropped);
+
+            // The load path's own contract: this must be `Ok`. If it is not,
+            // `AppSettings::load` would swallow it and hand back defaults.
+            let loaded: AppSettings = serde_json::from_value(serde_json::Value::Object(partial))
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "a settings file missing only `{dropped}` failed to parse ({e}); \
+                         `AppSettings::load` would silently reset every other setting. \
+                         Add #[serde(default)] to `{dropped}`."
+                    )
+                });
+
+            let reloaded = serde_json::to_value(&loaded).expect("settings re-serialize");
+            let reloaded = reloaded.as_object().expect("an object");
+
+            for key in &keys {
+                if key == dropped {
+                    // The one field that legitimately falls back to its default.
+                    continue;
+                }
+                assert_eq!(
+                    reloaded.get(key),
+                    full.get(key),
+                    "dropping `{dropped}` also lost `{key}`"
+                );
+            }
+        }
+    }
+
+    /// The missing-field default for `font_size` is 1.0, not `f64`'s 0.0.
+    ///
+    /// `#[serde(default)]` calls `FontSize::default()`, not `Default` on the
+    /// inner `f64` — a 0.0 scale factor would render the app unreadable, so
+    /// this pins which of the two it is.
+    #[test]
+    fn a_settings_file_with_no_font_size_reads_as_the_default_scale() {
+        let empty: AppSettings = serde_json::from_str("{}").expect("an empty settings file loads");
+        assert_eq!(empty.font_size, FontSize(FontSize::DEFAULT));
+        assert_eq!(empty.font_size, FontSize(1.0));
     }
 
     #[test]
