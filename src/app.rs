@@ -288,6 +288,11 @@ mod imp {
             });
 
             let app_clone = app.clone();
+            window.set_edit_profile_callback(move || {
+                app_clone.open_edit_profile();
+            });
+
+            let app_clone = app.clone();
             window.set_compose_callback(move || {
                 app_clone.open_compose_dialog();
             });
@@ -3933,6 +3938,103 @@ impl HangarApplication {
                     ctx.fetching.set(false);
                     glib::ControlFlow::Break
                 }
+            }
+        });
+    }
+
+    /// Edit Profile from the own page. The dialog prefills from what the
+    /// header shows and hands back only what changed.
+    fn open_edit_profile(&self) {
+        let Some(window) = self.imp().window.borrow().clone() else {
+            return;
+        };
+        let Some(profile) = window.current_profile() else {
+            // Nothing loaded yet; nothing truthful to prefill with.
+            return;
+        };
+        let app = self.clone();
+        crate::ui::edit_profile::present(&window, &profile, move |edits| {
+            app.save_profile(edits);
+        });
+    }
+
+    fn save_profile(&self, edits: crate::ui::edit_profile::ProfileEdits) {
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let client = self.client();
+
+        thread::spawn(move || {
+            let result = runtime::block_on(async {
+                client
+                    .update_profile(
+                        &edits.display_name,
+                        &edits.description,
+                        edits.avatar,
+                        edits.banner,
+                    )
+                    .await
+            });
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+
+        let app = self.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            match rx.try_recv() {
+                Ok(Ok(())) => {
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.show_toast("Profile updated");
+                    }
+                    app.refresh_own_profile();
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(e)) => {
+                    eprintln!("Failed to update profile: {}", e);
+                    app.report_session_expiry();
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.show_toast("Couldn't update your profile");
+                    }
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+            }
+        });
+    }
+
+    /// The header, sidebar avatar, and cache, refetched past the cache's
+    /// freshness window; a profile edit is exactly the moment it lies.
+    fn refresh_own_profile(&self) {
+        let Some(did) = self.imp().user_did.borrow().clone() else {
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel::<Result<Profile, String>>();
+        let client = self.client();
+        let did_for_fetch = did.clone();
+        thread::spawn(move || {
+            let result = runtime::block_on(async { client.get_profile(&did_for_fetch).await });
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+
+        let app = self.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            match rx.try_recv() {
+                Ok(Ok(profile)) => {
+                    if let Some(cache) = app.imp().cache.borrow().as_ref() {
+                        let _ = ProfileCache::new(cache).store_full(&profile);
+                    }
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        let display_name =
+                            profile.display_name.as_deref().unwrap_or(&profile.handle);
+                        window.set_user_avatar(display_name, profile.avatar.as_deref());
+                        window.update_profile_header(&profile);
+                    }
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(e)) => {
+                    eprintln!("Failed to refresh profile: {}", e);
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
             }
         });
     }

@@ -2851,6 +2851,145 @@ impl HangarClient {
         })
     }
 
+    /// The edited fields land on top of the existing record, so anything
+    /// this client does not know about (pinned post, labels, whatever the
+    /// lexicon grows next) survives the edit untouched.
+    fn merge_profile_record(
+        mut record: serde_json::Value,
+        display_name: &str,
+        description: &str,
+        avatar_blob: Option<serde_json::Value>,
+        banner_blob: Option<serde_json::Value>,
+    ) -> serde_json::Value {
+        let Some(map) = record.as_object_mut() else {
+            record = serde_json::json!({ "$type": "app.bsky.actor.profile" });
+            return Self::merge_profile_record(
+                record,
+                display_name,
+                description,
+                avatar_blob,
+                banner_blob,
+            );
+        };
+        map.insert("$type".into(), "app.bsky.actor.profile".into());
+        if display_name.is_empty() {
+            map.remove("displayName");
+        } else {
+            map.insert("displayName".into(), display_name.into());
+        }
+        if description.is_empty() {
+            map.remove("description");
+        } else {
+            map.insert("description".into(), description.into());
+        }
+        if let Some(blob) = avatar_blob {
+            map.insert("avatar".into(), blob);
+        }
+        if let Some(blob) = banner_blob {
+            map.insert("banner".into(), blob);
+        }
+        record
+    }
+
+    /// Update the signed-in user's profile record. Text lands always;
+    /// avatar and banner only when a new image was picked. The write swaps
+    /// against the record CID that was read, so a concurrent edit fails
+    /// loudly instead of being clobbered.
+    #[allow(clippy::await_holding_lock)]
+    pub async fn update_profile(
+        &self,
+        display_name: &str,
+        description: &str,
+        avatar: Option<(Vec<u8>, String)>,
+        banner: Option<(Vec<u8>, String)>,
+    ) -> Result<(), ClientError> {
+        // Blobs first; each upload takes the agent on its own.
+        let avatar_blob = match avatar {
+            Some((data, mime)) => Some(self.upload_blob(data, &mime).await?),
+            None => None,
+        };
+        let banner_blob = match banner {
+            Some((data, mime)) => Some(self.upload_blob(data, &mime).await?),
+            None => None,
+        };
+
+        with_agent_and_did!(self, agent, did => {
+
+        let collection =
+            atrium_api::types::string::Nsid::new("app.bsky.actor.profile".to_string())
+                .map_err(|_| ClientError::InvalidResponse("invalid collection".into()))?;
+        let rkey: atrium_api::types::string::RecordKey = "self"
+            .parse()
+            .map_err(|e| ClientError::InvalidResponse(format!("invalid rkey: {e}")))?;
+
+        let params = atrium_api::com::atproto::repo::get_record::ParametersData {
+            cid: None,
+            collection: collection.clone(),
+            repo: did.clone().into(),
+            rkey: rkey.clone(),
+        };
+        // A fresh account has no profile record yet; that one case starts
+        // from empty. Every other failure aborts, because writing a record
+        // merged onto guesses would wipe the fields this client keeps.
+        let (existing, swap) = match agent
+            .api
+            .com
+            .atproto
+            .repo
+            .get_record(params.into())
+            .await
+        {
+            Ok(output) => {
+                let value = serde_json::to_value(&output.data.value)
+                    .map_err(|e| ClientError::InvalidResponse(e.to_string()))?;
+                (value, output.data.cid.clone())
+            }
+            Err(atrium_api::xrpc::error::Error::XrpcResponse(res))
+                if matches!(
+                    &res.error,
+                    Some(atrium_api::xrpc::error::XrpcErrorKind::Custom(
+                        atrium_api::com::atproto::repo::get_record::Error::RecordNotFound(_)
+                    ))
+                ) =>
+            {
+                (serde_json::json!({ "$type": "app.bsky.actor.profile" }), None)
+            }
+            Err(e) => return Err(self.xrpc_error(e)),
+        };
+
+        let merged = Self::merge_profile_record(
+            existing,
+            display_name,
+            description,
+            avatar_blob,
+            banner_blob,
+        );
+        let record: Unknown = serde_json::from_value(merged)
+            .map_err(|e| ClientError::InvalidResponse(e.to_string()))?;
+
+        let input = atrium_api::com::atproto::repo::put_record::InputData {
+            collection,
+            record,
+            repo: did.clone().into(),
+            rkey,
+            swap_commit: None,
+            swap_record: swap,
+            validate: None,
+        };
+
+        agent
+            .api
+            .com
+            .atproto
+            .repo
+            .put_record(input.into())
+            .await
+            .map_err(|e| self.xrpc_error(e))?;
+
+        Ok(())
+        })
+    }
+
     /// Accounts the network suggests for the signed-in user, for filling
     /// an empty people search with something better than a shrug.
     #[allow(clippy::await_holding_lock)]

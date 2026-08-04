@@ -3,6 +3,7 @@
 pub mod actor_row;
 pub mod avatar_cache;
 mod compose_dialog;
+pub mod edit_profile;
 pub mod external;
 mod follow_list_page;
 pub mod inline_video;

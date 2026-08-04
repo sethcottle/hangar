@@ -264,6 +264,7 @@ mod imp {
             RefCell<Option<Box<dyn Fn(Profile, glib::WeakRef<gtk4::Button>) + 'static>>>,
         /// Args: the page's feed context and whether this is a first page.
         pub profile_tab_callback: RefCell<Option<Box<dyn Fn(Rc<ProfileFeedCtx>, bool) + 'static>>>,
+        pub edit_profile_callback: RefCell<Option<Box<dyn Fn() + 'static>>>,
         pub nav_changed_callback:
             RefCell<Option<Box<dyn Fn(crate::ui::sidebar::NavItem) + 'static>>>,
         // Mentions page state
@@ -1142,6 +1143,17 @@ impl HangarWindow {
     /// DID and refresh.
     pub fn own_profile_feed_ctx(&self) -> Option<Rc<ProfileFeedCtx>> {
         self.imp().own_profile_feed_ctx.borrow().clone()
+    }
+
+    pub fn set_edit_profile_callback<F: Fn() + 'static>(&self, callback: F) {
+        self.imp()
+            .edit_profile_callback
+            .replace(Some(Box::new(callback)));
+    }
+
+    /// The profile the own page currently shows.
+    pub fn current_profile(&self) -> Option<Profile> {
+        self.imp().current_profile.borrow().clone()
     }
 
     /// Args: the page's feed context and whether this is a first page.
@@ -3900,6 +3912,23 @@ impl HangarWindow {
         stats_box.append(&posts_box);
 
         info_box.append(&stats_box);
+
+        // Edit Profile, this being the one profile that is yours.
+        let edit_btn = gtk4::Button::with_label("Edit Profile");
+        edit_btn.add_css_class("pill");
+        edit_btn.set_halign(gtk4::Align::Start);
+        edit_btn.set_margin_top(8);
+        let win = self.downgrade();
+        edit_btn.connect_clicked(move |_| {
+            let Some(win) = win.upgrade() else {
+                return;
+            };
+            if let Some(cb) = win.imp().edit_profile_callback.borrow().as_ref() {
+                cb();
+            }
+        });
+        info_box.append(&edit_btn);
+
         header_box.append(&info_box);
 
         // Store widget references
@@ -8316,6 +8345,35 @@ mod tests {
             .clone()
             .unwrap();
         assert!(rows.first_child().and_downcast::<ActorRow>().is_some());
+
+        window.destroy();
+    }
+
+    /// Edit Profile on the own page reaches the app through its callback.
+    #[test]
+    fn edit_profile_reports_the_click() {
+        crate::ui::with_gtk(edit_profile_reports_the_click_body);
+    }
+
+    fn edit_profile_reports_the_click_body() {
+        let window: HangarWindow = glib::Object::builder().build();
+        let clicked: Rc<RefCell<u32>> = Rc::default();
+        let sink = clicked.clone();
+        window.set_edit_profile_callback(move || {
+            *sink.borrow_mut() += 1;
+        });
+
+        let mut widgets = Vec::new();
+        walk(&window.clone().upcast::<gtk4::Widget>(), 0, &mut widgets);
+        let btn = widgets
+            .iter()
+            .find_map(|(_, w)| {
+                let b = w.downcast_ref::<gtk4::Button>()?;
+                (b.label().as_deref() == Some("Edit Profile")).then(|| b.clone())
+            })
+            .expect("the own page offers Edit Profile");
+        btn.emit_clicked();
+        assert_eq!(*clicked.borrow(), 1);
 
         window.destroy();
     }
