@@ -1004,6 +1004,7 @@ impl MessagePage {
 
         // Older history loads at the top, so the spinner sits there.
         let spinner = gtk4::Spinner::new();
+        spinner.update_property(&[gtk4::accessible::Property::Label("Loading")]);
         spinner.set_visible(false);
         spinner.set_halign(gtk4::Align::Center);
         spinner.set_valign(gtk4::Align::Start);

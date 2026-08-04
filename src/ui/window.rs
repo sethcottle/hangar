@@ -380,6 +380,7 @@ impl HangarWindow {
 
         // Home section: NavigationView for thread/profile drill-down
         let home_nav_view = adw::NavigationView::new();
+        Self::focus_after_pop(&home_nav_view);
         let timeline_page = self.build_timeline_page();
         home_nav_view.add(&timeline_page);
         // Restore scroll position when a page is popped (user navigates back)
@@ -405,42 +406,49 @@ impl HangarWindow {
 
         // Mentions section: NavigationView for thread/profile drill-down
         let mentions_nav_view = adw::NavigationView::new();
+        Self::focus_after_pop(&mentions_nav_view);
         let mentions_page = self.build_mentions_page();
         mentions_nav_view.add(&mentions_page);
         main_stack.add_named(&mentions_nav_view, Some("mentions"));
 
         // Activity section: NavigationView for thread/profile drill-down
         let activity_nav_view = adw::NavigationView::new();
+        Self::focus_after_pop(&activity_nav_view);
         let activity_page = self.build_activity_page();
         activity_nav_view.add(&activity_page);
         main_stack.add_named(&activity_nav_view, Some("activity"));
 
         // Chat section: NavigationView for conversation drill-down
         let chat_nav_view = adw::NavigationView::new();
+        Self::focus_after_pop(&chat_nav_view);
         let chat_page = self.build_chat_page();
         chat_nav_view.add(&chat_page);
         main_stack.add_named(&chat_nav_view, Some("chat"));
 
         // Profile section: NavigationView for own profile
         let profile_nav_view = adw::NavigationView::new();
+        Self::focus_after_pop(&profile_nav_view);
         let profile_page = self.build_own_profile_page();
         profile_nav_view.add(&profile_page);
         main_stack.add_named(&profile_nav_view, Some("profile"));
 
         // Likes section: NavigationView for liked posts
         let likes_nav_view = adw::NavigationView::new();
+        Self::focus_after_pop(&likes_nav_view);
         let likes_page = self.build_likes_page();
         likes_nav_view.add(&likes_page);
         main_stack.add_named(&likes_nav_view, Some("likes"));
 
         // Saved posts section: NavigationView for thread/profile drill-down
         let bookmarks_nav_view = adw::NavigationView::new();
+        Self::focus_after_pop(&bookmarks_nav_view);
         let bookmarks_page = self.build_bookmarks_page();
         bookmarks_nav_view.add(&bookmarks_page);
         main_stack.add_named(&bookmarks_nav_view, Some("bookmarks"));
 
         // Search section: NavigationView for search results
         let search_nav_view = adw::NavigationView::new();
+        Self::focus_after_pop(&search_nav_view);
         let search_page = self.build_search_page();
         search_nav_view.add(&search_page);
         main_stack.add_named(&search_nav_view, Some("search"));
@@ -872,6 +880,7 @@ impl HangarWindow {
 
         // Loading spinner as an overlay at the bottom
         let spinner = gtk4::Spinner::new();
+        spinner.update_property(&[gtk4::accessible::Property::Label("Loading")]);
         spinner.set_visible(false);
         spinner.set_halign(gtk4::Align::Center);
         spinner.set_valign(gtk4::Align::End);
@@ -1229,6 +1238,8 @@ impl HangarWindow {
             } else {
                 banner.set_opacity(1.0);
             }
+            // A live region: the banner is easy to miss without sight of it.
+            self.announce(&label_text, gtk4::AccessibleAnnouncementPriority::Medium);
         }
     }
 
@@ -1710,6 +1721,26 @@ impl HangarWindow {
         }
 
         self.show_page(page_name);
+
+        // Keyboard users arrive with their focus, not just their eyes. The
+        // idle lets the page settle before the grab walks into it.
+        if let Some(nav_view) = self.nav_view_named(page_name) {
+            glib::idle_add_local_once(move || {
+                if let Some(page) = nav_view.visible_page() {
+                    page.grab_focus();
+                }
+            });
+        }
+    }
+
+    /// Focus follows a pop: the page underneath takes the keyboard back
+    /// instead of leaving focus on a widget that just left the tree.
+    fn focus_after_pop(nav_view: &adw::NavigationView) {
+        nav_view.connect_popped(|view, _| {
+            if let Some(page) = view.visible_page() {
+                page.grab_focus();
+            }
+        });
     }
 
     /// Build a thread view page
@@ -2549,6 +2580,7 @@ impl HangarWindow {
 
         // Loading spinner
         let spinner = gtk4::Spinner::new();
+        spinner.update_property(&[gtk4::accessible::Property::Label("Loading")]);
         spinner.set_visible(false);
         spinner.set_halign(gtk4::Align::Center);
         spinner.set_valign(gtk4::Align::End);
@@ -2748,6 +2780,7 @@ impl HangarWindow {
 
         // Loading spinner
         let spinner = gtk4::Spinner::new();
+        spinner.update_property(&[gtk4::accessible::Property::Label("Loading")]);
         spinner.set_visible(false);
         spinner.set_halign(gtk4::Align::Center);
         spinner.set_valign(gtk4::Align::End);
@@ -2937,6 +2970,7 @@ impl HangarWindow {
 
         // Loading spinner
         let spinner = gtk4::Spinner::new();
+        spinner.update_property(&[gtk4::accessible::Property::Label("Loading")]);
         spinner.set_visible(false);
         spinner.set_halign(gtk4::Align::Center);
         spinner.set_valign(gtk4::Align::End);
@@ -3466,6 +3500,7 @@ impl HangarWindow {
 
         // Loading spinner
         let spinner = gtk4::Spinner::new();
+        spinner.update_property(&[gtk4::accessible::Property::Label("Loading")]);
         spinner.set_visible(false);
         spinner.set_halign(gtk4::Align::Center);
         spinner.set_valign(gtk4::Align::End);
@@ -4006,6 +4041,7 @@ impl HangarWindow {
 
         // Loading spinner
         let spinner = gtk4::Spinner::new();
+        spinner.update_property(&[gtk4::accessible::Property::Label("Loading")]);
         spinner.set_visible(false);
         spinner.set_halign(gtk4::Align::Center);
         spinner.set_valign(gtk4::Align::End);
@@ -4239,6 +4275,7 @@ impl HangarWindow {
 
         // Loading spinner
         let spinner = gtk4::Spinner::new();
+        spinner.update_property(&[gtk4::accessible::Property::Label("Loading")]);
         spinner.set_visible(false);
         spinner.set_halign(gtk4::Align::Center);
         spinner.set_valign(gtk4::Align::End);
@@ -4536,6 +4573,7 @@ impl HangarWindow {
 
         // Loading spinner
         let spinner = gtk4::Spinner::new();
+        spinner.update_property(&[gtk4::accessible::Property::Label("Loading")]);
         spinner.set_visible(false);
         spinner.set_halign(gtk4::Align::Center);
         spinner.set_valign(gtk4::Align::End);
@@ -4645,6 +4683,7 @@ impl HangarWindow {
 
         // Loading spinner
         let spinner = gtk4::Spinner::new();
+        spinner.update_property(&[gtk4::accessible::Property::Label("Loading")]);
         spinner.set_visible(false);
         spinner.set_halign(gtk4::Align::Center);
         spinner.set_valign(gtk4::Align::End);
@@ -4951,6 +4990,8 @@ impl HangarWindow {
             let toast = adw::Toast::new(message);
             toast.set_timeout(3); // 3 seconds
             overlay.add_toast(toast);
+            // Toasts are how errors reach the user; say them aloud too.
+            self.announce(message, gtk4::AccessibleAnnouncementPriority::Medium);
         }
     }
 
@@ -5576,6 +5617,36 @@ impl HangarWindow {
         reduce_motion_row.set_activatable_widget(Some(&reduce_motion_switch));
         motion_group.add(&reduce_motion_row);
         page.add(&motion_group);
+
+        // Media
+        let media_group = adw::PreferencesGroup::new();
+        media_group.set_title("Media");
+
+        let require_alt_row = adw::ActionRow::builder()
+            .title("Require Alt Text")
+            .subtitle("Posting waits until every attached image is described")
+            .build();
+
+        let require_alt_switch = gtk4::Switch::new();
+        require_alt_switch.set_valign(gtk4::Align::Center);
+        require_alt_switch.set_active(current_settings.require_alt_text);
+        require_alt_switch
+            .update_property(&[gtk4::accessible::Property::Label("Require alt text")]);
+
+        require_alt_switch.connect_state_set(move |_switch, state| {
+            let mut settings = crate::state::AppSettings::load();
+            settings.require_alt_text = state;
+            if let Err(e) = settings.save() {
+                eprintln!("Failed to save settings: {e}");
+            }
+            // Compose dialogs read this when they open; nothing live to touch.
+            glib::Propagation::Proceed
+        });
+
+        require_alt_row.add_suffix(&require_alt_switch);
+        require_alt_row.set_activatable_widget(Some(&require_alt_switch));
+        media_group.add(&require_alt_row);
+        page.add(&media_group);
 
         page
     }

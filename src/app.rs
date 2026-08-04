@@ -1373,6 +1373,7 @@ impl HangarApplication {
         self.setup_mention_search(&dialog);
         self.setup_link_card_fetch(&dialog);
         dialog.present(Some(&window));
+        dialog.focus_composer();
     }
 
     fn open_reply_dialog(&self, parent_post: Post) {
@@ -1508,6 +1509,7 @@ impl HangarApplication {
         self.setup_mention_search(&dialog);
         self.setup_link_card_fetch(&dialog);
         dialog.present(Some(&window));
+        dialog.focus_composer();
     }
 
     fn open_quote_dialog(&self, quoted_post: Post) {
@@ -1628,6 +1630,7 @@ impl HangarApplication {
         self.setup_mention_search(&dialog);
         self.setup_link_card_fetch(&dialog);
         dialog.present(Some(&window));
+        dialog.focus_composer();
     }
 
     fn toggle_repost(&self, post: &Post, post_row_weak: glib::WeakRef<PostRow>) {

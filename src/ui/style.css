@@ -267,7 +267,8 @@ popover.menu > contents {
    frame is indistinguishable from a photograph without something saying so.
    Fixed colours rather than theme ones: it sits on top of arbitrary image
    pixels, where a light-theme foreground would be unreadable half the time. */
-.gif-badge {
+.gif-badge,
+.alt-badge {
     background-color: alpha(black, 0.7);
     color: white;
     font-size: 0.75em;

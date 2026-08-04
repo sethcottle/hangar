@@ -12,7 +12,6 @@ use libadwaita as adw;
 use libadwaita::prelude::*;
 use libadwaita::subclass::prelude::*;
 use regex::Regex;
-use std::cell::Cell;
 use std::sync::LazyLock;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -198,7 +197,7 @@ pub struct QuoteContext {
 
 mod imp {
     use super::*;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
 
     #[derive(Default)]
     pub struct ComposeDialog {
@@ -216,6 +215,9 @@ mod imp {
         // Image attachments
         pub image_strip: RefCell<Option<gtk4::Box>>,
         pub images: RefCell<Vec<ComposeImage>>,
+        /// Read once when the dialog opens; posting waits for alt text on
+        /// every image while set.
+        pub require_alt_text: Cell<bool>,
         pub add_image_button: RefCell<Option<gtk4::Button>>,
         pub remove_all_images_button: RefCell<Option<gtk4::Button>>,
         // Language selection
@@ -272,6 +274,8 @@ mod imp {
     impl ObjectImpl for ComposeDialog {
         fn constructed(&self) {
             self.parent_constructed();
+            self.require_alt_text
+                .set(crate::state::AppSettings::load().require_alt_text);
             let obj = self.obj();
             obj.setup_ui();
         }
@@ -892,8 +896,20 @@ impl ComposeDialog {
 
         // Disable Post button when over limit or empty (unless images are attached)
         let has_images = !imp.images.borrow().is_empty();
+        // The setting turns a missing description into a hard stop.
+        let alt_ok = !imp.require_alt_text.get()
+            || imp
+                .images
+                .borrow()
+                .iter()
+                .all(|img| !img.alt_text.is_empty());
         if let Some(btn) = imp.post_button.borrow().as_ref() {
-            btn.set_sensitive((grapheme_count > 0 || has_images) && remaining >= 0);
+            btn.set_sensitive((grapheme_count > 0 || has_images) && remaining >= 0 && alt_ok);
+            btn.set_tooltip_text(if alt_ok {
+                None
+            } else {
+                Some("Describe your images before posting")
+            });
         }
     }
 
@@ -1400,6 +1416,13 @@ impl ComposeDialog {
         // Images take precedence over link cards, so hide the link preview
         self.clear_link_preview();
 
+        // The descriptive-text prompt: with the setting on, attaching goes
+        // straight to describing.
+        if imp.require_alt_text.get() {
+            let index = imp.images.borrow().len().saturating_sub(1);
+            self.show_alt_text_dialog(index);
+        }
+
         // Re-evaluate post button state (images allow posting without text)
         if let Some(tv) = imp.text_view.borrow().as_ref() {
             self.update_char_counter(&tv.buffer());
@@ -1683,6 +1706,10 @@ impl ComposeDialog {
                     }
                 }
                 dialog.rebuild_image_strip();
+                // A fresh description may be what the Post button waited on.
+                if let Some(tv) = dialog.imp().text_view.borrow().as_ref() {
+                    dialog.update_char_counter(&tv.buffer());
+                }
             }
 
             if let Some(alt_dlg) = alt_dialog_weak.upgrade() {
@@ -3345,6 +3372,19 @@ impl ComposeDialog {
         self.imp().thread_callback.replace(Some(Box::new(callback)));
     }
 
+    /// Put the caret in the composer. Run after present; the idle lets the
+    /// dialog map first so the grab has somewhere to land.
+    pub fn focus_composer(&self) {
+        let dialog = self.downgrade();
+        glib::idle_add_local_once(move || {
+            if let Some(dialog) = dialog.upgrade()
+                && let Some(text_view) = dialog.imp().text_view.borrow().as_ref()
+            {
+                text_view.grab_focus();
+            }
+        });
+    }
+
     pub fn set_loading(&self, loading: bool) {
         let imp = self.imp();
         if let Some(btn) = imp.post_button.borrow().as_ref() {
@@ -3392,5 +3432,54 @@ impl ComposeDialog {
         if let Some(label) = self.imp().error_label.borrow().as_ref() {
             label.set_visible(false);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn a_compose_image(alt: &str) -> ComposeImage {
+        let bytes = glib::Bytes::from_static(&[0u8; 4]);
+        let texture = gdk::MemoryTexture::new(1, 1, gdk::MemoryFormat::R8g8b8a8, &bytes, 4);
+        ComposeImage {
+            data: vec![0; 4],
+            mime_type: "image/png".into(),
+            alt_text: alt.into(),
+            width: 1,
+            height: 1,
+            texture: texture.upcast(),
+        }
+    }
+
+    /// With the setting on, the Post button waits for every image to be
+    /// described and comes back the moment the last one is.
+    #[test]
+    fn posting_waits_for_alt_text_when_required() {
+        crate::ui::with_gtk(posting_waits_for_alt_text_when_required_body);
+    }
+
+    fn posting_waits_for_alt_text_when_required_body() {
+        let dialog = ComposeDialog::new();
+        let imp = dialog.imp();
+        imp.require_alt_text.set(true);
+
+        let buffer = imp.text_view.borrow().as_ref().unwrap().buffer();
+        buffer.set_text("words to post");
+
+        imp.images.borrow_mut().push(a_compose_image(""));
+        dialog.update_char_counter(&buffer);
+        let btn = imp.post_button.borrow().clone().unwrap();
+        assert!(!btn.is_sensitive(), "an undescribed image blocks posting");
+
+        imp.images.borrow_mut()[0].alt_text = "a described image".into();
+        dialog.update_char_counter(&buffer);
+        assert!(btn.is_sensitive(), "a description frees the Post button");
+
+        // Setting off: the same undescribed image posts fine.
+        imp.require_alt_text.set(false);
+        imp.images.borrow_mut()[0].alt_text.clear();
+        dialog.update_char_counter(&buffer);
+        assert!(btn.is_sensitive(), "the gate only exists when asked for");
     }
 }

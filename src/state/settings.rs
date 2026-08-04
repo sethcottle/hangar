@@ -169,6 +169,9 @@ pub struct AppSettings {
     /// When true, disable animations/transitions regardless of system setting
     #[serde(default)]
     pub reduce_motion: bool,
+    /// When true, posting waits until every attached image is described
+    #[serde(default)]
+    pub require_alt_text: bool,
     /// Color scheme preference (System follows desktop theme)
     #[serde(default)]
     pub color_scheme: ColorScheme,
@@ -281,6 +284,7 @@ mod tests {
         let populated = AppSettings {
             font_size: FontSize(1.35),
             reduce_motion: true,
+            require_alt_text: true,
             color_scheme: ColorScheme::Dark,
             default_post_language: Some("de".to_string()),
             default_threadgate: Some(crate::atproto::ThreadgateConfig {
@@ -299,7 +303,7 @@ mod tests {
         let keys: Vec<String> = full.keys().cloned().collect();
         assert_eq!(
             keys.len(),
-            9,
+            10,
             "field count changed; add the new field to `populated` above so it is \
              exercised with a non-default value: {keys:?}"
         );

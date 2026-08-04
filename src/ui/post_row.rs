@@ -1525,9 +1525,10 @@ impl PostRow {
                 picture.set_content_fit(gtk4::ContentFit::Contain);
 
                 frame.set_child(Some(&picture));
-                avatar_cache::load_image_into_picture(picture, img.thumb.clone());
-                Self::attach_image_click(&frame, images, 0);
-                grid_container.append(&frame);
+                avatar_cache::load_image_into_picture(picture.clone(), img.thumb.clone());
+                let cell = Self::with_alt_badge(frame.upcast(), &picture, &img.alt);
+                Self::attach_image_click(&cell, images, 0);
+                grid_container.append(&cell);
             }
             2 => {
                 // Two images side by side, both square-ish
@@ -1535,7 +1536,7 @@ impl PostRow {
                 row.set_homogeneous(true);
 
                 for (i, img) in images.iter().enumerate() {
-                    let cell = self.create_image_cell(&img.thumb, 240);
+                    let cell = self.create_image_cell(img, 240);
                     Self::attach_image_click(&cell, images, i);
                     row.append(&cell);
                 }
@@ -1547,15 +1548,15 @@ impl PostRow {
                 row.set_homogeneous(true);
 
                 // Left image, tall, visually spanning both rows
-                let left = self.create_image_cell(&images[0].thumb, 300);
+                let left = self.create_image_cell(&images[0], 300);
                 Self::attach_image_click(&left, images, 0);
                 row.append(&left);
 
                 // Right column with two stacked images. 148 * 2 + 4 spacing
                 // matches the left cell exactly.
                 let right_col = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
-                let top_right = self.create_image_cell(&images[1].thumb, 148);
-                let bot_right = self.create_image_cell(&images[2].thumb, 148);
+                let top_right = self.create_image_cell(&images[1], 148);
+                let bot_right = self.create_image_cell(&images[2], 148);
                 Self::attach_image_click(&top_right, images, 1);
                 Self::attach_image_click(&bot_right, images, 2);
                 right_col.append(&top_right);
@@ -1572,7 +1573,7 @@ impl PostRow {
                 bot_row.set_homogeneous(true);
 
                 for (i, img) in images.iter().take(4).enumerate() {
-                    let cell = self.create_image_cell(&img.thumb, 180);
+                    let cell = self.create_image_cell(img, 180);
                     Self::attach_image_click(&cell, images, i);
                     if i < 2 {
                         top_row.append(&cell);
@@ -1611,7 +1612,7 @@ impl PostRow {
         widget.add_controller(gesture);
     }
 
-    fn create_image_cell(&self, url: &str, height: i32) -> gtk4::Frame {
+    fn create_image_cell(&self, image: &crate::atproto::ImageEmbed, height: i32) -> gtk4::Widget {
         // Frame acts as the clipping container
         let frame = gtk4::Frame::new(None);
         frame.set_hexpand(true);
@@ -1628,9 +1629,32 @@ impl PostRow {
         picture.set_content_fit(gtk4::ContentFit::Cover);
 
         frame.set_child(Some(&picture));
-        avatar_cache::load_image_into_picture(picture, url.to_string());
+        avatar_cache::load_image_into_picture(picture.clone(), image.thumb.clone());
 
-        frame
+        Self::with_alt_badge(frame.upcast(), &picture, &image.alt)
+    }
+
+    /// Described images say so: the text becomes the picture's accessible
+    /// description and tooltip, and an ALT badge marks the corner. An
+    /// undescribed image passes through untouched.
+    fn with_alt_badge(cell: gtk4::Widget, picture: &gtk4::Picture, alt: &str) -> gtk4::Widget {
+        if alt.is_empty() {
+            return cell;
+        }
+        picture.set_alternative_text(Some(alt));
+        cell.set_tooltip_text(Some(alt));
+
+        let overlay = gtk4::Overlay::new();
+        overlay.set_child(Some(&cell));
+        let badge = gtk4::Label::new(Some("ALT"));
+        badge.add_css_class("alt-badge");
+        badge.set_halign(gtk4::Align::End);
+        badge.set_valign(gtk4::Align::End);
+        badge.set_margin_end(6);
+        badge.set_margin_bottom(6);
+        badge.set_can_target(false);
+        overlay.add_overlay(&badge);
+        overlay.upcast()
     }
 
     /// Render an external link card (clickable to open URL)
