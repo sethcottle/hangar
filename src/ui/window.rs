@@ -186,6 +186,15 @@ mod imp {
         pub post_clicked_callback: RefCell<Option<Box<dyn Fn(Post) + 'static>>>,
         pub profile_clicked_callback: RefCell<Option<Box<dyn Fn(Profile) + 'static>>>,
         pub mention_clicked_callback: RefCell<Option<Box<dyn Fn(String) + 'static>>>,
+        /// Args: subject DID, the page's follow-URI cell, the button.
+        pub follow_callback: RefCell<
+            Option<
+                Box<
+                    dyn Fn(String, Rc<RefCell<Option<String>>>, glib::WeakRef<gtk4::Button>)
+                        + 'static,
+                >,
+            >,
+        >,
         pub nav_changed_callback:
             RefCell<Option<Box<dyn Fn(crate::ui::sidebar::NavItem) + 'static>>>,
         // Mentions page state
@@ -932,6 +941,25 @@ impl HangarWindow {
 
     pub fn set_reply_callback<F: Fn(Post) + 'static>(&self, callback: F) {
         self.imp().reply_callback.replace(Some(Box::new(callback)));
+    }
+
+    /// Args: subject DID, the page's follow-URI cell, the button.
+    pub fn set_follow_callback<F>(&self, callback: F)
+    where
+        F: Fn(String, Rc<RefCell<Option<String>>>, glib::WeakRef<gtk4::Button>) + 'static,
+    {
+        self.imp().follow_callback.replace(Some(Box::new(callback)));
+    }
+
+    /// Point a Follow button at the given state: label, style, and back on.
+    pub fn sync_follow_button(button: &gtk4::Button, following: bool) {
+        button.set_label(if following { "Following" } else { "Follow" });
+        if following {
+            button.remove_css_class("suggested-action");
+        } else {
+            button.add_css_class("suggested-action");
+        }
+        button.set_sensitive(true);
     }
 
     pub fn set_compose_callback<F: Fn() + 'static>(&self, callback: F) {
@@ -1819,6 +1847,43 @@ impl HangarWindow {
         handle_label.set_halign(gtk4::Align::Center);
         handle_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         profile_header.append(&handle_label);
+
+        if profile.viewer_followed_by.is_some() {
+            let follows_you = gtk4::Label::new(Some("Follows you"));
+            follows_you.add_css_class("dim-label");
+            follows_you.add_css_class("caption");
+            follows_you.set_halign(gtk4::Align::Center);
+            profile_header.append(&follows_you);
+        }
+
+        // Follow/unfollow, hidden on your own page. The record URI lives in
+        // a cell shared with the app; the click hands both over and goes
+        // insensitive until the result comes back.
+        let own_page = self.imp().current_user_did.borrow().as_deref() == Some(&profile.did);
+        if !own_page {
+            let follow_uri = Rc::new(RefCell::new(profile.viewer_following.clone()));
+            let follow_btn = gtk4::Button::new();
+            follow_btn.add_css_class("pill");
+            follow_btn.set_halign(gtk4::Align::Center);
+            Self::sync_follow_button(&follow_btn, follow_uri.borrow().is_some());
+
+            let win = self.downgrade();
+            let did = profile.did.clone();
+            let uri_cell = follow_uri.clone();
+            follow_btn.connect_clicked(move |btn| {
+                let Some(win) = win.upgrade() else {
+                    return;
+                };
+                if let Some(cb) = win.imp().follow_callback.borrow().as_ref() {
+                    // Show the hoped-for state, locked until the server answers.
+                    let following = uri_cell.borrow().is_some();
+                    HangarWindow::sync_follow_button(btn, !following);
+                    btn.set_sensitive(false);
+                    cb(did.clone(), uri_cell.clone(), btn.downgrade());
+                }
+            });
+            profile_header.append(&follow_btn);
+        }
 
         // Followers and following, clickable. A count can be missing when
         // the full profile fetch failed; the lists open fine without it.
@@ -6931,6 +6996,122 @@ mod tests {
                 .and_downcast::<gtk4::Label>()
                 .is_some_and(|l| l.text() == "following"),
             "a missing count leaves the word as the whole stat"
+        );
+
+        window.destroy();
+    }
+
+    /// The follow button starts from viewer state, hands the callback the
+    /// DID and the URI cell, shows the hoped-for state while waiting, and
+    /// stays off your own page.
+    #[test]
+    fn the_follow_button_tracks_state_and_skips_your_own_page() {
+        crate::ui::with_gtk(the_follow_button_tracks_state_and_skips_your_own_page_body);
+    }
+
+    fn the_follow_button_tracks_state_and_skips_your_own_page_body() {
+        let window: HangarWindow = glib::Object::builder().build();
+
+        type Cell = Rc<RefCell<Option<String>>>;
+        let calls: Rc<RefCell<Vec<(String, Cell)>>> = Rc::new(RefCell::new(vec![]));
+        let sink = calls.clone();
+        window.set_follow_callback(move |did, cell, _btn| {
+            sink.borrow_mut().push((did, cell));
+        });
+
+        let follow_button_on = |tag: &str| -> gtk4::Button {
+            let nav_view = window.imp().home_nav_view.borrow().clone().unwrap();
+            let page = nav_view.find_page(tag).expect("page is in the stack");
+            let mut widgets = Vec::new();
+            walk(&page.upcast::<gtk4::Widget>(), 0, &mut widgets);
+            widgets
+                .iter()
+                .find_map(|(_, w)| {
+                    let btn = w.downcast_ref::<gtk4::Button>()?;
+                    matches!(btn.label().as_deref(), Some("Follow" | "Following"))
+                        .then(|| btn.clone())
+                })
+                .expect("the page has a follow button")
+        };
+
+        // Not followed yet, and they follow us.
+        let mut stranger = Profile::minimal(
+            "did:plc:stranger".into(),
+            "stranger.bsky.social".into(),
+            None,
+            None,
+        );
+        stranger.viewer_followed_by = Some("at://did:plc:stranger/app.bsky.graph.follow/1".into());
+        window.push_profile_page(&stranger, vec![]);
+
+        let btn = follow_button_on("profile:did:plc:stranger");
+        assert_eq!(btn.label().as_deref(), Some("Follow"));
+        assert!(btn.has_css_class("suggested-action"));
+        {
+            let nav_view = window.imp().home_nav_view.borrow().clone().unwrap();
+            let page = nav_view.find_page("profile:did:plc:stranger").unwrap();
+            let mut widgets = Vec::new();
+            walk(&page.upcast::<gtk4::Widget>(), 0, &mut widgets);
+            assert!(
+                widgets.iter().any(|(_, w)| w
+                    .downcast_ref::<gtk4::Label>()
+                    .is_some_and(|l| l.text() == "Follows you")),
+                "their follow of us is shown"
+            );
+        }
+
+        // Click: the callback gets the DID and the empty cell, the button
+        // shows Following and locks until the app reports back.
+        btn.emit_clicked();
+        assert_eq!(calls.borrow().len(), 1);
+        let (did, cell) = calls.borrow()[0].clone();
+        assert_eq!(did, "did:plc:stranger");
+        assert!(cell.borrow().is_none());
+        assert_eq!(btn.label().as_deref(), Some("Following"));
+        assert!(!btn.has_css_class("suggested-action"));
+        assert!(!btn.is_sensitive());
+
+        // The app answers with the record URI and unlocks the button.
+        cell.replace(Some("at://did:plc:me/app.bsky.graph.follow/9".into()));
+        HangarWindow::sync_follow_button(&btn, true);
+        assert!(btn.is_sensitive());
+
+        // Second click asks to unfollow: same cell, now holding the URI.
+        btn.emit_clicked();
+        assert_eq!(calls.borrow().len(), 2);
+        let (_, cell) = calls.borrow()[1].clone();
+        assert_eq!(
+            cell.borrow().as_deref(),
+            Some("at://did:plc:me/app.bsky.graph.follow/9")
+        );
+        assert_eq!(btn.label().as_deref(), Some("Follow"));
+
+        // Someone already followed starts from Following.
+        let mut followed = Profile::minimal(
+            "did:plc:followed".into(),
+            "followed.bsky.social".into(),
+            None,
+            None,
+        );
+        followed.viewer_following = Some("at://did:plc:me/app.bsky.graph.follow/2".into());
+        window.push_profile_page(&followed, vec![]);
+        let btn = follow_button_on("profile:did:plc:followed");
+        assert_eq!(btn.label().as_deref(), Some("Following"));
+        assert!(!btn.has_css_class("suggested-action"));
+
+        // Your own page carries no follow button.
+        window.set_current_user_did("did:plc:me");
+        let me = Profile::minimal("did:plc:me".into(), "me.bsky.social".into(), None, None);
+        window.push_profile_page(&me, vec![]);
+        let nav_view = window.imp().home_nav_view.borrow().clone().unwrap();
+        let page = nav_view.find_page("profile:did:plc:me").unwrap();
+        let mut widgets = Vec::new();
+        walk(&page.upcast::<gtk4::Widget>(), 0, &mut widgets);
+        assert!(
+            !widgets.iter().any(|(_, w)| w
+                .downcast_ref::<gtk4::Button>()
+                .is_some_and(|b| matches!(b.label().as_deref(), Some("Follow" | "Following")))),
+            "no follow button on your own page"
         );
 
         window.destroy();

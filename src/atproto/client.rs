@@ -2658,6 +2658,52 @@ impl HangarClient {
         })
     }
 
+    /// Follow a user. Returns the follow record's URI, which unfollow needs.
+    #[allow(clippy::await_holding_lock)]
+    pub async fn follow(&self, subject_did: &str) -> Result<String, ClientError> {
+        with_agent_and_did!(self, agent, did => {
+
+        let record_json = serde_json::json!({
+            "$type": "app.bsky.graph.follow",
+            "subject": subject_did,
+            "createdAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        });
+        let record: Unknown = serde_json::from_value(record_json)
+            .map_err(|e| ClientError::InvalidResponse(e.to_string()))?;
+
+        let collection = atrium_api::types::string::Nsid::new("app.bsky.graph.follow".to_string())
+            .map_err(|_| ClientError::InvalidResponse("invalid collection".into()))?;
+
+        let input = create_record::InputData {
+            collection,
+            record,
+            repo: did.clone().into(),
+            rkey: None,
+            swap_commit: None,
+            validate: None,
+        };
+
+        let output = agent
+            .api
+            .com
+            .atproto
+            .repo
+            .create_record(input.into())
+            .await
+            .map_err(|e| self.xrpc_error(e))?;
+
+        Ok(output.data.uri.to_string())
+        })
+    }
+
+    /// Unfollow by deleting the follow record
+    /// `follow_uri` is the AT-URI of the follow record (from viewer_following)
+    #[allow(clippy::await_holding_lock)]
+    pub async fn unfollow(&self, follow_uri: &str) -> Result<(), ClientError> {
+        self.delete_record(follow_uri, "app.bsky.graph.follow")
+            .await
+    }
+
     /// Save a post to the signed-in user's bookmarks. Bookmarks are private
     /// server-side state, not repo records, so there is nothing to delete by
     /// URI later; the post URI itself is the key.

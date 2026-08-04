@@ -8,6 +8,7 @@ use libadwaita as adw;
 use libadwaita::prelude::*;
 use once_cell::sync::Lazy;
 use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::thread;
 use tokio::sync::Semaphore;
@@ -237,6 +238,11 @@ mod imp {
             let app_clone = app.clone();
             crate::ui::post_row::set_bookmark_post_handler(move |post, row_weak| {
                 app_clone.toggle_bookmark(post, row_weak);
+            });
+
+            let app_clone = app.clone();
+            window.set_follow_callback(move |did, uri_cell, btn_weak| {
+                app_clone.toggle_follow(did, uri_cell, btn_weak);
             });
 
             let app_clone = app.clone();
@@ -3372,6 +3378,63 @@ impl HangarApplication {
                             "Couldn't remove from Saved"
                         } else {
                             "Couldn't save post"
+                        });
+                    }
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+            }
+        });
+    }
+
+    /// Follow or unfollow, decided by whether the page holds a record URI.
+    ///
+    /// The button already shows the hoped-for state and is insensitive; on
+    /// success the cell takes the new URI, on failure the button goes back.
+    fn toggle_follow(
+        &self,
+        did: String,
+        uri_cell: Rc<RefCell<Option<String>>>,
+        btn_weak: glib::WeakRef<gtk4::Button>,
+    ) {
+        let current_uri = uri_cell.borrow().clone();
+        let unfollowing = current_uri.is_some();
+        let (tx, rx) = std::sync::mpsc::channel::<Result<Option<String>, String>>();
+        let client = self.client();
+
+        thread::spawn(move || {
+            let result = runtime::block_on(async {
+                match current_uri {
+                    Some(uri) => client.unfollow(&uri).await.map(|_| None),
+                    None => client.follow(&did).await.map(Some),
+                }
+            });
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+
+        let app = self.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            match rx.try_recv() {
+                Ok(Ok(new_uri)) => {
+                    let following = new_uri.is_some();
+                    uri_cell.replace(new_uri);
+                    if let Some(btn) = btn_weak.upgrade() {
+                        HangarWindow::sync_follow_button(&btn, following);
+                    }
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(e)) => {
+                    eprintln!("Failed to update follow: {}", e);
+                    app.report_session_expiry();
+                    if let Some(btn) = btn_weak.upgrade() {
+                        HangarWindow::sync_follow_button(&btn, uri_cell.borrow().is_some());
+                    }
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.show_toast(if unfollowing {
+                            "Couldn't unfollow"
+                        } else {
+                            "Couldn't follow"
                         });
                     }
                     glib::ControlFlow::Break
