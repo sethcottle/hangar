@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::thread;
 use tokio::sync::Semaphore;
 
-use crate::atproto::client::ClientError;
+use crate::atproto::client::{ClientError, UnreadCounts};
 use crate::atproto::{Conversation, HangarClient, Notification, Post, Profile, SavedFeed, Session};
 use crate::cache::{CacheDb, FeedCache, FeedState, PostCache, ProfileCache};
 use crate::config;
@@ -21,21 +21,25 @@ use crate::state::SessionManager;
 use crate::state::oauth::OAuthManager;
 use crate::ui::avatar_cache;
 use crate::ui::post_row::PostRow;
-use crate::ui::{ComposeDialog, HangarWindow, LoginDialog, NavItem, QuoteContext, ReplyContext};
+use crate::ui::{
+    ComposeDialog, FollowListKind, FollowListPage, FollowListPush, HangarWindow, LoginDialog,
+    NavItem, QuoteContext, ReplyContext,
+};
 
 /// Limit concurrent API requests to prevent overwhelming the server during rapid scrolling
 static API_SEMAPHORE: Lazy<Arc<Semaphore>> = Lazy::new(|| Arc::new(Semaphore::new(4)));
 
-/// Which search owns the results lists.
+/// Which turn of events owns some shared state.
 ///
-/// Every new query bumps it. A fetch carries the token it started under and
-/// drops its results if a newer search has run since, so a slow page from
-/// the old query cannot splice into the new query's list.
+/// Every reset bumps it. A fetch carries the token it started under and
+/// drops its results if a bump happened since, so a slow response cannot
+/// overwrite state the user has already moved past. Searches use one per
+/// query; the badge clear uses one per section open.
 #[derive(Default)]
-pub(crate) struct SearchGeneration(std::cell::Cell<u64>);
+pub(crate) struct Generation(std::cell::Cell<u64>);
 
-impl SearchGeneration {
-    /// Start a new search. Every earlier token goes stale.
+impl Generation {
+    /// Take ownership. Every earlier token goes stale.
     fn bump(&self) {
         self.0.set(self.0.get().wrapping_add(1));
     }
@@ -107,9 +111,17 @@ mod imp {
         pub search_people_cursor: RefCell<Option<String>>,
         pub search_people_loading_more: RefCell<bool>,
         /// Which query the in-flight search fetches belong to
-        pub(crate) search_generation: SearchGeneration,
+        pub(crate) search_generation: Generation,
         /// Whether new posts polling has been started
         pub polling_started: RefCell<bool>,
+        /// Whether an unread-badge fetch is already in flight
+        pub checking_unread: RefCell<bool>,
+        /// Bumped when opening a section clears the notification badges, so
+        /// an unread poll already in flight cannot relight them
+        pub(crate) badge_clear_generation: Generation,
+        /// Set once a request dies of an expired session. Parks the polls
+        /// and the toast until the next successful sign-in
+        pub session_dead: RefCell<bool>,
     }
 
     #[glib::object_subclass]
@@ -233,6 +245,11 @@ mod imp {
             let app_clone = app.clone();
             window.set_profile_clicked_callback(move |profile| {
                 app_clone.open_profile_view(profile);
+            });
+
+            let app_clone = app.clone();
+            window.set_follow_list_clicked_callback(move |profile, kind| {
+                app_clone.open_follow_list(profile, kind);
             });
 
             let app_clone = app.clone();
@@ -474,11 +491,18 @@ impl HangarApplication {
     ///
     /// The client latches a refusal it could not refresh past: nothing
     /// downstream of `e.to_string()` can tell that apart from the server being
-    /// briefly unreachable.
+    /// briefly unreachable. Every failing request re-arms that latch, so the
+    /// `session_dead` flag is what holds this to one toast per dead session.
+    /// The same flag parks the polls; `fetch_user_profile` lifts it on the
+    /// next successful sign-in.
     fn report_session_expiry(&self) {
         if !self.client().take_session_expired() {
             return;
         }
+        if *self.imp().session_dead.borrow() {
+            return;
+        }
+        self.imp().session_dead.replace(true);
         if let Some(window) = self.imp().window.borrow().as_ref() {
             window.show_toast("Your session expired \u{2014} sign out and sign in again");
         }
@@ -734,6 +758,13 @@ impl HangarApplication {
         self.imp().user_did.replace(Some(did.to_string()));
         // Rows check post authorship against this before offering Delete
         crate::ui::post_row::set_current_user_did(Some(did));
+
+        // Every path here follows a successful sign-in, so the polls a dead
+        // session parked may run again.
+        self.imp().session_dead.replace(false);
+
+        // Badges should not wait out the first 30-second tick.
+        self.check_unread_counts();
 
         // Try cache first for instant display
         let mut skip_fetch = false;
@@ -1571,9 +1602,10 @@ impl HangarApplication {
         self.imp().polling_started.replace(true);
 
         let app = self.clone();
-        // Poll every 30 seconds for new posts
+        // One timer drives every badge: new posts and unread counts alike
         glib::timeout_add_seconds_local(30, move || {
             app.check_for_new_posts();
+            app.check_unread_counts();
             glib::ControlFlow::Continue
         });
     }
@@ -1581,6 +1613,12 @@ impl HangarApplication {
     fn check_for_new_posts(&self) {
         // Don't check if we're already checking
         if *self.imp().checking_new_posts.borrow() {
+            return;
+        }
+
+        // A dead session would fail here every 30 seconds; wait for the
+        // next sign-in instead.
+        if *self.imp().session_dead.borrow() {
             return;
         }
 
@@ -1673,6 +1711,100 @@ impl HangarApplication {
             window.hide_new_posts_banner();
             window.scroll_to_top();
         }
+    }
+
+    /// Refresh the Mentions, Activity, and Chat badges from the server.
+    ///
+    /// Rides the same 30-second timer as `check_for_new_posts`: one thread,
+    /// one round trip, three badges.
+    fn check_unread_counts(&self) {
+        let signed_in = self.imp().user_did.borrow().is_some();
+        let in_flight = *self.imp().checking_unread.borrow();
+        let expired = *self.imp().session_dead.borrow();
+        if !unread_poll_allowed(signed_in, in_flight, expired) {
+            return;
+        }
+        self.imp().checking_unread.replace(true);
+
+        // A badge clear while this fetch is out makes its counts stale.
+        let clear_token = self.imp().badge_clear_generation.token();
+
+        let (tx, rx) = std::sync::mpsc::channel::<Result<UnreadCounts, String>>();
+        let client = self.client();
+
+        thread::spawn(move || {
+            let result = runtime::block_on(async { client.get_unread_counts().await });
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+
+        let app = self.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            match rx.try_recv() {
+                Ok(Ok(counts)) => {
+                    app.imp().checking_unread.replace(false);
+                    if let Some(sidebar) = app.sidebar() {
+                        sidebar.set_badge(NavItem::Chat, counts.chat);
+                        // Opening a section may have cleared these two while
+                        // the fetch was out; stale counts would relight them.
+                        if app.imp().badge_clear_generation.is_current(clear_token) {
+                            sidebar.set_badge(NavItem::Mentions, counts.mentions);
+                            sidebar.set_badge(NavItem::Activity, counts.activity);
+                        }
+                    }
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(e)) => {
+                    app.imp().checking_unread.replace(false);
+                    eprintln!("Failed to check unread counts: {}", e);
+                    // On expiry this parks the poll until the next sign-in.
+                    app.report_session_expiry();
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    app.imp().checking_unread.replace(false);
+                    glib::ControlFlow::Break
+                }
+            }
+        });
+    }
+
+    /// The sidebar, while a window is up.
+    fn sidebar(&self) -> Option<crate::ui::sidebar::Sidebar> {
+        self.imp()
+            .window
+            .borrow()
+            .as_ref()
+            .and_then(|w| w.sidebar())
+    }
+
+    /// What `item`'s badge currently holds.
+    fn badge_count(&self, item: NavItem) -> u32 {
+        self.sidebar().map(|s| s.badge_count(item)).unwrap_or(0)
+    }
+
+    /// Clear both notification badges and tell the server.
+    ///
+    /// `seenAt` is account-wide, so opening either Mentions or Activity
+    /// marks everything seen. The badges clear together to say so honestly.
+    fn clear_notification_badges(&self) {
+        if self.badge_count(NavItem::Mentions) == 0 && self.badge_count(NavItem::Activity) == 0 {
+            return;
+        }
+        // Strand any unread poll already in flight; it counted before this
+        // clear and would relight the badges.
+        self.imp().badge_clear_generation.bump();
+        if let Some(sidebar) = self.sidebar() {
+            sidebar.set_badge(NavItem::Mentions, 0);
+            sidebar.set_badge(NavItem::Activity, 0);
+        }
+        // Fire and forget. If it fails, the next poll raises the badges again.
+        let client = self.client();
+        thread::spawn(move || {
+            if let Err(e) = runtime::block_on(async { client.update_notifications_seen().await }) {
+                eprintln!("Failed to mark notifications seen: {}", e);
+            }
+        });
     }
 
     /// Fetch the user's saved feeds and populate the feed selector
@@ -1930,13 +2062,15 @@ impl HangarApplication {
             let result = runtime::block_on(async {
                 let feed = client.get_author_feed(&actor, None).await;
                 // Avatar clicks arrive with the post author, a minimal
-                // profile with no bio. Fetch the full one so the pushed
-                // page can show it; if that fails, push what we had.
-                let full_profile = if profile.description.is_none() {
-                    client.get_profile(&actor).await.ok()
-                } else {
-                    None
-                };
+                // profile missing its bio, and search results come without
+                // counts. Fetch the full one so the pushed page can show
+                // both; if that fails, push what we had.
+                let full_profile =
+                    if profile.description.is_none() || profile.followers_count.is_none() {
+                        client.get_profile(&actor).await.ok()
+                    } else {
+                        None
+                    };
                 feed.map(|(posts, _cursor)| (full_profile.unwrap_or(profile), posts))
             });
             let _ = tx.send(result.map_err(|e| e.to_string()));
@@ -1958,6 +2092,133 @@ impl HangarApplication {
                 Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     eprintln!("Failed to fetch profile feed: connection lost");
+                    glib::ControlFlow::Break
+                }
+            }
+        });
+    }
+
+    /// Open the followers or following list for a profile
+    fn open_follow_list(&self, profile: Profile, kind: FollowListKind) {
+        let pushed = {
+            let window = self.imp().window.borrow();
+            let Some(window) = window.as_ref() else {
+                return;
+            };
+            window.push_follow_list_page(&profile, kind)
+        };
+        let Some(pushed) = pushed else {
+            return;
+        };
+
+        let page = match pushed {
+            FollowListPush::Pushed(page) => {
+                let app = self.clone();
+                let did = profile.did.clone();
+                let page_weak = page.downgrade();
+                page.set_load_more_callback(move || {
+                    let Some(page) = page_weak.upgrade() else {
+                        return;
+                    };
+                    // No cursor means either the first page is still in
+                    // flight or the server said the list is done.
+                    let Some(cursor) = page.cursor() else {
+                        return;
+                    };
+                    app.fetch_follow_list(&page, did.clone(), kind, Some(cursor));
+                });
+
+                // Retry resumes from the stored cursor: a failed first page
+                // starts over, a failed later page picks up where it was.
+                let app = self.clone();
+                let did = profile.did.clone();
+                let page_weak = page.downgrade();
+                page.set_retry_callback(move || {
+                    let Some(page) = page_weak.upgrade() else {
+                        return;
+                    };
+                    app.fetch_follow_list(&page, did.clone(), kind, page.cursor());
+                });
+
+                page
+            }
+            FollowListPush::PoppedBack(page) => {
+                // A healthy page keeps what it has. One whose first load
+                // failed gets another try on reopen.
+                if !page.needs_reload() {
+                    return;
+                }
+                page
+            }
+        };
+
+        self.fetch_follow_list(&page, profile.did.clone(), kind, page.cursor());
+    }
+
+    /// Fetch one page of a follow list and hand it to the pushed page.
+    ///
+    /// The page owns its cursor and in-flight flag; stacked lists must not
+    /// share state, and a popped page takes its fetch bookkeeping with it.
+    fn fetch_follow_list(
+        &self,
+        page: &FollowListPage,
+        did: String,
+        kind: FollowListKind,
+        cursor: Option<String>,
+    ) {
+        if page.is_fetching() {
+            return;
+        }
+        page.set_fetching(true);
+
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(Vec<Profile>, Option<String>), String>>();
+        let client = self.client();
+        let semaphore = API_SEMAPHORE.clone();
+
+        thread::spawn(move || {
+            let result = runtime::block_on(async {
+                let _permit = semaphore.acquire().await;
+                match kind {
+                    FollowListKind::Followers => {
+                        client.get_followers(&did, cursor.as_deref()).await
+                    }
+                    FollowListKind::Following => client.get_follows(&did, cursor.as_deref()).await,
+                }
+            });
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+
+        let app = self.clone();
+        let page_weak = page.downgrade();
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            match rx.try_recv() {
+                Ok(Ok((profiles, next_cursor))) => {
+                    if let Some(page) = page_weak.upgrade() {
+                        page.set_cursor(next_cursor);
+                        page.append_profiles(profiles);
+                        page.set_fetching(false);
+                        // Filtered or short pages can leave the viewport
+                        // unfilled with a cursor still stored.
+                        page.backfill_if_short();
+                    }
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(e)) => {
+                    eprintln!("Failed to fetch follow list: {}", e);
+                    if let Some(page) = page_weak.upgrade() {
+                        page.set_fetching(false);
+                        page.show_load_failed();
+                    }
+                    app.report_session_expiry();
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    eprintln!("Failed to fetch follow list: connection lost");
+                    if let Some(page) = page_weak.upgrade() {
+                        page.set_fetching(false);
+                        page.show_load_failed();
+                    }
                     glib::ControlFlow::Break
                 }
             }
@@ -2000,8 +2261,12 @@ impl HangarApplication {
             window.show_mentions_page();
         }
 
-        // Only fetch if we haven't loaded mentions yet
-        if self.imp().mentions_cursor.borrow().is_none() {
+        // A lit badge means the server has mentions this list does not.
+        let stale = self.badge_count(NavItem::Mentions) > 0;
+        self.clear_notification_badges();
+
+        // Fetch on first open, or when the badge said the list moved
+        if self.imp().mentions_cursor.borrow().is_none() || stale {
             self.fetch_mentions();
         }
     }
@@ -2109,8 +2374,14 @@ impl HangarApplication {
             window.show_activity_page();
         }
 
-        // Only fetch if we haven't loaded activity yet
-        if self.imp().activity_cursor.borrow().is_none() {
+        // Activity lists every notification, so unread under either badge
+        // means this list is behind.
+        let stale =
+            self.badge_count(NavItem::Mentions) > 0 || self.badge_count(NavItem::Activity) > 0;
+        self.clear_notification_badges();
+
+        // Fetch on first open, or when the badge said the list moved
+        if self.imp().activity_cursor.borrow().is_none() || stale {
             self.fetch_activity();
         }
     }
@@ -2220,8 +2491,11 @@ impl HangarApplication {
             window.show_chat_page();
         }
 
-        // Only fetch if we haven't loaded chat yet
-        if self.imp().chat_cursor.borrow().is_none() {
+        // The chat badge stays lit until a conversation is actually read;
+        // clearing it from the list would claim messages nobody has seen.
+        // The list itself still refreshes when the badge says it moved.
+        let stale = self.badge_count(NavItem::Chat) > 0;
+        if self.imp().chat_cursor.borrow().is_none() || stale {
             self.fetch_conversations();
         }
     }
@@ -2830,14 +3104,45 @@ impl Default for HangarApplication {
     }
 }
 
+/// Whether an unread poll may start: someone is signed in, the last one
+/// came back, and the session has not expired. The timer outlives sign-out
+/// and expiry alike, so this is what quiets it.
+fn unread_poll_allowed(signed_in: bool, in_flight: bool, expired: bool) -> bool {
+    signed_in && !in_flight && !expired
+}
+
 #[cfg(test)]
 mod tests {
-    use super::SearchGeneration;
+    use super::Generation;
+    use super::unread_poll_allowed;
+
+    /// The badge poll must stay quiet when signed out, must not stack
+    /// fetches when the network is slow, and must park for the rest of a
+    /// dead session once an expiry is reported.
+    #[test]
+    fn the_unread_poll_waits_for_sign_in_and_for_itself() {
+        assert!(unread_poll_allowed(true, false, false));
+        assert!(
+            !unread_poll_allowed(false, false, false),
+            "signed out: nothing to count"
+        );
+        assert!(
+            !unread_poll_allowed(true, true, false),
+            "one fetch at a time"
+        );
+        assert!(!unread_poll_allowed(false, true, false));
+        assert!(
+            !unread_poll_allowed(true, false, true),
+            "an expired session parks the poll until the next sign-in"
+        );
+        assert!(!unread_poll_allowed(true, true, true));
+        assert!(!unread_poll_allowed(false, false, true));
+    }
 
     /// A late page from the old query must not splice into the new list.
     #[test]
     fn a_new_search_strands_fetches_from_the_old_one() {
-        let generation = SearchGeneration::default();
+        let generation = Generation::default();
 
         let old = generation.token();
         assert!(

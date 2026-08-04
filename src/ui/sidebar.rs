@@ -70,6 +70,10 @@ mod imp {
         pub compose_btn: RefCell<Option<gtk4::Button>>,
         pub settings_callback: RefCell<Option<Box<dyn Fn() + 'static>>>,
         pub sign_out_callback: RefCell<Option<Box<dyn Fn() + 'static>>>,
+        /// Unread badge per nav row, in `NavItem::all()` order.
+        pub badge_labels: RefCell<Vec<gtk4::Label>>,
+        /// The uncapped counts behind the badges.
+        pub badge_counts: RefCell<Vec<u32>>,
     }
 
     #[glib::object_subclass]
@@ -267,7 +271,26 @@ impl Sidebar {
         let icon = gtk4::Image::from_icon_name(item.icon_name());
         icon.set_icon_size(gtk4::IconSize::Large);
         icon.set_pixel_size(24);
-        content.append(&icon);
+
+        // Unread count pinned to the icon's corner. The row's accessible
+        // label carries the count, so the badge itself stays out of the
+        // a11y tree.
+        let badge = gtk4::Label::builder()
+            .visible(false)
+            .can_target(false)
+            .halign(gtk4::Align::End)
+            .valign(gtk4::Align::Start)
+            .accessible_role(gtk4::AccessibleRole::Presentation)
+            .build();
+        badge.add_css_class("unread-badge");
+
+        let icon_overlay = gtk4::Overlay::new();
+        icon_overlay.set_child(Some(&icon));
+        icon_overlay.add_overlay(&badge);
+        content.append(&icon_overlay);
+
+        self.imp().badge_labels.borrow_mut().push(badge);
+        self.imp().badge_counts.borrow_mut().push(0);
 
         // Small label underneath
         let label = gtk4::Label::new(Some(item.label()));
@@ -332,6 +355,40 @@ impl Sidebar {
             .replace(Some(Box::new(callback)));
     }
 
+    /// Show `count` unread on `item`'s row. Zero hides the badge.
+    pub fn set_badge(&self, item: NavItem, count: u32) {
+        let Some(index) = NavItem::all().iter().position(|i| *i == item) else {
+            return;
+        };
+        let imp = self.imp();
+        if let Some(stored) = imp.badge_counts.borrow_mut().get_mut(index) {
+            if *stored == count {
+                return;
+            }
+            *stored = count;
+        }
+        if let Some(badge) = imp.badge_labels.borrow().get(index) {
+            badge.set_label(&badge_text(count));
+            badge.set_visible(count > 0);
+        }
+        if let Some(nav_list) = imp.nav_list.borrow().as_ref() {
+            if let Some(row) = nav_list.row_at_index(index as i32) {
+                row.update_property(&[gtk4::accessible::Property::Label(&badge_a11y_label(
+                    item, count,
+                ))]);
+            }
+        }
+    }
+
+    /// The count behind `item`'s badge, uncapped.
+    pub fn badge_count(&self, item: NavItem) -> u32 {
+        NavItem::all()
+            .iter()
+            .position(|i| *i == item)
+            .and_then(|index| self.imp().badge_counts.borrow().get(index).copied())
+            .unwrap_or(0)
+    }
+
     pub fn select_nav_item(&self, item: NavItem) {
         if let Some(nav_list) = self.imp().nav_list.borrow().as_ref() {
             if let Some(index) = NavItem::all().iter().position(|i| *i == item) {
@@ -347,5 +404,84 @@ impl Sidebar {
 impl Default for Sidebar {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Badge text. Three digits would not fit on the rail.
+fn badge_text(count: u32) -> String {
+    if count > 99 {
+        "99+".to_string()
+    } else {
+        count.to_string()
+    }
+}
+
+/// The row's accessible name. Exact even when the badge shows 99+.
+fn badge_a11y_label(item: NavItem, count: u32) -> String {
+    if count == 0 {
+        item.label().to_string()
+    } else {
+        format!("{}, {} unread", item.label(), count)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Set, cap, and clear, without disturbing the other rows.
+    #[test]
+    fn a_badge_shows_caps_and_hides() {
+        crate::ui::with_gtk(a_badge_shows_caps_and_hides_body);
+    }
+
+    fn a_badge_shows_caps_and_hides_body() {
+        let sidebar = Sidebar::new();
+        let index = NavItem::all()
+            .iter()
+            .position(|i| *i == NavItem::Mentions)
+            .expect("Mentions is a nav row");
+
+        assert!(
+            !sidebar.imp().badge_labels.borrow()[index].is_visible(),
+            "no unread, no badge"
+        );
+
+        sidebar.set_badge(NavItem::Mentions, 3);
+        {
+            let labels = sidebar.imp().badge_labels.borrow();
+            assert!(labels[index].is_visible());
+            assert_eq!(labels[index].label(), "3");
+        }
+        assert_eq!(sidebar.badge_count(NavItem::Mentions), 3);
+
+        // The display caps; the stored count must not, or the a11y label
+        // and the clearing logic would work from a lie.
+        sidebar.set_badge(NavItem::Mentions, 150);
+        assert_eq!(sidebar.imp().badge_labels.borrow()[index].label(), "99+");
+        assert_eq!(sidebar.badge_count(NavItem::Mentions), 150);
+
+        assert_eq!(
+            sidebar.badge_count(NavItem::Chat),
+            0,
+            "other rows stay untouched"
+        );
+
+        sidebar.set_badge(NavItem::Mentions, 0);
+        assert!(
+            !sidebar.imp().badge_labels.borrow()[index].is_visible(),
+            "zero hides the badge"
+        );
+        assert_eq!(sidebar.badge_count(NavItem::Mentions), 0);
+    }
+
+    /// GTK has no getter for accessible labels, so the string handed to the
+    /// rows is checked directly.
+    #[test]
+    fn the_row_a11y_label_carries_the_true_count() {
+        assert_eq!(badge_a11y_label(NavItem::Mentions, 0), "Mentions");
+        assert_eq!(badge_a11y_label(NavItem::Mentions, 3), "Mentions, 3 unread");
+        // Capped on screen, exact for the screen reader.
+        assert_eq!(badge_a11y_label(NavItem::Chat, 150), "Chat, 150 unread");
     }
 }

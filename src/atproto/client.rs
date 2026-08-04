@@ -51,6 +51,44 @@ pub struct ReplyRef {
     pub parent_cid: String,
 }
 
+/// Unread tallies behind the sidebar badges.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UnreadCounts {
+    pub mentions: u32,
+    pub activity: u32,
+    pub chat: u32,
+}
+
+impl UnreadCounts {
+    /// Tally one page of notifications and one of conversations.
+    ///
+    /// Notifications come as `(reason, is_read)`; the mentions/activity split
+    /// mirrors the filter in `get_notifications`. Conversations come as
+    /// `(unread_count, muted)`, and muted ones stay off the badge.
+    pub(crate) fn tally<'a>(
+        notifications: impl IntoIterator<Item = (&'a str, bool)>,
+        convos: impl IntoIterator<Item = (i64, bool)>,
+    ) -> Self {
+        let mut counts = Self::default();
+        for (reason, is_read) in notifications {
+            if is_read {
+                continue;
+            }
+            if matches!(reason, "mention" | "reply" | "quote") {
+                counts.mentions += 1;
+            } else {
+                counts.activity += 1;
+            }
+        }
+        for (unread, muted) in convos {
+            if !muted {
+                counts.chat = counts.chat.saturating_add(unread.max(0) as u32);
+            }
+        }
+        counts
+    }
+}
+
 /// Wraps atrium so the rest of the app only sees our own types.
 /// Supports both credential-based (app password) and OAuth authentication.
 /// Only one of `credential_agent` or `oauth_agent` is set at a time.
@@ -2117,6 +2155,126 @@ impl HangarClient {
         })
     }
 
+    /// Tally unread notifications and chat messages for the sidebar badges.
+    ///
+    /// One page of each, notifications capped at 100. A very busy account can
+    /// undercount, but the badge display caps at 99+ anyway.
+    #[allow(clippy::await_holding_lock)]
+    pub async fn get_unread_counts(&self) -> Result<UnreadCounts, ClientError> {
+        use atrium_api::agent::bluesky::{AtprotoServiceType, BSKY_CHAT_DID};
+
+        with_agent!(self, agent => {
+
+        let params = atrium_api::app::bsky::notification::list_notifications::ParametersData {
+            cursor: None,
+            limit: 100u8.try_into().ok(),
+            priority: None,
+            reasons: None,
+            seen_at: None,
+        };
+
+        let notif_output = agent
+            .api
+            .app
+            .bsky
+            .notification
+            .list_notifications(params.into())
+            .await
+            .map_err(|e| self.xrpc_error(e))?;
+
+        let chat_did = BSKY_CHAT_DID
+            .parse()
+            .map_err(|e| ClientError::Network(format!("invalid chat DID: {e}")))?;
+        let chat_api = agent.api_with_proxy(chat_did, AtprotoServiceType::BskyChat);
+
+        let convo_params = atrium_api::chat::bsky::convo::list_convos::ParametersData {
+            cursor: None,
+            limit: None,
+            read_state: None,
+            status: None,
+        };
+
+        let convo_output = chat_api
+            .chat
+            .bsky
+            .convo
+            .list_convos(convo_params.into())
+            .await
+            .map_err(|e| self.xrpc_error(e))?;
+
+        Ok(UnreadCounts::tally(
+            notif_output
+                .data
+                .notifications
+                .iter()
+                .map(|n| (n.data.reason.as_str(), n.data.is_read)),
+            convo_output
+                .data
+                .convos
+                .iter()
+                .map(|c| (c.data.unread_count, c.data.muted)),
+        ))
+        })
+    }
+
+    /// Tell the server every notification has been seen.
+    ///
+    /// `seenAt` is account-wide. The server cannot mark only mentions seen,
+    /// so the Mentions and Activity badges clear together.
+    #[allow(clippy::await_holding_lock)]
+    pub async fn update_notifications_seen(&self) -> Result<(), ClientError> {
+        with_agent!(self, agent => {
+
+        let input = atrium_api::app::bsky::notification::update_seen::InputData {
+            seen_at: atrium_api::types::string::Datetime::now(),
+        };
+
+        agent
+            .api
+            .app
+            .bsky
+            .notification
+            .update_seen(input.into())
+            .await
+            .map_err(|e| self.xrpc_error(e))?;
+
+        Ok(())
+        })
+    }
+
+    /// Mark a conversation read up to its latest message.
+    ///
+    /// For the conversation view once it exists; the chat badge follows the
+    /// server's word on the next poll.
+    #[allow(dead_code)]
+    #[allow(clippy::await_holding_lock)]
+    pub async fn mark_convo_read(&self, convo_id: &str) -> Result<(), ClientError> {
+        use atrium_api::agent::bluesky::{AtprotoServiceType, BSKY_CHAT_DID};
+
+        with_agent!(self, agent => {
+
+        let chat_did = BSKY_CHAT_DID
+            .parse()
+            .map_err(|e| ClientError::Network(format!("invalid chat DID: {e}")))?;
+        let chat_api = agent.api_with_proxy(chat_did, AtprotoServiceType::BskyChat);
+
+        let input = atrium_api::chat::bsky::convo::update_read::InputData {
+            convo_id: convo_id.to_string(),
+            message_id: None,
+        };
+
+        chat_api
+            .chat
+            .bsky
+            .convo
+            .update_read(input.into())
+            .await
+            .map_err(|e| self.xrpc_error(e))?;
+
+        Ok(())
+        })
+    }
+
     /// Get messages for a specific conversation
     #[allow(clippy::await_holding_lock)]
     pub async fn get_messages(
@@ -2343,31 +2501,101 @@ impl HangarClient {
         let actors: Vec<Profile> = output
             .data
             .actors
-            .into_iter()
-            .map(|actor| Profile {
-                did: actor.data.did.to_string(),
-                handle: actor.data.handle.to_string(),
-                display_name: actor.data.display_name.clone(),
-                avatar: actor.data.avatar.clone(),
-                banner: None,
-                description: actor.data.description.clone(),
-                followers_count: None,
-                following_count: None,
-                posts_count: None,
-                viewer_following: actor
-                    .data
-                    .viewer
-                    .as_ref()
-                    .and_then(|v| v.data.following.clone()),
-                viewer_followed_by: actor
-                    .data
-                    .viewer
-                    .as_ref()
-                    .and_then(|v| v.data.followed_by.clone()),
-            })
+            .iter()
+            .map(Self::profile_from_view)
             .collect();
 
         Ok((actors, output.data.cursor))
+        })
+    }
+
+    /// Convert a wire ProfileView into our Profile. The view carries no
+    /// counts; pages that need them fetch the full profile.
+    fn profile_from_view(view: &atrium_api::app::bsky::actor::defs::ProfileView) -> Profile {
+        Profile {
+            did: view.data.did.to_string(),
+            handle: view.data.handle.to_string(),
+            display_name: view.data.display_name.clone(),
+            avatar: view.data.avatar.clone(),
+            banner: None,
+            description: view.data.description.clone(),
+            followers_count: None,
+            following_count: None,
+            posts_count: None,
+            viewer_following: view
+                .data
+                .viewer
+                .as_ref()
+                .and_then(|v| v.data.following.clone()),
+            viewer_followed_by: view
+                .data
+                .viewer
+                .as_ref()
+                .and_then(|v| v.data.followed_by.clone()),
+        }
+    }
+
+    /// Fetch one page of the accounts following `actor`
+    #[allow(clippy::await_holding_lock)]
+    pub async fn get_followers(
+        &self,
+        actor: &str,
+        cursor: Option<&str>,
+    ) -> Result<(Vec<Profile>, Option<String>), ClientError> {
+        with_agent!(self, agent => {
+
+        let params = atrium_api::app::bsky::graph::get_followers::ParametersData {
+            actor: actor
+                .parse()
+                .map_err(|e| ClientError::InvalidResponse(format!("invalid actor: {e}")))?,
+            cursor: cursor.map(String::from),
+            limit: None,
+        };
+
+        let output = agent
+            .api
+            .app
+            .bsky
+            .graph
+            .get_followers(params.into())
+            .await
+            .map_err(|e| self.xrpc_error(e))?;
+
+        let profiles = output.data.followers.iter().map(Self::profile_from_view).collect();
+
+        Ok((profiles, output.data.cursor))
+        })
+    }
+
+    /// Fetch one page of the accounts `actor` follows
+    #[allow(clippy::await_holding_lock)]
+    pub async fn get_follows(
+        &self,
+        actor: &str,
+        cursor: Option<&str>,
+    ) -> Result<(Vec<Profile>, Option<String>), ClientError> {
+        with_agent!(self, agent => {
+
+        let params = atrium_api::app::bsky::graph::get_follows::ParametersData {
+            actor: actor
+                .parse()
+                .map_err(|e| ClientError::InvalidResponse(format!("invalid actor: {e}")))?,
+            cursor: cursor.map(String::from),
+            limit: None,
+        };
+
+        let output = agent
+            .api
+            .app
+            .bsky
+            .graph
+            .get_follows(params.into())
+            .await
+            .map_err(|e| self.xrpc_error(e))?;
+
+        let profiles = output.data.follows.iter().map(Self::profile_from_view).collect();
+
+        Ok((profiles, output.data.cursor))
         })
     }
 }
@@ -2690,5 +2918,48 @@ mod tests {
             let uri = format!("at://did:plc:a/{coll}/rkey");
             assert!(parse_record_uri(&uri, coll).is_ok());
         }
+    }
+
+    /// The mentions/activity split behind the sidebar badges.
+    #[test]
+    fn unread_notifications_split_between_mentions_and_activity() {
+        let counts = UnreadCounts::tally(
+            [
+                ("mention", false),
+                ("reply", false),
+                ("quote", false),
+                ("like", false),
+                ("repost", false),
+                ("follow", false),
+                ("like-via-repost", false),
+                // Read ones count nowhere.
+                ("mention", true),
+                ("like", true),
+            ],
+            [],
+        );
+        assert_eq!(counts.mentions, 3, "mention, reply, and quote");
+        assert_eq!(counts.activity, 4, "everything else unread");
+        assert_eq!(counts.chat, 0);
+    }
+
+    /// Muted conversations must not light the chat badge.
+    #[test]
+    fn chat_badge_sums_unread_over_unmuted_conversations_only() {
+        let counts = UnreadCounts::tally(
+            [],
+            [
+                (2, false),
+                (5, false),
+                (7, true),
+                (0, false),
+                // The server should never send a negative count; ignore one
+                // rather than wrapping the badge around.
+                (-3, false),
+            ],
+        );
+        assert_eq!(counts.chat, 7);
+        assert_eq!(counts.mentions, 0);
+        assert_eq!(counts.activity, 0);
     }
 }

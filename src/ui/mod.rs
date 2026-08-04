@@ -4,6 +4,7 @@ mod actor_row;
 pub mod avatar_cache;
 mod compose_dialog;
 pub mod external;
+mod follow_list_page;
 pub mod inline_video;
 mod login_dialog;
 pub mod media_viewer;
@@ -16,9 +17,10 @@ pub mod video_player;
 mod window;
 
 pub use compose_dialog::{ComposeDialog, QuoteContext, ReplyContext};
+pub use follow_list_page::{FollowListKind, FollowListPage};
 pub use login_dialog::LoginDialog;
 pub use sidebar::NavItem;
-pub use window::HangarWindow;
+pub use window::{FollowListPush, HangarWindow};
 
 /// Run a test body on the one GTK thread, or skip if there is no display.
 ///

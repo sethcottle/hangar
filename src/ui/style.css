@@ -574,4 +574,17 @@ popover.mention-popover > contents {
     margin-bottom: 4px;
 }
 
+/* Unread count pill on the sidebar rail icons */
+.unread-badge {
+    background-color: @accent_bg_color;
+    color: @accent_fg_color;
+    border-radius: 999px;
+    padding: 0px 4px;
+    font-size: 10px;
+    font-weight: 700;
+    min-width: 8px;
+    margin-top: -6px;
+    margin-right: -10px;
+}
+
 

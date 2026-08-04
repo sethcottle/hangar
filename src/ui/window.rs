@@ -5,6 +5,7 @@
 #![allow(clippy::collapsible_else_if)]
 
 use super::actor_row::{ActorObject, ActorRow};
+use super::follow_list_page::{FollowListKind, FollowListPage};
 use super::post_row::PostRow;
 use super::sidebar::Sidebar;
 use crate::atproto::{Conversation, Notification, Post, SavedFeed};
@@ -14,7 +15,7 @@ use gtk4::{gio, glib};
 use libadwaita as adw;
 use libadwaita::prelude::*;
 use libadwaita::subclass::prelude::*;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 mod post_object {
@@ -56,6 +57,15 @@ mod post_object {
 }
 
 use post_object::PostObject;
+
+/// What `push_follow_list_page` did with the request.
+pub enum FollowListPush {
+    /// A new page went onto the stack and needs wiring and a first fetch.
+    Pushed(FollowListPage),
+    /// An already-open copy was popped back to. Its callbacks are wired;
+    /// it only needs a fetch if its first load never completed.
+    PoppedBack(FollowListPage),
+}
 
 mod notification_object {
     use super::*;
@@ -247,6 +257,16 @@ mod imp {
         /// Only strong ref; rows find it through a thread-local `Weak`. See
         /// `ui::inline_video`.
         pub video_director: RefCell<Option<Rc<crate::ui::inline_video::VideoDirector>>>,
+        /// Poll-inserted posts the user has not scrolled up to yet. One
+        /// number feeds both the banner and the Home badge so they cannot
+        /// disagree.
+        pub unseen_posts: Cell<usize>,
+        // Follower and following stat clicks, own profile and pushed pages alike
+        pub follow_list_clicked_callback:
+            RefCell<Option<Box<dyn Fn(Profile, FollowListKind) + 'static>>>,
+        // The own-profile stat boxes, so their spoken labels can follow the counts
+        pub profile_followers_box: RefCell<Option<gtk4::Box>>,
+        pub profile_following_box: RefCell<Option<gtk4::Box>>,
     }
 
     #[glib::object_subclass]
@@ -976,13 +996,24 @@ impl HangarWindow {
     }
 
     pub fn show_new_posts_banner(&self, count: usize) {
+        // Each poll reports only its own batch, so keep a running total
+        // until the user actually looks at the top of the feed.
+        let total = self.imp().unseen_posts.get().saturating_add(count);
+        self.imp().unseen_posts.set(total);
+        if let Some(sidebar) = self.imp().sidebar.borrow().as_ref() {
+            sidebar.set_badge(
+                crate::ui::sidebar::NavItem::Home,
+                u32::try_from(total).unwrap_or(u32::MAX),
+            );
+        }
+
         if let Some(banner) = self.imp().new_posts_banner.borrow().as_ref() {
-            let label_text = if count == 1 {
+            let label_text = if total == 1 {
                 "1 new post".to_string()
-            } else if count > 99 {
+            } else if total > 99 {
                 "99+ new posts".to_string()
             } else {
-                format!("{} new posts", count)
+                format!("{} new posts", total)
             };
             // Find the label inside the button's box
             if let Some(banner_box) = banner.child().and_then(|c| c.downcast::<gtk4::Box>().ok()) {
@@ -1009,6 +1040,15 @@ impl HangarWindow {
     }
 
     pub fn hide_new_posts_banner(&self) {
+        // Scrolling near the top calls this every frame; only touch the
+        // badge when there was something to clear.
+        if self.imp().unseen_posts.get() != 0 {
+            self.imp().unseen_posts.set(0);
+            if let Some(sidebar) = self.imp().sidebar.borrow().as_ref() {
+                sidebar.set_badge(crate::ui::sidebar::NavItem::Home, 0);
+            }
+        }
+
         if let Some(banner) = self.imp().new_posts_banner.borrow().as_ref() {
             // Animate fade out then hide (skip animation if disabled)
             let animations_enabled = gtk4::Settings::default()
@@ -1236,6 +1276,16 @@ impl HangarWindow {
             .replace(Some(Box::new(callback)));
     }
 
+    /// Set callback for when a followers or following count is clicked
+    pub fn set_follow_list_clicked_callback<F: Fn(Profile, FollowListKind) + 'static>(
+        &self,
+        callback: F,
+    ) {
+        self.imp()
+            .follow_list_clicked_callback
+            .replace(Some(Box::new(callback)));
+    }
+
     /// Push a thread view page onto the current section's navigation stack
     pub fn push_thread_page(&self, post: &Post, thread_posts: Vec<Post>) {
         let nav_view = self.current_nav_view();
@@ -1283,6 +1333,75 @@ impl HangarWindow {
         let page = self.build_profile_page(profile, posts);
         page.set_tag(Some(&tag));
         nav_view.push(&page);
+    }
+
+    /// Push a followers or following list onto the current section's stack.
+    ///
+    /// Returns the list widget either way; the caller decides whether a
+    /// popped-back page still needs a fetch.
+    pub fn push_follow_list_page(
+        &self,
+        profile: &Profile,
+        kind: FollowListKind,
+    ) -> Option<FollowListPush> {
+        let nav_view = self.current_nav_view()?;
+
+        self.save_scroll_position();
+
+        // Same treatment as threads and profiles: revisiting pops back
+        // instead of stacking a second copy.
+        let tag = format!("{}:{}", kind.tag_prefix(), profile.did);
+        if let Some(existing) = nav_view.find_page(&tag) {
+            nav_view.pop_to_tag(&tag);
+            // The list is the content box's last child; see the push below.
+            let list = existing
+                .child()
+                .and_then(|content| content.last_child())
+                .and_downcast::<FollowListPage>()?;
+            return Some(FollowListPush::PoppedBack(list));
+        }
+
+        let list = FollowListPage::new(kind);
+
+        // Tapping a listed account opens their profile through the same
+        // route as everywhere else, so cycles dedupe on the profile tag.
+        let win = self.downgrade();
+        list.set_profile_activated_callback(move |profile| {
+            let Some(win) = win.upgrade() else {
+                return;
+            };
+            if let Some(cb) = win.imp().profile_clicked_callback.borrow().as_ref() {
+                cb(profile);
+            }
+        });
+
+        let content_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        content_box.set_hexpand(true);
+
+        let header = adw::HeaderBar::new();
+        header.set_show_start_title_buttons(false);
+        header.set_show_end_title_buttons(false);
+
+        let display_name = profile.display_name.as_deref().unwrap_or(&profile.handle);
+        let title_text = format!("{} · {}", kind.title(), display_name);
+        let title = gtk4::Label::new(Some(&title_text));
+        title.add_css_class("title");
+        // A bare label's minimum width is its full text; a long display name
+        // would push the window past the screen.
+        title.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        header.set_title_widget(Some(&title));
+
+        let window_controls = gtk4::WindowControls::new(gtk4::PackType::End);
+        header.pack_end(&window_controls);
+
+        content_box.append(&header);
+        content_box.append(&list);
+
+        let page = adw::NavigationPage::new(&content_box, &title_text);
+        page.set_tag(Some(&tag));
+        nav_view.push(&page);
+
+        Some(FollowListPush::Pushed(list))
     }
 
     /// Save the current scroll position for the active section
@@ -1681,6 +1800,18 @@ impl HangarWindow {
         handle_label.set_halign(gtk4::Align::Center);
         handle_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         profile_header.append(&handle_label);
+
+        // Followers and following, clickable. A count can be missing when
+        // the full profile fetch failed; the lists open fine without it.
+        let stats_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 16);
+        stats_row.set_halign(gtk4::Align::Center);
+        for (kind, count) in [
+            (FollowListKind::Followers, profile.followers_count),
+            (FollowListKind::Following, profile.following_count),
+        ] {
+            stats_row.append(&self.build_follow_stat(profile, kind, count));
+        }
+        profile_header.append(&stats_row);
 
         // Bio, with links. Wire text: it wraps and caps its line length,
         // there is no horizontal scrollbar to save it.
@@ -2786,25 +2917,48 @@ impl HangarWindow {
         let stats_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 16);
         stats_box.set_margin_top(8);
 
-        // Followers
-        let followers_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+        // Followers, clickable. The gesture is wired once here; the click
+        // reads current_profile so a later account switch needs no rewiring.
+        let followers_box = Self::clickable_stat_box();
         let followers_count = gtk4::Label::new(Some("0"));
         followers_count.add_css_class("heading");
         followers_box.append(&followers_count);
         let followers_static = gtk4::Label::new(Some("followers"));
         followers_static.add_css_class("dim-label");
         followers_box.append(&followers_static);
+        let win = self.downgrade();
+        let followers_click = gtk4::GestureClick::new();
+        followers_click.connect_released(move |_, _, _, _| {
+            if let Some(win) = win.upgrade() {
+                win.open_follow_list_for_current_profile(FollowListKind::Followers);
+            }
+        });
+        followers_box.add_controller(followers_click);
         stats_box.append(&followers_box);
 
-        // Following
-        let following_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+        // Following, same deal
+        let following_box = Self::clickable_stat_box();
         let following_count = gtk4::Label::new(Some("0"));
         following_count.add_css_class("heading");
         following_box.append(&following_count);
         let following_static = gtk4::Label::new(Some("following"));
         following_static.add_css_class("dim-label");
         following_box.append(&following_static);
+        let win = self.downgrade();
+        let following_click = gtk4::GestureClick::new();
+        following_click.connect_released(move |_, _, _, _| {
+            if let Some(win) = win.upgrade() {
+                win.open_follow_list_for_current_profile(FollowListKind::Following);
+            }
+        });
+        following_box.add_controller(following_click);
         stats_box.append(&following_box);
+
+        // Buttons need names before the first profile fills the counts in.
+        followers_box
+            .update_property(&[gtk4::accessible::Property::Label("Followers, opens list")]);
+        following_box
+            .update_property(&[gtk4::accessible::Property::Label("Following, opens list")]);
 
         // Posts count
         let posts_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
@@ -2828,8 +2982,79 @@ impl HangarWindow {
         imp.profile_followers_label.replace(Some(followers_count));
         imp.profile_following_label.replace(Some(following_count));
         imp.profile_posts_label.replace(Some(posts_count));
+        imp.profile_followers_box.replace(Some(followers_box));
+        imp.profile_following_box.replace(Some(following_box));
 
         header_box
+    }
+
+    /// An empty stat box that announces itself as a button and shows a
+    /// pointer, for follower and following counts that open their lists.
+    fn clickable_stat_box() -> gtk4::Box {
+        let stat_box = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(4)
+            .accessible_role(gtk4::AccessibleRole::Button)
+            .build();
+        stat_box.set_cursor_from_name(Some("pointer"));
+        stat_box
+    }
+
+    /// Route a click on an own-profile stat to the follow-list callback,
+    /// carrying whichever profile the header currently shows.
+    fn open_follow_list_for_current_profile(&self, kind: FollowListKind) {
+        let profile = self.imp().current_profile.borrow().clone();
+        let Some(profile) = profile else {
+            return;
+        };
+        if let Some(cb) = self.imp().follow_list_clicked_callback.borrow().as_ref() {
+            cb(profile, kind);
+        }
+    }
+
+    /// A clickable follower or following stat for a pushed profile page.
+    /// The page is rebuilt per push, so the count never needs updating.
+    fn build_follow_stat(
+        &self,
+        profile: &Profile,
+        kind: FollowListKind,
+        count: Option<u32>,
+    ) -> gtk4::Box {
+        let noun = match kind {
+            FollowListKind::Followers => "followers",
+            FollowListKind::Following => "following",
+        };
+
+        let stat_box = Self::clickable_stat_box();
+        if let Some(count) = count {
+            let count_label = gtk4::Label::new(Some(&Self::format_count(count)));
+            count_label.add_css_class("heading");
+            stat_box.append(&count_label);
+        }
+        let noun_label = gtk4::Label::new(Some(noun));
+        noun_label.add_css_class("dim-label");
+        stat_box.append(&noun_label);
+
+        let spoken = match count {
+            Some(count) => format!("{} {}, opens list", Self::format_count(count), noun),
+            None => format!("{}, opens list", kind.title()),
+        };
+        stat_box.update_property(&[gtk4::accessible::Property::Label(&spoken)]);
+
+        let win = self.downgrade();
+        let profile = profile.clone();
+        let click = gtk4::GestureClick::new();
+        click.connect_released(move |_, _, _, _| {
+            let Some(win) = win.upgrade() else {
+                return;
+            };
+            if let Some(cb) = win.imp().follow_list_clicked_callback.borrow().as_ref() {
+                cb(profile.clone(), kind);
+            }
+        });
+        stat_box.add_controller(click);
+
+        stat_box
     }
 
     /// Route link activations on a bio label, matching post text: mentions
@@ -2898,6 +3123,22 @@ impl HangarWindow {
         if let Some(label) = imp.profile_following_label.borrow().as_ref() {
             let count = profile.following_count.unwrap_or(0);
             label.set_text(&Self::format_count(count));
+        }
+        // The stat boxes read as buttons; keep what they say in step with
+        // the counts they show.
+        if let Some(stat_box) = imp.profile_followers_box.borrow().as_ref() {
+            let spoken = format!(
+                "{} followers, opens list",
+                Self::format_count(profile.followers_count.unwrap_or(0))
+            );
+            stat_box.update_property(&[gtk4::accessible::Property::Label(&spoken)]);
+        }
+        if let Some(stat_box) = imp.profile_following_box.borrow().as_ref() {
+            let spoken = format!(
+                "{} following, opens list",
+                Self::format_count(profile.following_count.unwrap_or(0))
+            );
+            stat_box.update_property(&[gtk4::accessible::Property::Label(&spoken)]);
         }
         if let Some(label) = imp.profile_posts_label.borrow().as_ref() {
             let count = profile.posts_count.unwrap_or(0);
@@ -6116,6 +6357,206 @@ mod tests {
             vec![a_post("kept").uri],
             "the thread page should hold exactly the surviving post"
         );
+
+        window.destroy();
+    }
+
+    /// Follow lists tag by account and side, and revisiting one pops back
+    /// to it instead of stacking a second copy.
+    #[test]
+    fn follow_list_pages_tag_by_account_and_side() {
+        crate::ui::with_gtk(follow_list_pages_tag_by_account_and_side_body);
+    }
+
+    fn follow_list_pages_tag_by_account_and_side_body() {
+        let window: HangarWindow = glib::Object::builder().build();
+
+        let alice = Profile::minimal(
+            "did:plc:alice".into(),
+            "alice.bsky.social".into(),
+            None,
+            None,
+        );
+        let bob = Profile::minimal("did:plc:bob".into(), "bob.bsky.social".into(), None, None);
+
+        assert!(matches!(
+            window.push_follow_list_page(&alice, FollowListKind::Followers),
+            Some(FollowListPush::Pushed(_))
+        ));
+        assert!(
+            matches!(
+                window.push_follow_list_page(&alice, FollowListKind::Following),
+                Some(FollowListPush::Pushed(_))
+            ),
+            "the two sides for one account are separate pages"
+        );
+        assert!(matches!(
+            window.push_follow_list_page(&bob, FollowListKind::Followers),
+            Some(FollowListPush::Pushed(_))
+        ));
+
+        let nav_view = window
+            .imp()
+            .home_nav_view
+            .borrow()
+            .clone()
+            .expect("the home section has a navigation view");
+        for tag in [
+            "followers:did:plc:alice",
+            "following:did:plc:alice",
+            "followers:did:plc:bob",
+        ] {
+            assert!(nav_view.find_page(tag).is_some(), "{tag} is in the stack");
+        }
+
+        assert!(
+            matches!(
+                window.push_follow_list_page(&alice, FollowListKind::Followers),
+                Some(FollowListPush::PoppedBack(_))
+            ),
+            "an already-open list is popped back to instead of repushed"
+        );
+        // Let the pop settle; the unmapped views may finish through idles.
+        let ctx = glib::MainContext::default();
+        while ctx.iteration(false) {}
+
+        assert_eq!(
+            nav_view.visible_page().and_then(|p| p.tag()).as_deref(),
+            Some("followers:did:plc:alice")
+        );
+        assert!(
+            nav_view.find_page("following:did:plc:alice").is_none(),
+            "popping back drops the pages that were stacked above"
+        );
+
+        window.destroy();
+    }
+
+    /// A pushed profile page offers both follow lists as real click targets,
+    /// with the count shown when the profile brought one.
+    #[test]
+    fn a_pushed_profile_page_offers_its_follow_lists() {
+        crate::ui::with_gtk(a_pushed_profile_page_offers_its_follow_lists_body);
+    }
+
+    fn a_pushed_profile_page_offers_its_follow_lists_body() {
+        let window: HangarWindow = glib::Object::builder().build();
+
+        let mut profile = Profile::minimal(
+            "did:plc:counted".into(),
+            "counted.bsky.social".into(),
+            None,
+            None,
+        );
+        profile.followers_count = Some(1200);
+        // following_count stays None: the target must still be clickable.
+        window.push_profile_page(&profile, vec![]);
+
+        let nav_view = window
+            .imp()
+            .home_nav_view
+            .borrow()
+            .clone()
+            .expect("the home section has a navigation view");
+        let page = nav_view
+            .find_page("profile:did:plc:counted")
+            .expect("the profile page is in the stack");
+
+        let mut widgets = Vec::new();
+        walk(&page.clone().upcast::<gtk4::Widget>(), 0, &mut widgets);
+        let stat_box_for = |noun: &str| -> gtk4::Widget {
+            widgets
+                .iter()
+                .find_map(|(_, w)| {
+                    let label = w.downcast_ref::<gtk4::Label>()?;
+                    (label.text() == noun).then(|| label.parent())?
+                })
+                .unwrap_or_else(|| panic!("no {noun} stat on the page"))
+        };
+
+        for noun in ["followers", "following"] {
+            let stat_box = stat_box_for(noun);
+            assert!(
+                !click_phases(&stat_box).is_empty(),
+                "the {noun} stat takes clicks"
+            );
+            assert!(
+                stat_box.cursor().is_some(),
+                "the {noun} stat shows a pointer"
+            );
+        }
+
+        // The known count is shown; the missing one leaves just the word.
+        let followers_box = stat_box_for("followers");
+        assert_eq!(
+            followers_box
+                .first_child()
+                .and_downcast::<gtk4::Label>()
+                .map(|l| l.text().to_string()),
+            Some("1.2K".into())
+        );
+        let following_box = stat_box_for("following");
+        assert!(
+            following_box
+                .first_child()
+                .and_downcast::<gtk4::Label>()
+                .is_some_and(|l| l.text() == "following"),
+            "a missing count leaves the word as the whole stat"
+        );
+
+        window.destroy();
+    }
+
+    /// The own-profile stats route to the follow-list callback with the
+    /// shown profile and the side that was clicked, and only once a
+    /// profile is actually loaded.
+    #[test]
+    fn the_own_profile_stats_ask_for_the_matching_list() {
+        crate::ui::with_gtk(the_own_profile_stats_ask_for_the_matching_list_body);
+    }
+
+    fn the_own_profile_stats_ask_for_the_matching_list_body() {
+        let window: HangarWindow = glib::Object::builder().build();
+        let imp = window.imp();
+
+        let opened: Rc<RefCell<Vec<(String, FollowListKind)>>> = Rc::new(RefCell::new(vec![]));
+        let sink = opened.clone();
+        window.set_follow_list_clicked_callback(move |profile, kind| {
+            sink.borrow_mut().push((profile.did, kind));
+        });
+
+        // Nothing loaded yet: a click has no list to open.
+        window.open_follow_list_for_current_profile(FollowListKind::Followers);
+        assert!(opened.borrow().is_empty());
+
+        let me = Profile::minimal("did:plc:me".into(), "me.bsky.social".into(), None, None);
+        window.update_profile_header(&me);
+        window.open_follow_list_for_current_profile(FollowListKind::Followers);
+        window.open_follow_list_for_current_profile(FollowListKind::Following);
+        assert_eq!(
+            *opened.borrow(),
+            vec![
+                ("did:plc:me".to_string(), FollowListKind::Followers),
+                ("did:plc:me".to_string(), FollowListKind::Following),
+            ]
+        );
+
+        // And the boxes themselves are wired as click targets.
+        for (name, cell) in [
+            ("followers", &imp.profile_followers_box),
+            ("following", &imp.profile_following_box),
+        ] {
+            let stat_box = cell
+                .borrow()
+                .clone()
+                .unwrap_or_else(|| panic!("the header stored its {name} box"));
+            let widget = stat_box.upcast::<gtk4::Widget>();
+            assert!(
+                !click_phases(&widget).is_empty(),
+                "the {name} box takes clicks"
+            );
+            assert!(widget.cursor().is_some(), "the {name} box shows a pointer");
+        }
 
         window.destroy();
     }
