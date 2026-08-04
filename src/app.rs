@@ -129,6 +129,8 @@ mod imp {
         pub(crate) search_generation: Generation,
         /// Same idea for the New Message picker's typeahead.
         pub(crate) message_target_generation: Generation,
+        /// Mirrors gio's NetworkMonitor; the banner and poll guards read it.
+        pub(crate) offline: RefCell<bool>,
         /// Whether new posts polling has been started
         pub polling_started: RefCell<bool>,
         /// Whether an unread-badge fetch is already in flight
@@ -204,6 +206,15 @@ mod imp {
                 window.add_css_class("devel");
             }
             self.window.replace(Some(window.clone()));
+
+            // Connectivity: the banner and the poll guards follow gio's
+            // monitor rather than waiting for requests to time out.
+            let monitor = gio::NetworkMonitor::default();
+            let app_clone = app.clone();
+            monitor.connect_network_changed(move |_, available| {
+                app_clone.set_network_available(available);
+            });
+            app.set_network_available(monitor.is_network_available());
 
             let app_clone = app.clone();
             window.set_load_more_callback(move || {
@@ -1088,6 +1099,7 @@ impl HangarApplication {
                 }
                 Ok(Err(e)) => {
                     eprintln!("Failed to fetch timeline: {}", e);
+                    app.toast_unless_offline("Couldn't load the feed");
                     app.report_session_expiry();
                     glib::ControlFlow::Break
                 }
@@ -1764,6 +1776,7 @@ impl HangarApplication {
                         window.set_loading_more(false);
                     }
                     eprintln!("Failed to fetch more timeline: {}", e);
+                    app.toast_unless_offline("Couldn't load more posts");
                     glib::ControlFlow::Break
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
@@ -1803,6 +1816,11 @@ impl HangarApplication {
         // A dead session would fail here every 30 seconds; wait for the
         // next sign-in instead.
         if *self.imp().session_dead.borrow() {
+            return;
+        }
+
+        // Offline says why every request would fail; the banner covers it.
+        if *self.imp().offline.borrow() {
             return;
         }
 
@@ -1911,6 +1929,10 @@ impl HangarApplication {
         let in_flight = *self.imp().checking_unread.borrow();
         let expired = *self.imp().session_dead.borrow();
         if !unread_poll_allowed(signed_in, in_flight, expired) {
+            return;
+        }
+        // Same offline guard as the new-posts poll.
+        if *self.imp().offline.borrow() {
             return;
         }
         self.imp().checking_unread.replace(true);
@@ -2162,6 +2184,7 @@ impl HangarApplication {
                 }
                 Ok(Err(e)) => {
                     eprintln!("Failed to fetch feed: {}", e);
+                    app.toast_unless_offline("Couldn't load this feed");
                     glib::ControlFlow::Break
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
@@ -2196,6 +2219,7 @@ impl HangarApplication {
                 }
                 Ok(Err(e)) => {
                     eprintln!("Failed to fetch thread: {}", e);
+                    app.toast_unless_offline("Couldn't load the thread");
                     // Clicking a quote of a deleted post lands here. Silence
                     // read as a dead click.
                     if let Some(window) = app.imp().window.borrow().as_ref() {
@@ -2235,6 +2259,7 @@ impl HangarApplication {
                 }
                 Ok(Err(e)) => {
                     eprintln!("Failed to fetch profile for handle: {}", e);
+                    app.toast_unless_offline("Couldn't open the profile");
                     glib::ControlFlow::Break
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
@@ -2281,6 +2306,7 @@ impl HangarApplication {
                 }
                 Ok(Err(e)) => {
                     eprintln!("Failed to fetch profile feed: {}", e);
+                    app.toast_unless_offline("Couldn't open the profile");
                     glib::ControlFlow::Break
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
@@ -2491,6 +2517,7 @@ impl HangarApplication {
                 }
                 Ok(Err(e)) => {
                     eprintln!("Failed to fetch mentions: {}", e);
+                    app.toast_unless_offline("Couldn't load mentions");
                     glib::ControlFlow::Break
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
@@ -2607,6 +2634,7 @@ impl HangarApplication {
                 }
                 Ok(Err(e)) => {
                     eprintln!("Failed to fetch activity: {}", e);
+                    app.toast_unless_offline("Couldn't load activity");
                     glib::ControlFlow::Break
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
@@ -3529,6 +3557,7 @@ impl HangarApplication {
                 }
                 Ok(Err(e)) => {
                     eprintln!("Failed to fetch likes: {}", e);
+                    app.toast_unless_offline("Couldn't load likes");
                     glib::ControlFlow::Break
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
@@ -3791,6 +3820,30 @@ impl HangarApplication {
         });
     }
 
+    /// Track connectivity. Going offline raises the banner and parks the
+    /// polls; coming back lowers it and refreshes the feed, since whatever
+    /// is on screen predates the outage.
+    fn set_network_available(&self, available: bool) {
+        let was_offline = *self.imp().offline.borrow();
+        self.imp().offline.replace(!available);
+        if let Some(window) = self.imp().window.borrow().as_ref() {
+            window.set_offline(!available);
+        }
+        if available && was_offline && self.imp().user_did.borrow().is_some() {
+            self.fetch_timeline();
+        }
+    }
+
+    /// A failure toast, unless the offline banner already explains it.
+    fn toast_unless_offline(&self, message: &str) {
+        if *self.imp().offline.borrow() {
+            return;
+        }
+        if let Some(window) = self.imp().window.borrow().as_ref() {
+            window.show_toast(message);
+        }
+    }
+
     /// Flip a follow on the server and hand the outcome to `done` on the
     /// main thread: Ok(Some(uri)) followed, Ok(None) unfollowed. A failure
     /// toasts and reports session expiry before `done` runs.
@@ -3948,6 +4001,7 @@ impl HangarApplication {
                         window.set_search_loading(false);
                     }
                     eprintln!("Failed to search: {}", e);
+                    app.toast_unless_offline("Search failed");
                     glib::ControlFlow::Break
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,

@@ -158,6 +158,7 @@ mod imp {
         pub sidebar: RefCell<Option<Sidebar>>,
         // Main content stack for top-level pages (Home, Mentions, etc.)
         pub main_stack: RefCell<Option<gtk4::Stack>>,
+        pub offline_banner: RefCell<Option<adw::Banner>>,
         // NavigationView for Home section (for thread/profile drill-down)
         pub home_nav_view: RefCell<Option<adw::NavigationView>>,
         // NavigationView for Mentions section (for thread/profile drill-down)
@@ -471,7 +472,14 @@ impl HangarWindow {
             }
         ));
 
-        main_box.append(&main_stack);
+        // Banner above the stack: connectivity is page-independent.
+        let offline_banner = adw::Banner::new("You're offline");
+        let content_column = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        content_column.set_hexpand(true);
+        content_column.append(&offline_banner);
+        content_column.append(&main_stack);
+        main_box.append(&content_column);
+        self.imp().offline_banner.replace(Some(offline_banner));
 
         // Wrap in AdwToastOverlay
         let toast_overlay = adw::ToastOverlay::new();
@@ -4985,6 +4993,25 @@ impl HangarWindow {
     }
 
     /// Show a toast notification
+    /// Show or clear the offline banner, saying so aloud either way.
+    pub fn set_offline(&self, offline: bool) {
+        let Some(banner) = self.imp().offline_banner.borrow().clone() else {
+            return;
+        };
+        if banner.is_revealed() == offline {
+            return;
+        }
+        banner.set_revealed(offline);
+        self.announce(
+            if offline {
+                "You're offline"
+            } else {
+                "Back online"
+            },
+            gtk4::AccessibleAnnouncementPriority::Medium,
+        );
+    }
+
     pub fn show_toast(&self, message: &str) {
         if let Some(overlay) = self.imp().toast_overlay.borrow().as_ref() {
             let toast = adw::Toast::new(message);
@@ -7753,6 +7780,25 @@ mod tests {
                 .is_some_and(|l| l.text() == "following"),
             "a missing count leaves the word as the whole stat"
         );
+
+        window.destroy();
+    }
+
+    /// The offline banner follows connectivity and only moves on change.
+    #[test]
+    fn the_offline_banner_follows_connectivity() {
+        crate::ui::with_gtk(the_offline_banner_follows_connectivity_body);
+    }
+
+    fn the_offline_banner_follows_connectivity_body() {
+        let window: HangarWindow = glib::Object::builder().build();
+        let banner = window.imp().offline_banner.borrow().clone().unwrap();
+
+        assert!(!banner.is_revealed(), "online until told otherwise");
+        window.set_offline(true);
+        assert!(banner.is_revealed());
+        window.set_offline(false);
+        assert!(!banner.is_revealed());
 
         window.destroy();
     }

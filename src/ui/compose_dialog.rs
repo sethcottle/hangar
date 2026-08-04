@@ -2532,8 +2532,26 @@ impl ComposeDialog {
             (count > 0 || has_images) && count <= MAX_GRAPHEMES
         });
 
+        // The require-alt gate covers every post in the thread.
+        let alt_ok = !imp.require_alt_text.get()
+            || (imp
+                .images
+                .borrow()
+                .iter()
+                .all(|img| !img.alt_text.is_empty())
+                && imp
+                    .thread_posts
+                    .borrow()
+                    .iter()
+                    .all(|block| block.images.iter().all(|img| !img.alt_text.is_empty())));
+
         if let Some(btn) = imp.post_button.borrow().as_ref() {
-            btn.set_sensitive(main_ok && thread_ok);
+            btn.set_sensitive(main_ok && thread_ok && alt_ok);
+            btn.set_tooltip_text(if alt_ok {
+                None
+            } else {
+                Some("Describe your images before posting")
+            });
         }
     }
 
@@ -2619,6 +2637,18 @@ impl ComposeDialog {
 
         self.rebuild_thread_image_strip(post_index);
         self.update_thread_post_button_state();
+
+        // The descriptive-text prompt, same as the main post.
+        if imp.require_alt_text.get() {
+            let index = imp
+                .thread_posts
+                .borrow()
+                .get(post_index)
+                .map(|block| block.images.len().saturating_sub(1));
+            if let Some(index) = index {
+                self.show_thread_alt_text_dialog(post_index, index);
+            }
+        }
     }
 
     /// Rebuild image strip for a thread post.
@@ -2977,6 +3007,8 @@ impl ComposeDialog {
                     }
                 }
                 dialog.rebuild_thread_image_strip(post_index);
+                // A fresh description may be what the Post button waited on.
+                dialog.update_thread_post_button_state();
             }
 
             if let Some(dlg) = alt_dialog_weak.upgrade() {
