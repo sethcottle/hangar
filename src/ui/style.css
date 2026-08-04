@@ -159,8 +159,10 @@ menubutton.flat.circular.reposted > button {
     color: @error_color;
 }
 
-/* Timeline background */
-.background {
+/* Timeline background. Tooltip windows carry .background too, and their
+   text is white in both themes; painting them with the window color made
+   them unreadable in light theme. Leave them to the theme. */
+.background:not(tooltip) {
     background-color: @window_bg_color;
 }
 

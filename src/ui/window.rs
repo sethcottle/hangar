@@ -7013,6 +7013,24 @@ mod tests {
         window.destroy();
     }
 
+    /// The stylesheet must parse clean. GTK only warns at runtime, so a
+    /// bad selector would otherwise ship as silently dropped rules.
+    #[test]
+    fn the_stylesheet_parses_without_errors() {
+        crate::ui::with_gtk(the_stylesheet_parses_without_errors_body);
+    }
+
+    fn the_stylesheet_parses_without_errors_body() {
+        let provider = gtk4::CssProvider::new();
+        let errors: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(vec![]));
+        let sink = errors.clone();
+        provider.connect_parsing_error(move |_, section, error| {
+            sink.borrow_mut().push(format!("{section}: {error}"));
+        });
+        provider.load_from_string(include_str!("style.css"));
+        assert!(errors.borrow().is_empty(), "{:?}", errors.borrow());
+    }
+
     /// The follow button starts from viewer state, hands the callback the
     /// DID and the URI cell, shows the hoped-for state while waiting, and
     /// stays off your own page.
