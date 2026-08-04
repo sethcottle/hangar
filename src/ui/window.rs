@@ -555,29 +555,15 @@ impl HangarWindow {
         imp.search_nav_view.replace(Some(search_nav_view));
 
         // Narrow windows drop the rail's captions; icons, tooltips, and
-        // accessible names keep carrying the meaning.
-        let breakpoint = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
-            adw::BreakpointConditionLengthType::MaxWidth,
-            560.0,
-            adw::LengthUnit::Sp,
-        ));
-        let win = self.downgrade();
-        breakpoint.connect_apply(move |_| {
-            if let Some(win) = win.upgrade()
-                && let Some(sidebar) = win.imp().sidebar.borrow().as_ref()
-            {
-                sidebar.set_compact(true);
+        // accessible names keep carrying the meaning. Watched by property
+        // rather than an AdwBreakpoint: a breakpoint surrenders the
+        // window's minimum size, and pages that cannot shrink that far
+        // clipped at the edge instead of adapting.
+        self.connect_default_width_notify(|win| {
+            if let Some(sidebar) = win.imp().sidebar.borrow().as_ref() {
+                sidebar.set_compact(win.default_width() < 640);
             }
         });
-        let win = self.downgrade();
-        breakpoint.connect_unapply(move |_| {
-            if let Some(win) = win.upgrade()
-                && let Some(sidebar) = win.imp().sidebar.borrow().as_ref()
-            {
-                sidebar.set_compact(false);
-            }
-        });
-        self.add_breakpoint(breakpoint);
 
         // Keyboard shortcuts live on the application as GActions; see
         // `HangarApplication::setup_gactions`.
@@ -8421,6 +8407,35 @@ mod tests {
         );
         window.set_conversations_load_failed();
         assert!(imp.chat_error_state.borrow().clone().unwrap().get_visible());
+
+        window.destroy();
+    }
+
+    /// The rail compacts on narrow widths through the width property, not
+    /// an AdwBreakpoint: a breakpoint drops the window's minimum size and
+    /// pages clipped at the edge instead of adapting.
+    #[test]
+    fn the_rail_compacts_by_width_without_a_breakpoint() {
+        crate::ui::with_gtk(the_rail_compacts_by_width_without_a_breakpoint_body);
+    }
+
+    fn the_rail_compacts_by_width_without_a_breakpoint_body() {
+        let window: HangarWindow = glib::Object::builder().build();
+        let sidebar = window.imp().sidebar.borrow().clone().unwrap();
+        let label_visible = || {
+            sidebar
+                .imp()
+                .nav_text_labels
+                .borrow()
+                .first()
+                .map(|l| l.get_visible())
+                .unwrap()
+        };
+
+        window.set_default_size(500, 800);
+        assert!(!label_visible(), "narrow windows drop the captions");
+        window.set_default_size(900, 800);
+        assert!(label_visible(), "room brings them back");
 
         window.destroy();
     }
