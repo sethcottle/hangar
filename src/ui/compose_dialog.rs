@@ -1661,7 +1661,7 @@ impl ComposeDialog {
 
         let has_video = imp.video.borrow().is_some();
         if let Some(video) = imp.video.borrow().as_ref() {
-            strip.append(&self.build_video_tile(video, None));
+            strip.append(&self.build_video_tile(video));
         }
         strip.set_visible(has_images || has_video);
     }
@@ -2177,7 +2177,7 @@ impl ComposeDialog {
     }
 
     /// Build the tile a strip shows for its video.
-    fn build_video_tile(&self, video: &ComposeVideo, slot: Option<usize>) -> gtk4::Overlay {
+    fn build_video_tile(&self, video: &ComposeVideo) -> gtk4::Overlay {
         let tile = gtk4::Overlay::new();
         tile.set_size_request(200, 80);
         tile.add_css_class("compose-thumbnail");
@@ -2244,8 +2244,12 @@ impl ComposeDialog {
         remove_btn.set_tooltip_text(Some("Remove video"));
         remove_btn.update_property(&[gtk4::accessible::Property::Label("Remove video")]);
         let dialog_weak = self.downgrade();
+        let token = video.token;
         remove_btn.connect_clicked(move |_| {
-            if let Some(dialog) = dialog_weak.upgrade() {
+            // The slot is found fresh; thread posts shuffle indices.
+            if let Some(dialog) = dialog_weak.upgrade()
+                && let Some(slot) = dialog.video_slot(token)
+            {
                 dialog.remove_video(slot);
             }
         });
@@ -2898,6 +2902,17 @@ impl ComposeDialog {
     /// Maximum posts in a thread
     const MAX_THREAD_POSTS: usize = 10;
 
+    /// Where a thread block sits right now, found by its container.
+    /// Closures resolve through this at click time; a stored index goes
+    /// stale the moment an earlier post is removed.
+    fn thread_index_of(&self, container: &gtk4::Box) -> Option<usize> {
+        self.imp()
+            .thread_posts
+            .borrow()
+            .iter()
+            .position(|b| &b.container == container)
+    }
+
     /// Add a new post to the thread.
     fn add_thread_post(&self) {
         let imp = self.imp();
@@ -2941,9 +2956,11 @@ impl ComposeDialog {
             post_index + 2
         ))]);
         let dialog_weak = self.downgrade();
-        let idx = post_index;
+        let block_for_remove = block_box.clone();
         remove_btn.connect_clicked(move |_| {
-            if let Some(dialog) = dialog_weak.upgrade() {
+            if let Some(dialog) = dialog_weak.upgrade()
+                && let Some(idx) = dialog.thread_index_of(&block_for_remove)
+            {
                 dialog.remove_thread_post(idx);
             }
         });
@@ -2999,19 +3016,23 @@ impl ComposeDialog {
 
         // Wire up CW button for this thread post
         let dialog_weak = self.downgrade();
-        let pi = post_index;
+        let block_for_cw = block_box.clone();
         cw_button.connect_clicked(move |_| {
-            if let Some(dialog) = dialog_weak.upgrade() {
-                dialog.show_thread_content_warning_dialog(pi);
+            if let Some(dialog) = dialog_weak.upgrade()
+                && let Some(idx) = dialog.thread_index_of(&block_for_cw)
+            {
+                dialog.show_thread_content_warning_dialog(idx);
             }
         });
 
         // Wire up remove all images button for this thread post
         let dialog_weak = self.downgrade();
-        let pi = post_index;
+        let block_for_clear = block_box.clone();
         remove_all_button.connect_clicked(move |_| {
-            if let Some(dialog) = dialog_weak.upgrade() {
-                dialog.remove_all_thread_images(pi);
+            if let Some(dialog) = dialog_weak.upgrade()
+                && let Some(idx) = dialog.thread_index_of(&block_for_clear)
+            {
+                dialog.remove_all_thread_images(idx);
             }
         });
 
@@ -3025,21 +3046,26 @@ impl ComposeDialog {
 
         // Wire up text change handler for char counter
         let dialog_weak = self.downgrade();
-        let idx = post_index;
+        let block_for_counter = block_box.clone();
         text_view.buffer().connect_changed(move |buf| {
             let Some(dialog) = dialog_weak.upgrade() else {
                 return;
             };
-            dialog.update_thread_post_counter(idx, buf);
+            if let Some(idx) = dialog.thread_index_of(&block_for_counter) {
+                dialog.update_thread_post_counter(idx, buf);
+            }
         });
 
-        // Track focus on this thread post text view
+        // Track focus on this thread post text view. 0 = main post,
+        // 1+ = thread posts, resolved when focus lands.
         let dialog_weak = self.downgrade();
-        let focus_idx = post_index + 1; // 0 = main post, 1+ = thread posts
+        let block_for_focus = block_box.clone();
         let focus_controller = gtk4::EventControllerFocus::new();
         focus_controller.connect_enter(move |_| {
-            if let Some(dialog) = dialog_weak.upgrade() {
-                dialog.imp().focused_post_index.set(focus_idx);
+            if let Some(dialog) = dialog_weak.upgrade()
+                && let Some(idx) = dialog.thread_index_of(&block_for_focus)
+            {
+                dialog.imp().focused_post_index.set(idx + 1);
             }
         });
         text_view.add_controller(focus_controller);
@@ -3096,6 +3122,15 @@ impl ComposeDialog {
         }
 
         imp.thread_posts.borrow_mut().remove(index);
+
+        // The focused-post index shifts with the removal: the removed
+        // post's focus falls back to the main post, later ones slide up.
+        let focused = imp.focused_post_index.get();
+        if focused == index + 1 {
+            imp.focused_post_index.set(0);
+        } else if focused > index + 1 {
+            imp.focused_post_index.set(focused - 1);
+        }
 
         // Re-number remaining posts
         self.renumber_thread_posts();
@@ -3386,10 +3421,12 @@ impl ComposeDialog {
             remove_btn.set_margin_end(4);
             remove_btn.set_tooltip_text(Some(&format!("Remove image {}", i + 1)));
             let dialog_weak = self.downgrade();
-            let pi = post_index;
+            let block_for_remove = block.container.clone();
             let ii = i;
             remove_btn.connect_clicked(move |_| {
-                if let Some(dialog) = dialog_weak.upgrade() {
+                if let Some(dialog) = dialog_weak.upgrade()
+                    && let Some(pi) = dialog.thread_index_of(&block_for_remove)
+                {
                     dialog.remove_thread_image(pi, ii);
                 }
             });
@@ -3410,11 +3447,13 @@ impl ComposeDialog {
             // Click to edit alt text
             let click = gtk4::GestureClick::new();
             let dialog_weak = self.downgrade();
-            let pi = post_index;
+            let block_for_alt = block.container.clone();
             let ii = i;
             click.connect_released(move |gesture, _, _, _| {
                 gesture.set_state(gtk4::EventSequenceState::Claimed);
-                if let Some(dialog) = dialog_weak.upgrade() {
+                if let Some(dialog) = dialog_weak.upgrade()
+                    && let Some(pi) = dialog.thread_index_of(&block_for_alt)
+                {
                     dialog.show_thread_alt_text_dialog(pi, ii);
                 }
             });
@@ -3424,9 +3463,7 @@ impl ComposeDialog {
         }
 
         if let Some(video) = block.video.as_ref() {
-            block
-                .image_strip
-                .append(&self.build_video_tile(video, Some(post_index)));
+            block.image_strip.append(&self.build_video_tile(video));
         }
         let has_media = has_images || block.video.is_some();
         block.image_strip.set_visible(has_media);
@@ -4305,6 +4342,82 @@ mod tests {
             dialog.build_compose_data().unwrap().video.is_none(),
             "nothing left to embed"
         );
+    }
+
+    fn block_remove_button(block: &ThreadPostBlock) -> gtk4::Button {
+        block
+            .container
+            .first_child()
+            .and_then(|header| header.last_child())
+            .and_downcast::<gtk4::Button>()
+            .expect("the block header ends with its remove button")
+    }
+
+    /// Thread block actions act on the block they belong to, however the
+    /// list has shuffled since they were built. Stored build-time indices
+    /// used to panic or hit the wrong post after a removal.
+    #[test]
+    fn thread_actions_follow_the_block_not_its_birth_index() {
+        crate::ui::with_gtk(thread_actions_follow_the_block_not_its_birth_index_body);
+    }
+
+    fn thread_actions_follow_the_block_not_its_birth_index_body() {
+        let dialog = ComposeDialog::new();
+        let imp = dialog.imp();
+
+        dialog.add_thread_post();
+        dialog.add_thread_post();
+        dialog.add_thread_post();
+        for (i, block) in imp.thread_posts.borrow().iter().enumerate() {
+            block
+                .text_view
+                .buffer()
+                .set_text(&format!("post {}", i + 2));
+        }
+
+        // Focus rides the shuffle: the third block keeps focus when an
+        // earlier one goes.
+        imp.focused_post_index.set(3);
+        dialog.remove_thread_post(0);
+        assert_eq!(imp.focused_post_index.get(), 2, "focus slid up");
+
+        // The last block's remove button was built at index 2 but the
+        // block now sits at 1. The click must remove that block.
+        let btn = block_remove_button(&imp.thread_posts.borrow()[1]);
+        btn.emit_clicked();
+        let texts: Vec<String> = imp
+            .thread_posts
+            .borrow()
+            .iter()
+            .map(|b| {
+                let buf = b.text_view.buffer();
+                buf.text(&buf.start_iter(), &buf.end_iter(), false).into()
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["post 3".to_string()],
+            "the clicked block went, its neighbor stayed"
+        );
+
+        // The survivor's counter still tracks its own text.
+        let long_text = "words ".repeat(10);
+        imp.thread_posts.borrow()[0]
+            .text_view
+            .buffer()
+            .set_text(long_text.trim_end());
+        let expected = (MAX_GRAPHEMES - 59).to_string();
+        assert_eq!(
+            imp.thread_posts.borrow()[0].char_counter.text(),
+            expected,
+            "the counter follows the block, not its birth index"
+        );
+
+        // Removing the focused block parks focus on the main post.
+        imp.focused_post_index.set(1);
+        dialog.remove_thread_post(0);
+        assert_eq!(imp.focused_post_index.get(), 0);
+        assert!(imp.thread_posts.borrow().is_empty());
     }
 
     /// A thread post's video gates the same button, lands in that post's
