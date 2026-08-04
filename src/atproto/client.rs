@@ -467,13 +467,19 @@ impl HangarClient {
         // Extract reply context (who this is replying to)
         let reply_context = self.extract_reply_context(&feed_view.data.reply);
 
-        // Extract viewer state (like/repost URIs)
-        let (viewer_like, viewer_repost) = post_view
+        // Extract viewer state (like/repost URIs, bookmark flag)
+        let (viewer_like, viewer_repost, viewer_bookmarked) = post_view
             .data
             .viewer
             .as_ref()
-            .map(|v| (v.data.like.clone(), v.data.repost.clone()))
-            .unwrap_or((None, None));
+            .map(|v| {
+                (
+                    v.data.like.clone(),
+                    v.data.repost.clone(),
+                    v.data.bookmarked,
+                )
+            })
+            .unwrap_or((None, None, None));
 
         Post {
             uri: post_view.data.uri,
@@ -493,6 +499,7 @@ impl HangarClient {
             embed,
             viewer_like,
             viewer_repost,
+            viewer_bookmarked,
             repost_reason,
             reply_context,
         }
@@ -1884,12 +1891,18 @@ impl HangarClient {
         let (text, created_at) = self.extract_post_record(&post_view.data.record);
         let embed = self.extract_embed(&post_view.data.embed);
 
-        let (viewer_like, viewer_repost) = post_view
+        let (viewer_like, viewer_repost, viewer_bookmarked) = post_view
             .data
             .viewer
             .as_ref()
-            .map(|v| (v.data.like.clone(), v.data.repost.clone()))
-            .unwrap_or((None, None));
+            .map(|v| {
+                (
+                    v.data.like.clone(),
+                    v.data.repost.clone(),
+                    v.data.bookmarked,
+                )
+            })
+            .unwrap_or((None, None, None));
 
         Post {
             uri: post_view.data.uri.clone(),
@@ -1909,6 +1922,7 @@ impl HangarClient {
             embed,
             viewer_like,
             viewer_repost,
+            viewer_bookmarked,
             repost_reason: None,
             reply_context: None,
         }
@@ -2108,6 +2122,7 @@ impl HangarClient {
             embed: None,
             viewer_like: None,
             viewer_repost: None,
+            viewer_bookmarked: None,
             repost_reason: None,
             reply_context: None,
         })
@@ -2244,9 +2259,7 @@ impl HangarClient {
 
     /// Mark a conversation read up to its latest message.
     ///
-    /// For the conversation view once it exists; the chat badge follows the
-    /// server's word on the next poll.
-    #[allow(dead_code)]
+    /// The chat badge follows the server's word on the next poll.
     #[allow(clippy::await_holding_lock)]
     pub async fn mark_convo_read(&self, convo_id: &str) -> Result<(), ClientError> {
         use atrium_api::agent::bluesky::{AtprotoServiceType, BSKY_CHAT_DID};
@@ -2315,12 +2328,7 @@ impl HangarClient {
             .into_iter()
             .filter_map(|msg| match msg {
                 Union::Refs(OutputMessagesItem::ChatBskyConvoDefsMessageView(view)) => {
-                    Some(ChatMessage {
-                        id: view.data.id.clone(),
-                        text: view.data.text.clone(),
-                        sender_did: view.data.sender.data.did.to_string(),
-                        sent_at: view.data.sent_at.as_str().to_string(),
-                    })
+                    Some(Self::chat_message_from_view(&view))
                 }
                 // Skip deleted messages
                 Union::Refs(OutputMessagesItem::ChatBskyConvoDefsDeletedMessageView(_)) => None,
@@ -2355,12 +2363,9 @@ impl HangarClient {
             .collect();
 
         let last_message = convo.data.last_message.as_ref().and_then(|msg| match msg {
-            Union::Refs(ConvoViewLastMessageRefs::MessageView(view)) => Some(ChatMessage {
-                id: view.data.id.clone(),
-                text: view.data.text.clone(),
-                sender_did: view.data.sender.data.did.to_string(),
-                sent_at: view.data.sent_at.as_str().to_string(),
-            }),
+            Union::Refs(ConvoViewLastMessageRefs::MessageView(view)) => {
+                Some(Self::chat_message_from_view(view))
+            }
             _ => None,
         });
 
@@ -2371,6 +2376,60 @@ impl HangarClient {
             unread_count: convo.data.unread_count,
             muted: convo.data.muted,
         }
+    }
+
+    /// Convert an atrium MessageView to our ChatMessage type
+    fn chat_message_from_view(
+        view: &atrium_api::chat::bsky::convo::defs::MessageView,
+    ) -> ChatMessage {
+        ChatMessage {
+            id: view.data.id.clone(),
+            text: view.data.text.clone(),
+            sender_did: view.data.sender.data.did.to_string(),
+            sent_at: view.data.sent_at.as_str().to_string(),
+        }
+    }
+
+    /// Send a plain text message in a conversation.
+    ///
+    /// The server answers with the message it stored, so the open view can
+    /// append the real thing rather than a local copy.
+    #[allow(clippy::await_holding_lock)]
+    pub async fn send_chat_message(
+        &self,
+        convo_id: &str,
+        text: &str,
+    ) -> Result<ChatMessage, ClientError> {
+        use atrium_api::agent::bluesky::{AtprotoServiceType, BSKY_CHAT_DID};
+
+        with_agent!(self, agent => {
+
+        let chat_did = BSKY_CHAT_DID
+            .parse()
+            .map_err(|e| ClientError::Network(format!("invalid chat DID: {e}")))?;
+        let chat_api = agent.api_with_proxy(chat_did, AtprotoServiceType::BskyChat);
+
+        let message = atrium_api::chat::bsky::convo::defs::MessageInputData {
+            embed: None,
+            facets: None,
+            text: text.to_string(),
+        };
+
+        let input = atrium_api::chat::bsky::convo::send_message::InputData {
+            convo_id: convo_id.to_string(),
+            message: message.into(),
+        };
+
+        let output = chat_api
+            .chat
+            .bsky
+            .convo
+            .send_message(input.into())
+            .await
+            .map_err(|e| self.xrpc_error(e))?;
+
+        Ok(Self::chat_message_from_view(&output))
+        })
     }
 
     /// Search posts by query string
@@ -2598,6 +2657,106 @@ impl HangarClient {
         Ok((profiles, output.data.cursor))
         })
     }
+
+    /// Save a post to the signed-in user's bookmarks. Bookmarks are private
+    /// server-side state, not repo records, so there is nothing to delete by
+    /// URI later; the post URI itself is the key.
+    #[allow(clippy::await_holding_lock)]
+    pub async fn create_bookmark(&self, uri: &str, cid: &str) -> Result<(), ClientError> {
+        with_agent!(self, agent => {
+
+        let input = atrium_api::app::bsky::bookmark::create_bookmark::InputData {
+            cid: cid
+                .parse()
+                .map_err(|e| ClientError::InvalidResponse(format!("invalid cid: {e}")))?,
+            uri: uri.to_string(),
+        };
+
+        agent
+            .api
+            .app
+            .bsky
+            .bookmark
+            .create_bookmark(input.into())
+            .await
+            .map_err(|e| self.xrpc_error(e))?;
+
+        Ok(())
+        })
+    }
+
+    /// Take a post out of the signed-in user's bookmarks
+    #[allow(clippy::await_holding_lock)]
+    pub async fn delete_bookmark(&self, uri: &str) -> Result<(), ClientError> {
+        with_agent!(self, agent => {
+
+        let input = atrium_api::app::bsky::bookmark::delete_bookmark::InputData {
+            uri: uri.to_string(),
+        };
+
+        agent
+            .api
+            .app
+            .bsky
+            .bookmark
+            .delete_bookmark(input.into())
+            .await
+            .map_err(|e| self.xrpc_error(e))?;
+
+        Ok(())
+        })
+    }
+
+    /// Fetch one page of the signed-in user's saved posts
+    #[allow(clippy::await_holding_lock)]
+    pub async fn get_bookmarks(
+        &self,
+        cursor: Option<&str>,
+    ) -> Result<(Vec<Post>, Option<String>), ClientError> {
+        with_agent!(self, agent => {
+
+        let params = atrium_api::app::bsky::bookmark::get_bookmarks::ParametersData {
+            cursor: cursor.map(String::from),
+            limit: None,
+        };
+
+        let output = agent
+            .api
+            .app
+            .bsky
+            .bookmark
+            .get_bookmarks(params.into())
+            .await
+            .map_err(|e| self.xrpc_error(e))?;
+
+        let posts: Vec<Post> = output
+            .data
+            .bookmarks
+            .iter()
+            .filter_map(|bookmark| self.convert_bookmark_view(bookmark))
+            .collect();
+
+        Ok((posts, output.data.cursor))
+        })
+    }
+
+    /// The post behind a bookmark, if there still is one. A bookmark can
+    /// outlive its post or point at an author who has since blocked the
+    /// viewer; those items carry no post to show and are skipped.
+    fn convert_bookmark_view(
+        &self,
+        bookmark: &atrium_api::app::bsky::bookmark::defs::BookmarkView,
+    ) -> Option<Post> {
+        use atrium_api::app::bsky::bookmark::defs::BookmarkViewItemRefs;
+        use atrium_api::types::Union;
+
+        match &bookmark.data.item {
+            Union::Refs(BookmarkViewItemRefs::AppBskyFeedDefsPostView(view)) => {
+                Some(self.convert_post_view(view))
+            }
+            _ => None,
+        }
+    }
 }
 
 impl Default for HangarClient {
@@ -2784,6 +2943,101 @@ mod tests {
         }])
     }
 
+    fn bookmark_view(
+        item: serde_json::Value,
+    ) -> atrium_api::app::bsky::bookmark::defs::BookmarkView {
+        serde_json::from_value(serde_json::json!({
+            "subject": {
+                "uri": "at://did:plc:test/app.bsky.feed.post/saved",
+                "cid": "bafyreidfayvfuwqa7qlnopdjiqrxzs6blmoeu4rujcjtnci5beludirz2a"
+            },
+            "item": item
+        }))
+        .expect("a bookmark view deserializes")
+    }
+
+    /// A saved post comes through whole; a bookmark whose post is gone or
+    /// whose author blocks the viewer has nothing to show and is skipped.
+    #[test]
+    fn a_bookmark_yields_its_post_and_a_dead_one_yields_nothing() {
+        let client = HangarClient::new();
+
+        let live = bookmark_view(serde_json::json!({
+            "$type": "app.bsky.feed.defs#postView",
+            "uri": "at://did:plc:test/app.bsky.feed.post/saved",
+            "cid": "bafyreidfayvfuwqa7qlnopdjiqrxzs6blmoeu4rujcjtnci5beludirz2a",
+            "author": { "did": "did:plc:test", "handle": "someone.bsky.social" },
+            "record": {
+                "$type": "app.bsky.feed.post",
+                "text": "worth keeping",
+                "createdAt": "2026-01-01T00:00:00Z"
+            },
+            "indexedAt": "2026-01-01T00:00:00Z",
+            "viewer": { "bookmarked": true }
+        }));
+        let post = client
+            .convert_bookmark_view(&live)
+            .expect("a live post comes through");
+        assert_eq!(post.uri, "at://did:plc:test/app.bsky.feed.post/saved");
+        assert_eq!(post.text, "worth keeping");
+        assert_eq!(
+            post.viewer_bookmarked,
+            Some(true),
+            "the menu decides Save vs Remove from this flag"
+        );
+
+        let gone = bookmark_view(serde_json::json!({
+            "$type": "app.bsky.feed.defs#notFoundPost",
+            "uri": "at://did:plc:test/app.bsky.feed.post/gone",
+            "notFound": true
+        }));
+        assert!(client.convert_bookmark_view(&gone).is_none());
+
+        let blocked = bookmark_view(serde_json::json!({
+            "$type": "app.bsky.feed.defs#blockedPost",
+            "uri": "at://did:plc:test/app.bsky.feed.post/blocked",
+            "blocked": true,
+            "author": { "did": "did:plc:test" }
+        }));
+        assert!(client.convert_bookmark_view(&blocked).is_none());
+    }
+
+    /// Cached posts were serialized before `viewer_bookmarked` existed; a row
+    /// missing the key must still come back rather than voiding the cache.
+    #[test]
+    fn a_post_serialized_before_bookmarks_still_deserializes() {
+        let old = serde_json::json!({
+            "uri": "at://did:plc:test/app.bsky.feed.post/old",
+            "cid": "cid",
+            "author": {
+                "did": "did:plc:test",
+                "handle": "someone.bsky.social",
+                "display_name": null,
+                "avatar": null,
+                "banner": null,
+                "description": null,
+                "followers_count": null,
+                "following_count": null,
+                "posts_count": null,
+                "viewer_following": null,
+                "viewer_followed_by": null
+            },
+            "text": "from the old cache",
+            "created_at": "2026-01-01T00:00:00Z",
+            "indexed_at": "2026-01-01T00:00:00Z",
+            "like_count": null,
+            "repost_count": null,
+            "reply_count": null,
+            "embed": null,
+            "viewer_like": null,
+            "viewer_repost": null,
+            "repost_reason": null,
+            "reply_context": null
+        });
+        let post: Post = serde_json::from_value(old).expect("an old cached post still loads");
+        assert_eq!(post.viewer_bookmarked, None);
+    }
+
     /// A GIF attached to a quote is an `external` view, which was the one
     /// variant of this union with no arm: it fell into `_ => None` and the post
     /// rendered with a blank body.
@@ -2961,5 +3215,33 @@ mod tests {
         assert_eq!(counts.chat, 7);
         assert_eq!(counts.mentions, 0);
         assert_eq!(counts.activity, 0);
+    }
+
+    /// The wire-to-app mapping for one chat message: id, text, sender,
+    /// and timestamp come through untouched.
+    #[test]
+    fn chat_messages_map_straight_off_the_wire() {
+        use atrium_api::chat::bsky::convo::defs::{MessageViewData, MessageViewSenderData};
+
+        let view: atrium_api::chat::bsky::convo::defs::MessageView = MessageViewData {
+            embed: None,
+            facets: None,
+            id: "3kmsgid".into(),
+            reactions: None,
+            rev: "22".into(),
+            sender: MessageViewSenderData {
+                did: "did:plc:sender".parse().unwrap(),
+            }
+            .into(),
+            sent_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            text: "hi there & <hello>".into(),
+        }
+        .into();
+
+        let message = HangarClient::chat_message_from_view(&view);
+        assert_eq!(message.id, "3kmsgid");
+        assert_eq!(message.text, "hi there & <hello>");
+        assert_eq!(message.sender_did, "did:plc:sender");
+        assert_eq!(message.sent_at, "2026-01-01T00:00:00Z");
     }
 }

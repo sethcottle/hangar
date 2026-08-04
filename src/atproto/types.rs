@@ -174,6 +174,10 @@ pub struct Post {
     pub viewer_like: Option<String>,
     /// URI of the viewer's repost record, if they reposted this post
     pub viewer_repost: Option<String>,
+    /// Whether the viewer saved this post. Defaulted so cached posts written
+    /// before the field existed still deserialize.
+    #[serde(default)]
+    pub viewer_bookmarked: Option<bool>,
     /// Repost attribution if this appeared in feed via repost
     pub repost_reason: Option<RepostReason>,
     /// Reply context if this post is a reply

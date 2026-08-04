@@ -8,7 +8,7 @@ mod types;
 pub use client::{HangarClient, ReplyRef};
 pub use gif::GifEmbed;
 pub use types::{
-    ComposeData, Conversation, Embed, ExternalEmbed, ImageAttachment, ImageEmbed, LinkCardData,
-    Notification, Post, PostgateConfig, Profile, QuoteEmbed, ReplyContext, RepostReason, SavedFeed,
-    Session, ThreadgateConfig, ThreadgateRule, VideoEmbed,
+    ChatMessage, ComposeData, Conversation, Embed, ExternalEmbed, ImageAttachment, ImageEmbed,
+    LinkCardData, Notification, Post, PostgateConfig, Profile, QuoteEmbed, ReplyContext,
+    RepostReason, SavedFeed, Session, ThreadgateConfig, ThreadgateRule, VideoEmbed,
 };

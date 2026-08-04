@@ -406,6 +406,25 @@ popover.menu > contents {
     padding: 4px 0;
 }
 
+/* Chat message bubbles */
+.msg-bubble {
+    padding: 8px 12px;
+    border-radius: 12px;
+}
+
+.msg-in {
+    background-color: alpha(@card_bg_color, 0.8);
+}
+
+.msg-out {
+    background-color: alpha(@accent_bg_color, 0.25);
+}
+
+/* Links in messages are underlined, same reasoning as post content */
+.msg-bubble label a {
+    text-decoration: underline;
+}
+
 /* Settings sidebar navigation */
 .settings-sidebar {
     background-color: @window_bg_color;

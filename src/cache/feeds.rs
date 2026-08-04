@@ -244,6 +244,8 @@ impl<'a> FeedCache<'a> {
             embed,
             viewer_like: row.get(12)?,
             viewer_repost: row.get(13)?,
+            // Not a cached column; the menu falls back to offering Save.
+            viewer_bookmarked: None,
             repost_reason,
             reply_context,
         })

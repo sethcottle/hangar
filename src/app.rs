@@ -13,7 +13,9 @@ use std::thread;
 use tokio::sync::Semaphore;
 
 use crate::atproto::client::{ClientError, UnreadCounts};
-use crate::atproto::{Conversation, HangarClient, Notification, Post, Profile, SavedFeed, Session};
+use crate::atproto::{
+    ChatMessage, Conversation, HangarClient, Notification, Post, Profile, SavedFeed, Session,
+};
 use crate::cache::{CacheDb, FeedCache, FeedState, PostCache, ProfileCache};
 use crate::config;
 use crate::runtime;
@@ -23,11 +25,14 @@ use crate::ui::avatar_cache;
 use crate::ui::post_row::PostRow;
 use crate::ui::{
     ComposeDialog, FollowListKind, FollowListPage, FollowListPush, HangarWindow, LoginDialog,
-    NavItem, QuoteContext, ReplyContext,
+    MessagePage, MessagePush, NavItem, QuoteContext, ReplyContext,
 };
 
 /// Limit concurrent API requests to prevent overwhelming the server during rapid scrolling
 static API_SEMAPHORE: Lazy<Arc<Semaphore>> = Lazy::new(|| Arc::new(Semaphore::new(4)));
+
+/// Seconds between polls for new messages while a conversation is open.
+const MESSAGE_POLL_SECS: u32 = 5;
 
 /// Which turn of events owns some shared state.
 ///
@@ -103,6 +108,12 @@ mod imp {
         /// Likes state
         pub likes_cursor: RefCell<Option<String>>,
         pub likes_loading_more: RefCell<bool>,
+        /// Saved posts state. Saves happen from any list at any time, so the
+        /// section refetches on every open; the generation keeps a page-two
+        /// append from an earlier visit off the fresh list.
+        pub bookmarks_cursor: RefCell<Option<String>>,
+        pub bookmarks_loading_more: RefCell<bool>,
+        pub(crate) bookmarks_generation: Generation,
         /// Search state
         pub search_query: RefCell<Option<String>>,
         pub search_cursor: RefCell<Option<String>>,
@@ -222,6 +233,12 @@ mod imp {
                 app_clone.confirm_delete_post(post);
             });
 
+            // Save/unsave, dispatched the same way.
+            let app_clone = app.clone();
+            crate::ui::post_row::set_bookmark_post_handler(move |post, row_weak| {
+                app_clone.toggle_bookmark(post, row_weak);
+            });
+
             let app_clone = app.clone();
             window.set_compose_callback(move || {
                 app_clone.open_compose_dialog();
@@ -290,6 +307,11 @@ mod imp {
             let app_clone = app.clone();
             window.set_likes_load_more_callback(move || {
                 app_clone.fetch_likes_more();
+            });
+
+            let app_clone = app.clone();
+            window.set_bookmarks_load_more_callback(move || {
+                app_clone.fetch_bookmarks_more();
             });
 
             let app_clone = app.clone();
@@ -2248,6 +2270,9 @@ impl HangarApplication {
             NavItem::Likes => {
                 self.open_likes_view();
             }
+            NavItem::Bookmarks => {
+                self.open_bookmarks_view();
+            }
             NavItem::Search => {
                 self.open_search_view();
             }
@@ -2592,14 +2617,348 @@ impl HangarApplication {
         });
     }
 
-    /// Open a conversation view (placeholder for now)
+    /// Open a conversation in the message view, pushed onto the chat stack.
     fn open_conversation_view(&self, conversation: Conversation) {
-        // TODO: Implement conversation detail view with messages
-        eprintln!(
-            "Opening conversation: {} with {} members",
-            conversation.id,
-            conversation.members.len()
-        );
+        let pushed = {
+            let window = self.imp().window.borrow();
+            let Some(window) = window.as_ref() else {
+                return;
+            };
+            window.push_message_page(&conversation)
+        };
+        let Some(pushed) = pushed else {
+            return;
+        };
+
+        let page = match pushed {
+            MessagePush::Pushed(page) => {
+                let app = self.clone();
+                let page_weak = page.downgrade();
+                page.set_load_older_callback(move || {
+                    let Some(page) = page_weak.upgrade() else {
+                        return;
+                    };
+                    app.fetch_older_messages(&page);
+                });
+
+                // Retry redoes the first load; only a page with nothing
+                // listed ever shows the button.
+                let app = self.clone();
+                let page_weak = page.downgrade();
+                page.set_retry_callback(move || {
+                    let Some(page) = page_weak.upgrade() else {
+                        return;
+                    };
+                    app.fetch_first_messages(&page);
+                });
+
+                let app = self.clone();
+                let page_weak = page.downgrade();
+                page.set_send_callback(move |text| {
+                    let Some(page) = page_weak.upgrade() else {
+                        return;
+                    };
+                    app.send_conversation_message(&page, text);
+                });
+
+                self.start_message_poll(&page);
+                page
+            }
+            MessagePush::PoppedBack(page) => {
+                // A healthy page keeps what it has, and its poll is still
+                // running. One whose first load failed gets another try.
+                if !page.needs_reload() {
+                    return;
+                }
+                page
+            }
+        };
+
+        self.fetch_first_messages(&page);
+    }
+
+    /// Fetch the newest page of a conversation's history.
+    ///
+    /// The page is its own generation token: results apply through a weak
+    /// ref, so a popped page drops whatever was still in flight for it.
+    fn fetch_first_messages(&self, page: &MessagePage) {
+        if page.is_fetching() {
+            return;
+        }
+        page.set_fetching(true);
+        let convo_id = page.convo_id();
+
+        let (tx, rx) =
+            std::sync::mpsc::channel::<Result<(Vec<ChatMessage>, Option<String>), String>>();
+        let client = self.client();
+        let semaphore = API_SEMAPHORE.clone();
+
+        thread::spawn(move || {
+            let result = runtime::block_on(async {
+                let _permit = semaphore.acquire().await;
+                client.get_messages(&convo_id, None).await
+            });
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+
+        let app = self.clone();
+        let page_weak = page.downgrade();
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            match rx.try_recv() {
+                Ok(Ok((messages, cursor))) => {
+                    if let Some(page) = page_weak.upgrade() {
+                        page.set_cursor(cursor);
+                        page.set_initial_messages(messages);
+                        page.set_fetching(false);
+                        page.backfill_if_short();
+                        // The conversation is on screen now, so the server
+                        // can honestly call it read.
+                        app.mark_conversation_read(page.convo_id());
+                    }
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(e)) => {
+                    eprintln!("Failed to fetch messages: {}", e);
+                    if let Some(page) = page_weak.upgrade() {
+                        page.set_fetching(false);
+                        page.show_load_failed();
+                    }
+                    app.report_session_expiry();
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    eprintln!("Failed to fetch messages: connection lost");
+                    if let Some(page) = page_weak.upgrade() {
+                        page.set_fetching(false);
+                        page.show_load_failed();
+                    }
+                    glib::ControlFlow::Break
+                }
+            }
+        });
+    }
+
+    /// Fetch the page of history older than what is shown.
+    fn fetch_older_messages(&self, page: &MessagePage) {
+        if page.is_fetching() {
+            return;
+        }
+        let Some(cursor) = page.cursor() else {
+            return;
+        };
+        page.set_fetching(true);
+        let convo_id = page.convo_id();
+
+        let (tx, rx) =
+            std::sync::mpsc::channel::<Result<(Vec<ChatMessage>, Option<String>), String>>();
+        let client = self.client();
+        let semaphore = API_SEMAPHORE.clone();
+
+        thread::spawn(move || {
+            let result = runtime::block_on(async {
+                let _permit = semaphore.acquire().await;
+                client.get_messages(&convo_id, Some(&cursor)).await
+            });
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+
+        let app = self.clone();
+        let page_weak = page.downgrade();
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            match rx.try_recv() {
+                Ok(Ok((messages, cursor))) => {
+                    if let Some(page) = page_weak.upgrade() {
+                        page.set_cursor(cursor);
+                        page.prepend_older(messages);
+                        page.set_fetching(false);
+                        // Filtered pages can leave the viewport unfilled
+                        // with a cursor still stored.
+                        page.backfill_if_short();
+                    }
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(e)) => {
+                    eprintln!("Failed to fetch older messages: {}", e);
+                    if let Some(page) = page_weak.upgrade() {
+                        page.set_fetching(false);
+                    }
+                    // Rows are on screen, so the status page is out; say it
+                    // out loud instead.
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.show_toast("Couldn't load older messages");
+                    }
+                    app.report_session_expiry();
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    if let Some(page) = page_weak.upgrade() {
+                        page.set_fetching(false);
+                    }
+                    glib::ControlFlow::Break
+                }
+            }
+        });
+    }
+
+    /// Send the composer's draft. On failure the draft stays in the entry
+    /// and the toast says to try again.
+    fn send_conversation_message(&self, page: &MessagePage, text: String) {
+        if page.is_sending() {
+            return;
+        }
+        page.set_sending(true);
+        let convo_id = page.convo_id();
+
+        let (tx, rx) = std::sync::mpsc::channel::<Result<ChatMessage, String>>();
+        let client = self.client();
+
+        thread::spawn(move || {
+            let result =
+                runtime::block_on(async { client.send_chat_message(&convo_id, &text).await });
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+
+        let app = self.clone();
+        let page_weak = page.downgrade();
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            match rx.try_recv() {
+                Ok(Ok(message)) => {
+                    if let Some(page) = page_weak.upgrade() {
+                        page.sent_ok(message);
+                    }
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(e)) => {
+                    eprintln!("Failed to send message: {}", e);
+                    if let Some(page) = page_weak.upgrade() {
+                        page.send_failed();
+                    }
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.show_toast("The message didn't send. Try again.");
+                    }
+                    app.report_session_expiry();
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    if let Some(page) = page_weak.upgrade() {
+                        page.send_failed();
+                    }
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.show_toast("The message didn't send. Try again.");
+                    }
+                    glib::ControlFlow::Break
+                }
+            }
+        });
+    }
+
+    /// Poll for new messages while the conversation page is up.
+    ///
+    /// The timer holds a weak ref and dies with the page. Ticks skip while
+    /// the page is covered or off screen, while any fetch of its own is
+    /// already out, and for the rest of a dead session.
+    fn start_message_poll(&self, page: &MessagePage) {
+        let app = self.clone();
+        let page_weak = page.downgrade();
+        glib::timeout_add_seconds_local(MESSAGE_POLL_SECS, move || {
+            let Some(page) = page_weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            let busy = page.is_fetching() || page.is_polling() || !page.loaded_once();
+            if message_poll_allowed(page.is_mapped(), busy, *app.imp().session_dead.borrow()) {
+                app.poll_conversation(&page);
+            }
+            glib::ControlFlow::Continue
+        });
+    }
+
+    /// One poll round: fetch the newest page and fold in whatever is new.
+    fn poll_conversation(&self, page: &MessagePage) {
+        page.set_polling(true);
+        let convo_id = page.convo_id();
+
+        let (tx, rx) =
+            std::sync::mpsc::channel::<Result<(Vec<ChatMessage>, Option<String>), String>>();
+        let client = self.client();
+
+        thread::spawn(move || {
+            let result = runtime::block_on(async { client.get_messages(&convo_id, None).await });
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+
+        let app = self.clone();
+        let page_weak = page.downgrade();
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            match rx.try_recv() {
+                Ok(Ok((messages, _cursor))) => {
+                    if let Some(page) = page_weak.upgrade() {
+                        page.set_polling(false);
+                        let added = page.merge_new(messages);
+                        // Only a page still on screen can honestly claim
+                        // the user saw what just arrived.
+                        if added > 0 && page.is_mapped() {
+                            app.mark_conversation_read(page.convo_id());
+                        }
+                    }
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(e)) => {
+                    // Transient failures self-heal on the next tick; an
+                    // expiry parks the poll through the flag it raises.
+                    eprintln!("Failed to poll messages: {}", e);
+                    if let Some(page) = page_weak.upgrade() {
+                        page.set_polling(false);
+                    }
+                    app.report_session_expiry();
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    if let Some(page) = page_weak.upgrade() {
+                        page.set_polling(false);
+                    }
+                    glib::ControlFlow::Break
+                }
+            }
+        });
+    }
+
+    /// Tell the server the conversation is read, then let the UI follow:
+    /// the row in the chat list drops its badge and the sidebar re-tallies.
+    /// On failure both stay lit, which is the truth; the next successful
+    /// open clears them.
+    fn mark_conversation_read(&self, convo_id: String) {
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let client = self.client();
+        let id = convo_id.clone();
+
+        thread::spawn(move || {
+            let result = runtime::block_on(async { client.mark_convo_read(&id).await });
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+
+        let app = self.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            match rx.try_recv() {
+                Ok(Ok(())) => {
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.set_conversation_read(&convo_id);
+                    }
+                    app.check_unread_counts();
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(e)) => {
+                    eprintln!("Failed to mark conversation read: {}", e);
+                    app.report_session_expiry();
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+            }
+        });
     }
 
     /// Open the own profile view
@@ -2830,6 +3189,195 @@ impl HangarApplication {
                     }
                     glib::ControlFlow::Break
                 }
+            }
+        });
+    }
+
+    /// Open the Saved view. Posts get saved and unsaved from every list, and
+    /// from other clients, so this refetches on every open rather than
+    /// trusting a list loaded earlier.
+    fn open_bookmarks_view(&self) {
+        if let Some(window) = self.imp().window.borrow().as_ref() {
+            window.show_bookmarks_page();
+        }
+        self.fetch_bookmarks();
+    }
+
+    /// Fetch the first page of saved posts, replacing the list
+    fn fetch_bookmarks(&self) {
+        // Take ownership of the list: anything still in flight from an
+        // earlier visit belongs to the page this replaces.
+        self.imp().bookmarks_generation.bump();
+        let token = self.imp().bookmarks_generation.token();
+        self.imp().bookmarks_loading_more.replace(false);
+
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(Vec<Post>, Option<String>), String>>();
+        let client = self.client();
+
+        thread::spawn(move || {
+            let result = runtime::block_on(async { client.get_bookmarks(None).await });
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+
+        let app = self.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            match rx.try_recv() {
+                Ok(result) => {
+                    if !app.imp().bookmarks_generation.is_current(token) {
+                        return glib::ControlFlow::Break;
+                    }
+                    match result {
+                        Ok((posts, next_cursor)) => {
+                            app.imp().bookmarks_cursor.replace(next_cursor);
+                            if let Some(window) = app.imp().window.borrow().as_ref() {
+                                window.set_bookmarks(posts);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to fetch saved posts: {}", e);
+                            app.report_session_expiry();
+                            if let Some(window) = app.imp().window.borrow().as_ref() {
+                                window.show_toast("Couldn't load saved posts");
+                            }
+                        }
+                    }
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    eprintln!("Failed to fetch saved posts: connection lost");
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.show_toast("Couldn't load saved posts");
+                    }
+                    glib::ControlFlow::Break
+                }
+            }
+        });
+    }
+
+    /// Fetch more saved posts for infinite scroll
+    fn fetch_bookmarks_more(&self) {
+        if *self.imp().bookmarks_loading_more.borrow() {
+            return;
+        }
+        let cursor = match self.imp().bookmarks_cursor.borrow().as_ref() {
+            Some(c) => c.clone(),
+            None => return,
+        };
+        self.imp().bookmarks_loading_more.replace(true);
+        let token = self.imp().bookmarks_generation.token();
+
+        if let Some(window) = self.imp().window.borrow().as_ref() {
+            window.set_bookmarks_loading(true);
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(Vec<Post>, Option<String>), String>>();
+        let client = self.client();
+
+        thread::spawn(move || {
+            let result = runtime::block_on(async { client.get_bookmarks(Some(&cursor)).await });
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+
+        let app = self.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            match rx.try_recv() {
+                Ok(result) => {
+                    app.imp().bookmarks_loading_more.replace(false);
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.set_bookmarks_loading(false);
+                    }
+                    if !app.imp().bookmarks_generation.is_current(token) {
+                        return glib::ControlFlow::Break;
+                    }
+                    match result {
+                        Ok((posts, next_cursor)) => {
+                            app.imp().bookmarks_cursor.replace(next_cursor);
+                            if !posts.is_empty() {
+                                if let Some(window) = app.imp().window.borrow().as_ref() {
+                                    window.append_bookmarks(posts);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to fetch more saved posts: {}", e);
+                            app.report_session_expiry();
+                            if let Some(window) = app.imp().window.borrow().as_ref() {
+                                window.show_toast("Couldn't load more saved posts");
+                            }
+                        }
+                    }
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    app.imp().bookmarks_loading_more.replace(false);
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.set_bookmarks_loading(false);
+                    }
+                    glib::ControlFlow::Break
+                }
+            }
+        });
+    }
+
+    /// Save or unsave a post, whichever the menu offered
+    fn toggle_bookmark(&self, post: Post, row_weak: glib::WeakRef<PostRow>) {
+        let was_saved = post.viewer_bookmarked == Some(true);
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let client = self.client();
+        let uri = post.uri.clone();
+        let cid = post.cid.clone();
+
+        thread::spawn(move || {
+            let result = runtime::block_on(async {
+                if was_saved {
+                    client.delete_bookmark(&uri).await
+                } else {
+                    client.create_bookmark(&uri, &cid).await
+                }
+            });
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+
+        let app = self.clone();
+        let uri = post.uri;
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            match rx.try_recv() {
+                Ok(Ok(())) => {
+                    // Flip the row, but only if it is still showing this post;
+                    // a pooled row may have been rebound while we waited.
+                    if let Some(row) = row_weak.upgrade() {
+                        if row.post_uri().as_deref() == Some(uri.as_str()) {
+                            row.set_viewer_bookmarked(!was_saved);
+                        }
+                    }
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        if was_saved {
+                            // Unsaving from the Saved page takes the row out
+                            // now; from any other list this is a no-op.
+                            window.remove_bookmark(&uri);
+                            window.show_toast("Removed from Saved");
+                        } else {
+                            window.show_toast("Post saved");
+                        }
+                    }
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(e)) => {
+                    eprintln!("Failed to update bookmark: {}", e);
+                    app.report_session_expiry();
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.show_toast(if was_saved {
+                            "Couldn't remove from Saved"
+                        } else {
+                            "Couldn't save post"
+                        });
+                    }
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
             }
         });
     }
@@ -3111,9 +3659,18 @@ fn unread_poll_allowed(signed_in: bool, in_flight: bool, expired: bool) -> bool 
     signed_in && !in_flight && !expired
 }
 
+/// Whether a message-poll tick may fetch: the conversation page is on
+/// screen, none of its fetches are already out and its first load landed,
+/// and the session has not expired. The timer itself only dies with the
+/// page; this is what quiets it in between.
+fn message_poll_allowed(mapped: bool, busy: bool, expired: bool) -> bool {
+    mapped && !busy && !expired
+}
+
 #[cfg(test)]
 mod tests {
     use super::Generation;
+    use super::message_poll_allowed;
     use super::unread_poll_allowed;
 
     /// The badge poll must stay quiet when signed out, must not stack
@@ -3137,6 +3694,31 @@ mod tests {
         );
         assert!(!unread_poll_allowed(true, true, true));
         assert!(!unread_poll_allowed(false, false, true));
+    }
+
+    /// The message poll must stay quiet while its page is off screen,
+    /// while any of the page's fetches are already out, and for the rest
+    /// of a dead session. Only the page being dropped stops the timer;
+    /// this gate is what holds each tick.
+    #[test]
+    fn the_message_poll_waits_for_its_page_and_for_itself() {
+        assert!(message_poll_allowed(true, false, false));
+        assert!(
+            !message_poll_allowed(false, false, false),
+            "a covered or hidden page is not being read"
+        );
+        assert!(
+            !message_poll_allowed(true, true, false),
+            "one fetch per page at a time"
+        );
+        assert!(
+            !message_poll_allowed(true, false, true),
+            "an expired session parks the poll"
+        );
+        assert!(!message_poll_allowed(false, true, false));
+        assert!(!message_poll_allowed(false, false, true));
+        assert!(!message_poll_allowed(true, true, true));
+        assert!(!message_poll_allowed(false, true, true));
     }
 
     /// A late page from the old query must not splice into the new list.

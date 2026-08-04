@@ -8,6 +8,7 @@ mod follow_list_page;
 pub mod inline_video;
 mod login_dialog;
 pub mod media_viewer;
+mod message_page;
 pub mod post_row;
 #[cfg(test)]
 mod rebind_audit;
@@ -19,6 +20,7 @@ mod window;
 pub use compose_dialog::{ComposeDialog, QuoteContext, ReplyContext};
 pub use follow_list_page::{FollowListKind, FollowListPage};
 pub use login_dialog::LoginDialog;
+pub use message_page::{MessagePage, MessagePush};
 pub use sidebar::NavItem;
 pub use window::{FollowListPush, HangarWindow};
 

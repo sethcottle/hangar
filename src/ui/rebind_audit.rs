@@ -133,6 +133,7 @@ fn audit_post(i: u32) -> Post {
         embed: embed_for(k),
         viewer_like: None,
         viewer_repost: None,
+        viewer_bookmarked: None,
         // Reposts and replies, so the header furniture changes shape between
         // binds as well as the embed band.
         //

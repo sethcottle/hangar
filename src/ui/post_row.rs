@@ -51,6 +51,11 @@ thread_local! {
     /// dispatches to it, so the list factories need no per-bind wiring.
     static DELETE_POST_HANDLER: std::cell::RefCell<Option<Box<dyn Fn(Post)>>> =
         const { std::cell::RefCell::new(None) };
+    /// What a Save/Remove click does. Same shape as the delete handler; the
+    /// row comes along weakly so the app can flip its label on success.
+    static BOOKMARK_POST_HANDLER: std::cell::RefCell<
+        Option<Box<dyn Fn(Post, glib::WeakRef<PostRow>)>>,
+    > = const { std::cell::RefCell::new(None) };
 }
 
 /// Record whose posts are deletable. `None` on sign-out.
@@ -65,6 +70,13 @@ pub fn set_current_user_did(did: Option<&str>) {
 /// spares each one the wiring.
 pub fn set_delete_post_handler<F: Fn(Post) + 'static>(handler: F) {
     DELETE_POST_HANDLER.with(|cell| {
+        cell.replace(Some(Box::new(handler)));
+    });
+}
+
+/// Install the app-level save/unsave flow. See [`set_delete_post_handler`].
+pub fn set_bookmark_post_handler<F: Fn(Post, glib::WeakRef<PostRow>) + 'static>(handler: F) {
+    BOOKMARK_POST_HANDLER.with(|cell| {
         cell.replace(Some(Box::new(handler)));
     });
 }
@@ -120,6 +132,9 @@ mod imp {
         pub view_post_item: RefCell<Option<gtk4::Button>>,
         pub copy_link_item: RefCell<Option<gtk4::Button>>,
         pub open_link_item: RefCell<Option<gtk4::Button>>,
+        pub bookmark_item: RefCell<Option<gtk4::Button>>,
+        /// Reads "Save Post" or "Remove from Saved"; bind keeps it honest.
+        pub bookmark_item_label: RefCell<Option<gtk4::Label>>,
         pub delete_item: RefCell<Option<gtk4::Button>>,
         /// Separator plus Delete button, shown and hidden as one block so no
         /// stray separator trails the menu on other people's posts.
@@ -423,8 +438,16 @@ impl PostRow {
         actions.append(&spacer);
 
         // Post overflow menu button
-        let (menu_btn, view_post_item, copy_link_item, open_link_item, delete_item, delete_section) =
-            Self::create_post_menu_button();
+        let (
+            menu_btn,
+            view_post_item,
+            copy_link_item,
+            open_link_item,
+            bookmark_item,
+            bookmark_item_label,
+            delete_item,
+            delete_section,
+        ) = Self::create_post_menu_button();
         menu_btn.set_tooltip_text(Some("More options"));
         menu_btn.update_property(&[gtk4::accessible::Property::Label("More options")]);
         actions.append(&menu_btn);
@@ -446,6 +469,26 @@ impl PostRow {
                 DELETE_POST_HANDLER.with(|cell| {
                     if let Some(handler) = cell.borrow().as_ref() {
                         handler(post);
+                    }
+                });
+            }
+        });
+
+        // Save/Remove, wired once for the same reason as Delete.
+        let row_weak = self.downgrade();
+        let bookmark_popover = menu_btn.popover();
+        bookmark_item.connect_clicked(move |_| {
+            if let Some(p) = &bookmark_popover {
+                p.popdown();
+            }
+            let Some(row) = row_weak.upgrade() else {
+                return;
+            };
+            let post = row.imp().post.borrow().clone();
+            if let Some(post) = post {
+                BOOKMARK_POST_HANDLER.with(|cell| {
+                    if let Some(handler) = cell.borrow().as_ref() {
+                        handler(post, row.downgrade());
                     }
                 });
             }
@@ -504,6 +547,8 @@ impl PostRow {
         imp.view_post_item.replace(Some(view_post_item));
         imp.copy_link_item.replace(Some(copy_link_item));
         imp.open_link_item.replace(Some(open_link_item));
+        imp.bookmark_item.replace(Some(bookmark_item));
+        imp.bookmark_item_label.replace(Some(bookmark_item_label));
         imp.delete_item.replace(Some(delete_item));
         imp.delete_section.replace(Some(delete_section));
         imp.main_box.replace(Some(main_box));
@@ -592,14 +637,16 @@ impl PostRow {
         )
     }
 
-    /// Create a post overflow menu button with View Post, Bookmark, Report, etc.
+    /// Create a post overflow menu button with View Post, Save, Report, etc.
     /// Returns: (menu_btn, view_item, copy_link_item, open_link_item,
-    /// delete_item, delete_section)
+    /// bookmark_item, bookmark_item_label, delete_item, delete_section)
     fn create_post_menu_button() -> (
         gtk4::MenuButton,
         gtk4::Button,
         gtk4::Button,
         gtk4::Button,
+        gtk4::Button,
+        gtk4::Label,
         gtk4::Button,
         gtk4::Box,
     ) {
@@ -641,6 +688,17 @@ impl PostRow {
         copy_link_item.set_child(Some(&copy_link_content));
         copy_link_item.add_css_class("flat");
         popover_box.append(&copy_link_item);
+
+        // Save Post / Remove from Saved. One item; bind swaps the label to
+        // match the post it is showing.
+        let bookmark_item = gtk4::Button::new();
+        let bookmark_content = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        bookmark_content.append(&gtk4::Image::from_icon_name("bookmark-new-symbolic"));
+        let bookmark_item_label = gtk4::Label::new(Some("Save Post"));
+        bookmark_content.append(&bookmark_item_label);
+        bookmark_item.set_child(Some(&bookmark_content));
+        bookmark_item.add_css_class("flat");
+        popover_box.append(&bookmark_item);
 
         // Separator
         let sep2 = gtk4::Separator::new(gtk4::Orientation::Horizontal);
@@ -692,6 +750,8 @@ impl PostRow {
             view_item,
             copy_link_item,
             open_link_item,
+            bookmark_item,
+            bookmark_item_label,
             delete_item,
             delete_section,
         )
@@ -1158,6 +1218,16 @@ impl PostRow {
             section.set_visible(own);
         }
 
+        // The Save/Remove label follows the post, fresh on every bind so a
+        // recycled row cannot offer to save a post the user already saved.
+        if let Some(label) = imp.bookmark_item_label.borrow().as_ref() {
+            label.set_text(if post.viewer_bookmarked == Some(true) {
+                "Remove from Saved"
+            } else {
+                "Save Post"
+            });
+        }
+
         // The View Post action reuses post_clicked_callback
         if let Some(view_item) = imp.view_post_item.borrow().as_ref() {
             let post_row = self.downgrade();
@@ -1245,6 +1315,22 @@ impl PostRow {
     /// Set the viewer's repost URI (after a successful repost operation)
     pub fn set_viewer_repost_uri(&self, uri: Option<String>) {
         self.imp().viewer_repost_uri.replace(uri);
+    }
+
+    /// Record a save or unsave that just succeeded. Updates the stored post,
+    /// so the next click toggles the other way, and the menu label with it.
+    pub fn set_viewer_bookmarked(&self, saved: bool) {
+        let imp = self.imp();
+        if let Some(post) = imp.post.borrow_mut().as_mut() {
+            post.viewer_bookmarked = Some(saved);
+        }
+        if let Some(label) = imp.bookmark_item_label.borrow().as_ref() {
+            label.set_text(if saved {
+                "Remove from Saved"
+            } else {
+                "Save Post"
+            });
+        }
     }
 
     /// Give up any video this row is playing. Idempotent.
@@ -1814,6 +1900,7 @@ impl PostRow {
             embed: quote.embed.as_deref().cloned(),
             viewer_like: None,
             viewer_repost: None,
+            viewer_bookmarked: None,
             repost_reason: None,
             reply_context: None,
         };
@@ -2359,6 +2446,7 @@ mod tests {
             embed,
             viewer_like: None,
             viewer_repost: None,
+            viewer_bookmarked: None,
             repost_reason: None,
             reply_context: None,
         }
@@ -3256,5 +3344,82 @@ mod tests {
 
         // Other tests bind posts authored by did:plc:test; leave nothing set.
         super::set_current_user_did(None);
+    }
+
+    /// The menu's Save entry follows the post: bind decides the label fresh
+    /// each time, one click asks for one toggle of the post the row shows
+    /// now, and a confirmed save flips the label without a rebind.
+    #[test]
+    fn save_follows_the_bound_post_and_fires_once() {
+        crate::ui::with_gtk(save_follows_the_bound_post_and_fires_once_body);
+    }
+
+    fn save_follows_the_bound_post_and_fires_once_body() {
+        use std::cell::RefCell as StdRefCell;
+        use std::rc::Rc;
+
+        let toggled: Rc<StdRefCell<Vec<(String, Option<bool>)>>> = Rc::default();
+        let sink = Rc::clone(&toggled);
+        super::set_bookmark_post_handler(move |post, _row| {
+            sink.borrow_mut().push((post.uri, post.viewer_bookmarked));
+        });
+
+        let row = PostRow::new();
+        let label = row
+            .imp()
+            .bookmark_item_label
+            .borrow()
+            .clone()
+            .expect("built in setup_ui");
+
+        let saved = || {
+            let mut post = post_with(None, "at://did:plc:test/app.bsky.feed.post/saved");
+            post.viewer_bookmarked = Some(true);
+            post
+        };
+        let unsaved = post_with(None, "at://did:plc:test/app.bsky.feed.post/unsaved");
+
+        row.bind(&saved());
+        assert_eq!(label.text(), "Remove from Saved");
+
+        // Recycled onto an unsaved post, the offer has to flip back.
+        row.bind(&unsaved);
+        assert_eq!(label.text(), "Save Post");
+
+        // Bound many times over, one click still asks for one toggle, of the
+        // post the row shows now, carrying the saved state the server call
+        // has to invert.
+        for _ in 0..4 {
+            row.bind(&saved());
+            row.bind(&unsaved);
+        }
+        row.imp()
+            .bookmark_item
+            .borrow()
+            .as_ref()
+            .expect("built in setup_ui")
+            .emit_clicked();
+        assert_eq!(
+            *toggled.borrow(),
+            vec![(
+                "at://did:plc:test/app.bsky.feed.post/unsaved".to_string(),
+                None
+            )],
+            "one click on Save must request exactly one toggle"
+        );
+
+        // The app confirms the save: the label flips in place and the stored
+        // post flips with it, so the next click asks to remove.
+        row.set_viewer_bookmarked(true);
+        assert_eq!(label.text(), "Remove from Saved");
+        assert_eq!(
+            row.imp()
+                .post
+                .borrow()
+                .as_ref()
+                .and_then(|p| p.viewer_bookmarked),
+            Some(true),
+            "the stored post must flip too, or the next click saves again"
+        );
     }
 }

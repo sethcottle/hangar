@@ -1062,6 +1062,7 @@ mod tests {
             })),
             viewer_like: None,
             viewer_repost: None,
+            viewer_bookmarked: None,
             repost_reason: None,
             reply_context: None,
         }

@@ -6,6 +6,7 @@
 
 use super::actor_row::{ActorObject, ActorRow};
 use super::follow_list_page::{FollowListKind, FollowListPage};
+use super::message_page::{MessagePage, MessagePush};
 use super::post_row::PostRow;
 use super::sidebar::Sidebar;
 use crate::atproto::{Conversation, Notification, Post, SavedFeed};
@@ -231,6 +232,14 @@ mod imp {
         pub likes_load_more_callback: RefCell<Option<Box<dyn Fn() + 'static>>>,
         pub likes_scrolled_window: RefCell<Option<gtk4::ScrolledWindow>>,
         pub likes_spinner: RefCell<Option<gtk4::Spinner>>,
+        // Saved posts page state
+        pub bookmarks_nav_view: RefCell<Option<adw::NavigationView>>,
+        pub bookmarks_model: RefCell<Option<gio::ListStore>>,
+        pub bookmarks_load_more_callback: RefCell<Option<Box<dyn Fn() + 'static>>>,
+        pub bookmarks_scrolled_window: RefCell<Option<gtk4::ScrolledWindow>>,
+        pub bookmarks_spinner: RefCell<Option<gtk4::Spinner>>,
+        pub bookmarks_overlay: RefCell<Option<gtk4::Overlay>>,
+        pub bookmarks_empty_state: RefCell<Option<adw::StatusPage>>,
         // Search page state
         pub search_nav_view: RefCell<Option<adw::NavigationView>>,
         pub search_model: RefCell<Option<gio::ListStore>>,
@@ -390,6 +399,12 @@ impl HangarWindow {
         likes_nav_view.add(&likes_page);
         main_stack.add_named(&likes_nav_view, Some("likes"));
 
+        // Saved posts section: NavigationView for thread/profile drill-down
+        let bookmarks_nav_view = adw::NavigationView::new();
+        let bookmarks_page = self.build_bookmarks_page();
+        bookmarks_nav_view.add(&bookmarks_page);
+        main_stack.add_named(&bookmarks_nav_view, Some("bookmarks"));
+
         // Search section: NavigationView for search results
         let search_nav_view = adw::NavigationView::new();
         let search_page = self.build_search_page();
@@ -432,6 +447,7 @@ impl HangarWindow {
         imp.chat_nav_view.replace(Some(chat_nav_view));
         imp.profile_nav_view.replace(Some(profile_nav_view));
         imp.likes_nav_view.replace(Some(likes_nav_view));
+        imp.bookmarks_nav_view.replace(Some(bookmarks_nav_view));
         imp.search_nav_view.replace(Some(search_nav_view));
 
         // Add keyboard shortcuts
@@ -1429,6 +1445,7 @@ impl HangarWindow {
             "chat" => "chat",
             "profile" => "own-profile",
             "likes" => "likes",
+            "bookmarks" => "bookmarks",
             "search" => "search",
             _ => return,
         };
@@ -1447,6 +1464,7 @@ impl HangarWindow {
             "chat" => self.imp().chat_nav_view.borrow().clone(),
             "profile" => self.imp().profile_nav_view.borrow().clone(),
             "likes" => self.imp().likes_nav_view.borrow().clone(),
+            "bookmarks" => self.imp().bookmarks_nav_view.borrow().clone(),
             "search" => self.imp().search_nav_view.borrow().clone(),
             _ => self.imp().home_nav_view.borrow().clone(),
         }
@@ -1461,6 +1479,7 @@ impl HangarWindow {
             "chat" => Some("chat"),
             "profile" => Some("own-profile"),
             "likes" => Some("likes"),
+            "bookmarks" => Some("bookmarks"),
             "search" => Some("search"),
             // Settings has no NavigationView of its own, and `nav_view_named`
             // falls back to Home's, so a tag here would unwind Home instead.
@@ -2510,6 +2529,91 @@ impl HangarWindow {
             .replace(Some(Box::new(callback)));
     }
 
+    /// Push a conversation's message view onto the chat stack.
+    ///
+    /// A conversation already in the stack is popped back to instead of
+    /// stacked twice, so a double click cannot open two copies.
+    pub fn push_message_page(&self, conversation: &Conversation) -> Option<MessagePush> {
+        let nav_view = self.imp().chat_nav_view.borrow().clone()?;
+
+        let tag = format!("convo:{}", conversation.id);
+        if let Some(existing) = nav_view.find_page(&tag) {
+            nav_view.pop_to_tag(&tag);
+            // The message page is the content box's last child; see the
+            // push below.
+            let page = existing
+                .child()
+                .and_then(|content| content.last_child())
+                .and_downcast::<MessagePage>()?;
+            return Some(MessagePush::PoppedBack(page));
+        }
+
+        let my_did = self.imp().current_user_did.borrow().clone();
+        let page = MessagePage::new(conversation, my_did.as_deref());
+
+        // Mentions in messages route like mentions everywhere else.
+        let win = self.downgrade();
+        page.set_mention_clicked_callback(move |handle| {
+            let Some(win) = win.upgrade() else {
+                return;
+            };
+            if let Some(cb) = win.imp().mention_clicked_callback.borrow().as_ref() {
+                cb(handle);
+            }
+        });
+
+        let content_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        content_box.set_hexpand(true);
+
+        let header = adw::HeaderBar::new();
+        header.set_show_start_title_buttons(false);
+        header.set_show_end_title_buttons(false);
+
+        let title_text = page.conversation_title();
+        let title = gtk4::Label::new(Some(&title_text));
+        title.add_css_class("title");
+        // A bare label's minimum width is its full text; a long display
+        // name would push the window past the screen.
+        title.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        header.set_title_widget(Some(&title));
+
+        let window_controls = gtk4::WindowControls::new(gtk4::PackType::End);
+        header.pack_end(&window_controls);
+
+        content_box.append(&header);
+        content_box.append(&page);
+
+        let nav_page = adw::NavigationPage::new(&content_box, &title_text);
+        nav_page.set_tag(Some(&tag));
+        nav_view.push(&nav_page);
+
+        Some(MessagePush::Pushed(page))
+    }
+
+    /// Drop the unread badge on one conversation row after a read went
+    /// through on the server.
+    pub fn set_conversation_read(&self, convo_id: &str) {
+        let model = self.imp().chat_model.borrow().clone();
+        let Some(model) = model else {
+            return;
+        };
+        for i in 0..model.n_items() {
+            let Some(object) = model.item(i).and_downcast::<ConversationObject>() else {
+                continue;
+            };
+            let Some(mut convo) = object.conversation() else {
+                continue;
+            };
+            if convo.id != convo_id || convo.unread_count == 0 {
+                continue;
+            }
+            convo.unread_count = 0;
+            // Replacing the item is what makes the bound row repaint.
+            model.splice(i, 1, &[ConversationObject::new(convo)]);
+            break;
+        }
+    }
+
     /// Set callback for nav item changes
     pub fn set_nav_changed_callback<F: Fn(crate::ui::sidebar::NavItem) + 'static>(
         &self,
@@ -3414,6 +3518,263 @@ impl HangarWindow {
             .replace(Some(Box::new(callback)));
     }
 
+    // ======== Saved Posts Page ========
+
+    /// Build the saved posts page
+    fn build_bookmarks_page(&self) -> adw::NavigationPage {
+        let content_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        content_box.set_hexpand(true);
+
+        let header = adw::HeaderBar::new();
+        header.set_show_start_title_buttons(false);
+        header.set_show_end_title_buttons(false);
+
+        let title = gtk4::Label::new(Some("Saved"));
+        title.add_css_class("title");
+        header.set_title_widget(Some(&title));
+
+        // Add window controls (close, minimize, maximize) to the end
+        let window_controls = gtk4::WindowControls::new(gtk4::PackType::End);
+        header.pack_end(&window_controls);
+
+        content_box.append(&header);
+        content_box.append(&self.build_bookmarks_list());
+
+        let page = adw::NavigationPage::new(&content_box, "Saved");
+        page.set_tag(Some("bookmarks"));
+        page
+    }
+
+    /// Build the saved posts list widget
+    fn build_bookmarks_list(&self) -> gtk4::Box {
+        let bookmarks_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        bookmarks_box.set_vexpand(true);
+
+        let overlay = gtk4::Overlay::new();
+        overlay.set_vexpand(true);
+
+        let model = gio::ListStore::new::<PostObject>();
+        let factory = gtk4::SignalListItemFactory::new();
+
+        factory.connect_setup(|_, item| {
+            let post_row = PostRow::new();
+            if let Some(list_item) = item.downcast_ref::<gtk4::ListItem>() {
+                list_item.set_child(Some(&post_row));
+            }
+        });
+        Self::release_video_on_unbind(&factory);
+
+        let win = self.downgrade();
+        factory.connect_bind(move |_, item| {
+            let Some(win) = win.upgrade() else {
+                return;
+            };
+            if let Some(list_item) = item.downcast_ref::<gtk4::ListItem>()
+                && let Some(post_object) = list_item.item().and_downcast::<PostObject>()
+                && let Some(post) = post_object.post()
+                && let Some(post_row) = list_item.child().and_downcast::<PostRow>()
+            {
+                post_row.bind(&post);
+                let post_for_like = post.clone();
+                let w = win.downgrade();
+                post_row.connect_like_clicked(move |row, was_liked, like_uri| {
+                    let Some(w) = w.upgrade() else {
+                        return;
+                    };
+                    let mut post_with_state = post_for_like.clone();
+                    post_with_state.viewer_like = if was_liked { like_uri } else { None };
+                    let row_weak = row.downgrade();
+                    w.imp()
+                        .like_callback
+                        .borrow()
+                        .as_ref()
+                        .map(|cb| cb(post_with_state, row_weak));
+                });
+                let post_for_repost = post.clone();
+                let w = win.downgrade();
+                post_row.connect_repost_clicked(move |row, was_reposted, repost_uri| {
+                    let Some(w) = w.upgrade() else {
+                        return;
+                    };
+                    let mut post_with_state = post_for_repost.clone();
+                    post_with_state.viewer_repost = if was_reposted { repost_uri } else { None };
+                    let row_weak = row.downgrade();
+                    w.imp()
+                        .repost_callback
+                        .borrow()
+                        .as_ref()
+                        .map(|cb| cb(post_with_state, row_weak));
+                });
+                let post_for_quote = post.clone();
+                let w = win.downgrade();
+                post_row.connect_quote_clicked(move || {
+                    let Some(w) = w.upgrade() else {
+                        return;
+                    };
+                    w.imp()
+                        .quote_callback
+                        .borrow()
+                        .as_ref()
+                        .map(|cb| cb(post_for_quote.clone()));
+                });
+                let post_clone = post.clone();
+                let w = win.downgrade();
+                post_row.connect_reply_clicked(move || {
+                    let Some(w) = w.upgrade() else {
+                        return;
+                    };
+                    w.imp()
+                        .reply_callback
+                        .borrow()
+                        .as_ref()
+                        .map(|cb| cb(post_clone.clone()));
+                });
+                // Navigation callbacks for saved posts
+                let w = win.downgrade();
+                post_row.set_post_clicked_callback(move |p| {
+                    let Some(w) = w.upgrade() else {
+                        return;
+                    };
+                    w.imp()
+                        .post_clicked_callback
+                        .borrow()
+                        .as_ref()
+                        .map(|cb| cb(p));
+                });
+            }
+        });
+
+        let selection = gtk4::NoSelection::new(Some(model.clone()));
+        let list_view = gtk4::ListView::new(Some(selection), Some(factory));
+        list_view.add_css_class("background");
+
+        // Content width, and the scrollability the list needs to virtualize.
+        // See `build_timeline`. The list has to be this widget's direct child
+        // and this widget the scroller's; a box or overlay between them breaks
+        // scrolling.
+        let clamp = adw::ClampScrollable::new();
+        clamp.set_maximum_size(800);
+        clamp.set_tightening_threshold(600);
+        clamp.set_child(Some(&list_view));
+
+        let scrolled = gtk4::ScrolledWindow::new();
+        scrolled.set_vexpand(true);
+        scrolled.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
+        scrolled.set_child(Some(&clamp));
+        overlay.set_child(Some(&scrolled));
+
+        // Loading spinner
+        let spinner = gtk4::Spinner::new();
+        spinner.set_visible(false);
+        spinner.set_halign(gtk4::Align::Center);
+        spinner.set_valign(gtk4::Align::End);
+        spinner.set_margin_bottom(16);
+        overlay.add_overlay(&spinner);
+
+        // Empty state (shown instead of the overlay when nothing is saved)
+        let empty_state = adw::StatusPage::new();
+        empty_state.set_icon_name(Some("user-bookmarks-symbolic"));
+        empty_state.set_title("Nothing saved yet");
+        empty_state.set_description(Some("Save a post from its menu and it will show up here."));
+        empty_state.set_vexpand(true);
+        empty_state.set_visible(false);
+
+        bookmarks_box.append(&overlay);
+        bookmarks_box.append(&empty_state);
+
+        // Store references
+        let imp = self.imp();
+        imp.bookmarks_model.replace(Some(model));
+        imp.bookmarks_scrolled_window
+            .replace(Some(scrolled.clone()));
+        imp.bookmarks_spinner.replace(Some(spinner));
+        imp.bookmarks_overlay.replace(Some(overlay));
+        imp.bookmarks_empty_state.replace(Some(empty_state));
+
+        // Infinite scroll
+        let adj = scrolled.vadjustment();
+        let win = self.downgrade();
+        adj.connect_value_changed(move |adj| {
+            let Some(win) = win.upgrade() else {
+                return;
+            };
+            let value = adj.value();
+            let upper = adj.upper();
+            let page_size = adj.page_size();
+            if value >= upper - page_size - 200.0 {
+                if let Some(cb) = win.imp().bookmarks_load_more_callback.borrow().as_ref() {
+                    cb();
+                }
+            }
+        });
+
+        bookmarks_box
+    }
+
+    /// Show the saved posts page (top-level navigation, instant switch)
+    pub fn show_bookmarks_page(&self) {
+        self.switch_to_page("bookmarks");
+    }
+
+    /// Set saved posts in the list, swapping in the empty state when there
+    /// are none
+    pub fn set_bookmarks(&self, posts: Vec<Post>) {
+        let empty = posts.is_empty();
+        if let Some(model) = self.imp().bookmarks_model.borrow().as_ref() {
+            model.remove_all();
+            for post in posts {
+                model.append(&PostObject::new(post));
+            }
+        }
+        if let Some(overlay) = self.imp().bookmarks_overlay.borrow().as_ref() {
+            overlay.set_visible(!empty);
+        }
+        if let Some(empty_state) = self.imp().bookmarks_empty_state.borrow().as_ref() {
+            empty_state.set_visible(empty);
+        }
+    }
+
+    /// Append more saved posts to the list
+    pub fn append_bookmarks(&self, posts: Vec<Post>) {
+        if let Some(model) = self.imp().bookmarks_model.borrow().as_ref() {
+            for post in posts {
+                model.append(&PostObject::new(post));
+            }
+        }
+    }
+
+    /// Take an unsaved post out of the Saved list right away, if the list is
+    /// showing it. Bringing back the empty state when the last one goes.
+    pub fn remove_bookmark(&self, uri: &str) {
+        let Some(model) = self.imp().bookmarks_model.borrow().clone() else {
+            return;
+        };
+        Self::remove_post_from_store(&model, uri);
+        if model.n_items() == 0 {
+            if let Some(overlay) = self.imp().bookmarks_overlay.borrow().as_ref() {
+                overlay.set_visible(false);
+            }
+            if let Some(empty_state) = self.imp().bookmarks_empty_state.borrow().as_ref() {
+                empty_state.set_visible(true);
+            }
+        }
+    }
+
+    /// Set loading state for the saved posts page
+    pub fn set_bookmarks_loading(&self, loading: bool) {
+        if let Some(spinner) = self.imp().bookmarks_spinner.borrow().as_ref() {
+            spinner.set_visible(loading);
+            spinner.set_spinning(loading);
+        }
+    }
+
+    /// Set callback for loading more saved posts
+    pub fn set_bookmarks_load_more_callback<F: Fn() + 'static>(&self, callback: F) {
+        self.imp()
+            .bookmarks_load_more_callback
+            .replace(Some(Box::new(callback)));
+    }
+
     // ======== Search Page ========
 
     fn build_search_page(&self) -> adw::NavigationPage {
@@ -3882,7 +4243,14 @@ impl HangarWindow {
     fn pop_thread_pages_for(&self, uri: &str) {
         let tag = format!("thread:{uri}");
         for section in [
-            "home", "mentions", "activity", "chat", "profile", "likes", "search",
+            "home",
+            "mentions",
+            "activity",
+            "chat",
+            "profile",
+            "likes",
+            "bookmarks",
+            "search",
         ] {
             let Some(nav_view) = self.nav_view_named(section) else {
                 continue;
@@ -4590,6 +4958,7 @@ impl HangarWindow {
                 "chat" => Some(crate::ui::sidebar::NavItem::Chat),
                 "profile" => Some(crate::ui::sidebar::NavItem::Profile),
                 "likes" => Some(crate::ui::sidebar::NavItem::Likes),
+                "bookmarks" => Some(crate::ui::sidebar::NavItem::Bookmarks),
                 "search" => Some(crate::ui::sidebar::NavItem::Search),
                 _ => Some(crate::ui::sidebar::NavItem::Home),
             };
@@ -5648,6 +6017,7 @@ mod tests {
                 embed: None,
                 viewer_like: None,
                 viewer_repost: None,
+                viewer_bookmarked: None,
                 repost_reason: None,
                 reply_context: None,
             }),
@@ -5675,6 +6045,7 @@ mod tests {
             embed: None,
             viewer_like: None,
             viewer_repost: None,
+            viewer_bookmarked: None,
             repost_reason: None,
             reply_context: None,
         }
@@ -6009,9 +6380,9 @@ mod tests {
     ///
     /// The `AdwClamp` to `AdwClampScrollable` swaps only count at the
     /// call sites, and a clamp built inside a test says nothing about what
-    /// `window.rs` uses. So this walks the trees the app constructs: seven
+    /// `window.rs` uses. So this walks the trees the app constructs: eight
     /// feeds off the window's own fields, plus the other-user profile page,
-    /// which is built per profile. Reverting any one of the eight turns this
+    /// which is built per profile. Reverting any one of the nine turns this
     /// red on that page's name.
     ///
     /// The pages that keep a plain `AdwClamp` are covered by
@@ -6032,6 +6403,7 @@ mod tests {
             ("activity", &imp.activity_scrolled_window),
             ("chat", &imp.chat_scrolled_window),
             ("likes", &imp.likes_scrolled_window),
+            ("bookmarks", &imp.bookmarks_scrolled_window),
             ("search", &imp.search_scrolled_window),
             ("search people", &imp.search_people_scrolled_window),
         ] {
@@ -6060,8 +6432,8 @@ mod tests {
 
         assert_eq!(
             feeds.len(),
-            8,
-            "this test is meant to cover all eight virtualized feeds"
+            9,
+            "this test is meant to cover all nine virtualized feeds"
         );
 
         for (page, scrolled) in &feeds {
@@ -6223,6 +6595,61 @@ mod tests {
         window.destroy();
     }
 
+    /// The Saved page swaps between its list and its empty state as posts
+    /// come and go, including when unsaving empties the list in place.
+    #[test]
+    fn the_saved_page_swaps_between_list_and_empty_state() {
+        crate::ui::with_gtk(the_saved_page_swaps_between_list_and_empty_state_body);
+    }
+
+    fn the_saved_page_swaps_between_list_and_empty_state_body() {
+        let window: HangarWindow = glib::Object::builder().build();
+        let imp = window.imp();
+
+        let empty_state = imp
+            .bookmarks_empty_state
+            .borrow()
+            .clone()
+            .expect("the Saved page built an empty state");
+        let overlay = imp
+            .bookmarks_overlay
+            .borrow()
+            .clone()
+            .expect("the Saved page built its list overlay");
+        let model = imp
+            .bookmarks_model
+            .borrow()
+            .clone()
+            .expect("the Saved page built a model");
+
+        // Nothing saved: the empty state speaks, the list stands down.
+        window.set_bookmarks(vec![]);
+        assert!(empty_state.get_visible());
+        assert!(!overlay.get_visible());
+
+        window.set_bookmarks(vec![a_post("first"), a_post("second")]);
+        window.append_bookmarks(vec![a_post("third")]);
+        assert_eq!(model.n_items(), 3);
+        assert!(!empty_state.get_visible());
+        assert!(overlay.get_visible());
+
+        // Unsaving takes rows out one at a time; the last one leaving brings
+        // the empty state back.
+        window.remove_bookmark(&a_post("third").uri);
+        window.remove_bookmark(&a_post("first").uri);
+        assert_eq!(model.n_items(), 1);
+        assert!(
+            !empty_state.get_visible(),
+            "one post still saved, the list stays"
+        );
+        window.remove_bookmark(&a_post("second").uri);
+        assert_eq!(model.n_items(), 0);
+        assert!(empty_state.get_visible());
+        assert!(!overlay.get_visible());
+
+        window.destroy();
+    }
+
     /// Deleting a post has to take it out of everything showing it.
     ///
     /// The stored models, a pushed profile page whose model nothing else
@@ -6240,6 +6667,7 @@ mod tests {
 
         window.set_posts(vec![a_post("doomed"), a_post("kept")]);
         window.set_likes(vec![a_post("doomed")]);
+        window.set_bookmarks(vec![a_post("doomed"), a_post("kept")]);
         window.set_search_results(vec![a_post("kept"), a_post("doomed")]);
         window.set_profile_posts(vec![a_post("doomed"), a_post("kept")]);
 
@@ -6272,6 +6700,7 @@ mod tests {
         for (page, cell) in [
             ("timeline", &imp.timeline_model),
             ("likes", &imp.likes_model),
+            ("bookmarks", &imp.bookmarks_model),
             ("search", &imp.search_model),
             ("own profile", &imp.profile_page_model),
         ] {
