@@ -3888,6 +3888,16 @@ impl HangarApplication {
         });
     }
 
+    /// What a tab's page actually lists. The server's posts_with_replies
+    /// is a superset with standalone posts included; the Replies tab wants
+    /// only the replies, so the rest of the page stays behind.
+    fn tab_posts(filter: &str, mut posts: Vec<Post>) -> Vec<Post> {
+        if filter == "posts_with_replies" {
+            posts.retain(|post| post.reply_context.is_some());
+        }
+        posts
+    }
+
     /// One page of a profile tab's feed. First pages were cleared by the
     /// tab switch; later pages append. The context's generation strands a
     /// fetch whose tab was switched away while it was out.
@@ -3929,7 +3939,7 @@ impl HangarApplication {
                 Ok(Ok((posts, next_cursor))) => {
                     ctx.fetching.set(false);
                     ctx.cursor.replace(next_cursor);
-                    ctx.append_posts(posts);
+                    ctx.append_posts(Self::tab_posts(filter, posts));
                     glib::ControlFlow::Break
                 }
                 Ok(Err(e)) => {
@@ -4452,6 +4462,47 @@ mod tests {
             !generation.is_current(new),
             "every bump strands earlier fetches"
         );
+    }
+
+    /// The Replies tab lists only replies; the server's filter is a
+    /// superset with standalone posts mixed in. Other tabs pass through.
+    #[test]
+    fn the_replies_tab_keeps_only_replies() {
+        use crate::atproto::{Post, Profile, ReplyContext};
+
+        let post = |uri: &str, reply: bool| {
+            let author = Profile::minimal("did:plc:a".into(), "a.bsky.social".into(), None, None);
+            Post {
+                uri: uri.into(),
+                cid: "cid".into(),
+                author: author.clone(),
+                text: "words".into(),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                indexed_at: "2026-01-01T00:00:00Z".into(),
+                like_count: None,
+                repost_count: None,
+                reply_count: None,
+                embed: None,
+                viewer_like: None,
+                viewer_repost: None,
+                viewer_bookmarked: None,
+                repost_reason: None,
+                reply_context: reply.then(|| ReplyContext {
+                    parent_author: author.clone(),
+                    root_author: author,
+                }),
+            }
+        };
+
+        let page = vec![post("at://a/1", false), post("at://a/2", true)];
+        let replies = super::HangarApplication::tab_posts("posts_with_replies", page.clone());
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].uri, "at://a/2");
+
+        let posts = super::HangarApplication::tab_posts("posts_and_author_threads", page.clone());
+        assert_eq!(posts.len(), 2, "other tabs list the page as served");
+        let media = super::HangarApplication::tab_posts("posts_with_media", page);
+        assert_eq!(media.len(), 2);
     }
 
     /// The About dialog states the crate version, so a release bump cannot

@@ -3933,11 +3933,10 @@ impl HangarWindow {
         banner_box.append(&banner_picture);
         banner_overlay.set_child(Some(&banner_box));
 
-        // Avatar overlaid on banner (positioned at bottom)
+        // Avatar overlaid on banner, centered like the drill-down pages.
         let avatar = adw::Avatar::new(80, None, true);
-        avatar.set_halign(gtk4::Align::Start);
+        avatar.set_halign(gtk4::Align::Center);
         avatar.set_valign(gtk4::Align::End);
-        avatar.set_margin_start(16);
         avatar.set_margin_bottom(-40); // Overlap into content below
         banner_overlay.add_overlay(&avatar);
 
@@ -3953,14 +3952,14 @@ impl HangarWindow {
         // Display name
         let name_label = gtk4::Label::new(None);
         name_label.add_css_class("title-1");
-        name_label.set_halign(gtk4::Align::Start);
+        name_label.set_halign(gtk4::Align::Center);
         name_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         info_box.append(&name_label);
 
         // Handle
         let handle_label = gtk4::Label::new(None);
         handle_label.add_css_class("dim-label");
-        handle_label.set_halign(gtk4::Align::Start);
+        handle_label.set_halign(gtk4::Align::Center);
         handle_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         info_box.append(&handle_label);
 
@@ -3968,8 +3967,9 @@ impl HangarWindow {
         let bio_label = gtk4::Label::new(None);
         bio_label.set_wrap(true);
         bio_label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
-        bio_label.set_halign(gtk4::Align::Start);
-        bio_label.set_xalign(0.0);
+        bio_label.set_halign(gtk4::Align::Center);
+        bio_label.set_justify(gtk4::Justification::Center);
+        bio_label.set_max_width_chars(60);
         bio_label.set_use_markup(true); // Bio links
         bio_label.set_visible(false); // Hidden until profile loads
         // Wired once here. update_profile_header runs twice per login,
@@ -3979,6 +3979,7 @@ impl HangarWindow {
 
         // Stats row
         let stats_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 16);
+        stats_box.set_halign(gtk4::Align::Center);
         stats_box.set_margin_top(8);
 
         // Followers, clickable. The gesture is wired once here; the click
@@ -4039,7 +4040,7 @@ impl HangarWindow {
         // Edit Profile, this being the one profile that is yours.
         let edit_btn = gtk4::Button::with_label("Edit Profile");
         edit_btn.add_css_class("pill");
-        edit_btn.set_halign(gtk4::Align::Start);
+        edit_btn.set_halign(gtk4::Align::Center);
         edit_btn.set_margin_top(8);
         let win = self.downgrade();
         edit_btn.connect_clicked(move |_| {
