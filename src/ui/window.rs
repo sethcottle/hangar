@@ -793,85 +793,7 @@ impl HangarWindow {
                 {
                     post_row.bind(&post);
                     post_row.set_list_position(list_item.position());
-                    // Like callback receives (post_row, was_liked, like_uri) captured before toggle
-                    let post_for_like = post.clone();
-                    let w = win.downgrade();
-                    post_row.connect_like_clicked(move |row, was_liked, like_uri| {
-                        let Some(w) = w.upgrade() else {
-                            return;
-                        };
-                        let mut post_with_state = post_for_like.clone();
-                        // If it was liked, we're unliking, so pass the like_uri
-                        // If it wasn't liked, we're liking, so pass None
-                        post_with_state.viewer_like = if was_liked { like_uri } else { None };
-                        let row_weak = row.downgrade();
-                        if let Some(cb) = w.imp().like_callback.borrow().as_ref() {
-                            cb(post_with_state, row_weak);
-                        }
-                    });
-                    // Repost callback receives (post_row, was_reposted, repost_uri) captured before toggle
-                    let post_for_repost = post.clone();
-                    let w = win.downgrade();
-                    post_row.connect_repost_clicked(move |row, was_reposted, repost_uri| {
-                        let Some(w) = w.upgrade() else {
-                            return;
-                        };
-                        let mut post_with_state = post_for_repost.clone();
-                        post_with_state.viewer_repost =
-                            if was_reposted { repost_uri } else { None };
-                        let row_weak = row.downgrade();
-                        if let Some(cb) = w.imp().repost_callback.borrow().as_ref() {
-                            cb(post_with_state, row_weak);
-                        }
-                    });
-                    let post_for_quote = post.clone();
-                    let w = win.downgrade();
-                    post_row.connect_quote_clicked(move || {
-                        let Some(w) = w.upgrade() else {
-                            return;
-                        };
-                        if let Some(cb) = w.imp().quote_callback.borrow().as_ref() {
-                            cb(post_for_quote.clone());
-                        }
-                    });
-                    let post_clone = post.clone();
-                    let w = win.downgrade();
-                    post_row.connect_reply_clicked(move || {
-                        let Some(w) = w.upgrade() else {
-                            return;
-                        };
-                        if let Some(cb) = w.imp().reply_callback.borrow().as_ref() {
-                            cb(post_clone.clone());
-                        }
-                    });
-                    // Navigation callbacks
-                    let w = win.downgrade();
-                    post_row.set_post_clicked_callback(move |p| {
-                        let Some(w) = w.upgrade() else {
-                            return;
-                        };
-                        if let Some(cb) = w.imp().post_clicked_callback.borrow().as_ref() {
-                            cb(p);
-                        }
-                    });
-                    let w = win.downgrade();
-                    post_row.set_profile_clicked_callback(move |profile| {
-                        let Some(w) = w.upgrade() else {
-                            return;
-                        };
-                        if let Some(cb) = w.imp().profile_clicked_callback.borrow().as_ref() {
-                            cb(profile);
-                        }
-                    });
-                    let w = win.downgrade();
-                    post_row.set_mention_clicked_callback(move |handle| {
-                        let Some(w) = w.upgrade() else {
-                            return;
-                        };
-                        if let Some(cb) = w.imp().mention_clicked_callback.borrow().as_ref() {
-                            cb(handle);
-                        }
-                    });
+                    win.wire_post_row(&post_row, &post);
                 }
             }
         ));
@@ -1873,6 +1795,89 @@ impl HangarWindow {
             .replace(Some(Box::new(callback)));
     }
 
+    /// Route one bound row's interactions to the window callbacks: like,
+    /// repost, quote, reply, and the post, profile, and mention
+    /// navigation. Every post list wires through here; page-local subsets
+    /// are how mention clicks went dead on some pages. The post click is
+    /// wired even where the row body is not clickable, since embedded
+    /// quote cards still fire it.
+    fn wire_post_row(&self, post_row: &PostRow, post: &Post) {
+        let post_for_like = post.clone();
+        let w = self.downgrade();
+        post_row.connect_like_clicked(move |row, was_liked, like_uri| {
+            let Some(w) = w.upgrade() else {
+                return;
+            };
+            let mut post_with_state = post_for_like.clone();
+            // Liked means this click unlikes, so the URI rides along.
+            post_with_state.viewer_like = if was_liked { like_uri } else { None };
+            let row_weak = row.downgrade();
+            if let Some(cb) = w.imp().like_callback.borrow().as_ref() {
+                cb(post_with_state, row_weak);
+            }
+        });
+        let post_for_repost = post.clone();
+        let w = self.downgrade();
+        post_row.connect_repost_clicked(move |row, was_reposted, repost_uri| {
+            let Some(w) = w.upgrade() else {
+                return;
+            };
+            let mut post_with_state = post_for_repost.clone();
+            post_with_state.viewer_repost = if was_reposted { repost_uri } else { None };
+            let row_weak = row.downgrade();
+            if let Some(cb) = w.imp().repost_callback.borrow().as_ref() {
+                cb(post_with_state, row_weak);
+            }
+        });
+        let post_for_quote = post.clone();
+        let w = self.downgrade();
+        post_row.connect_quote_clicked(move || {
+            let Some(w) = w.upgrade() else {
+                return;
+            };
+            if let Some(cb) = w.imp().quote_callback.borrow().as_ref() {
+                cb(post_for_quote.clone());
+            }
+        });
+        let post_for_reply = post.clone();
+        let w = self.downgrade();
+        post_row.connect_reply_clicked(move || {
+            let Some(w) = w.upgrade() else {
+                return;
+            };
+            if let Some(cb) = w.imp().reply_callback.borrow().as_ref() {
+                cb(post_for_reply.clone());
+            }
+        });
+        let w = self.downgrade();
+        post_row.set_post_clicked_callback(move |p| {
+            let Some(w) = w.upgrade() else {
+                return;
+            };
+            if let Some(cb) = w.imp().post_clicked_callback.borrow().as_ref() {
+                cb(p);
+            }
+        });
+        let w = self.downgrade();
+        post_row.set_profile_clicked_callback(move |profile| {
+            let Some(w) = w.upgrade() else {
+                return;
+            };
+            if let Some(cb) = w.imp().profile_clicked_callback.borrow().as_ref() {
+                cb(profile);
+            }
+        });
+        let w = self.downgrade();
+        post_row.set_mention_clicked_callback(move |handle| {
+            let Some(w) = w.upgrade() else {
+                return;
+            };
+            if let Some(cb) = w.imp().mention_clicked_callback.borrow().as_ref() {
+                cb(handle);
+            }
+        });
+    }
+
     /// Set callback for when a followers or following count is clicked
     pub fn set_follow_list_clicked_callback<F: Fn(Profile, FollowListKind) + 'static>(
         &self,
@@ -2179,102 +2184,7 @@ impl HangarWindow {
             let post_row = PostRow::new();
             post_row.bind(&post);
 
-            // Like callback
-            let post_for_like = post.clone();
-            let w = win.downgrade();
-            post_row.connect_like_clicked(move |row, was_liked, like_uri| {
-                let Some(w) = w.upgrade() else {
-                    return;
-                };
-                let mut post_with_state = post_for_like.clone();
-                post_with_state.viewer_like = if was_liked { like_uri } else { None };
-                let row_weak = row.downgrade();
-                w.imp()
-                    .like_callback
-                    .borrow()
-                    .as_ref()
-                    .map(|cb| cb(post_with_state, row_weak));
-            });
-
-            // Repost callback
-            let post_for_repost = post.clone();
-            let w = win.downgrade();
-            post_row.connect_repost_clicked(move |row, was_reposted, repost_uri| {
-                let Some(w) = w.upgrade() else {
-                    return;
-                };
-                let mut post_with_state = post_for_repost.clone();
-                post_with_state.viewer_repost = if was_reposted { repost_uri } else { None };
-                let row_weak = row.downgrade();
-                w.imp()
-                    .repost_callback
-                    .borrow()
-                    .as_ref()
-                    .map(|cb| cb(post_with_state, row_weak));
-            });
-
-            // Quote callback
-            let post_for_quote = post.clone();
-            let w = win.downgrade();
-            post_row.connect_quote_clicked(move || {
-                let Some(w) = w.upgrade() else {
-                    return;
-                };
-                w.imp()
-                    .quote_callback
-                    .borrow()
-                    .as_ref()
-                    .map(|cb| cb(post_for_quote.clone()));
-            });
-
-            // Reply callback
-            let post_clone = post.clone();
-            let w = win.downgrade();
-            post_row.connect_reply_clicked(move || {
-                let Some(w) = w.upgrade() else {
-                    return;
-                };
-                w.imp()
-                    .reply_callback
-                    .borrow()
-                    .as_ref()
-                    .map(|cb| cb(post_clone.clone()));
-            });
-
-            // The post click callback is always set so embedded quotes can navigate.
-            // When !clickable (main post in thread), the row body click is
-            // disabled via set_not_clickable(), but quote cards still fire this.
-            {
-                let w = win.downgrade();
-                post_row.set_post_clicked_callback(move |p| {
-                    let Some(w) = w.upgrade() else {
-                        return;
-                    };
-                    if let Some(cb) = w.imp().post_clicked_callback.borrow().as_ref() {
-                        cb(p);
-                    }
-                });
-            }
-
-            let w = win.downgrade();
-            post_row.set_profile_clicked_callback(move |profile| {
-                let Some(w) = w.upgrade() else {
-                    return;
-                };
-                if let Some(cb) = w.imp().profile_clicked_callback.borrow().as_ref() {
-                    cb(profile);
-                }
-            });
-
-            let w = win.downgrade();
-            post_row.set_mention_clicked_callback(move |handle| {
-                let Some(w) = w.upgrade() else {
-                    return;
-                };
-                if let Some(cb) = w.imp().mention_clicked_callback.borrow().as_ref() {
-                    cb(handle);
-                }
-            });
+            win.wire_post_row(&post_row, &post);
 
             post_row
         };
@@ -2678,61 +2588,7 @@ impl HangarWindow {
                 post_row.set_visible(true);
                 post_row.bind(&post);
                 post_row.set_list_position(list_item.position());
-                // Wire up like/repost/reply/quote callbacks
-                let post_for_like = post.clone();
-                let w = win.downgrade();
-                post_row.connect_like_clicked(move |row, was_liked, like_uri| {
-                    let Some(w) = w.upgrade() else {
-                        return;
-                    };
-                    let mut post_with_state = post_for_like.clone();
-                    post_with_state.viewer_like = if was_liked { like_uri } else { None };
-                    let row_weak = row.downgrade();
-                    w.imp()
-                        .like_callback
-                        .borrow()
-                        .as_ref()
-                        .map(|cb| cb(post_with_state, row_weak));
-                });
-                let post_for_repost = post.clone();
-                let w = win.downgrade();
-                post_row.connect_repost_clicked(move |row, was_reposted, repost_uri| {
-                    let Some(w) = w.upgrade() else {
-                        return;
-                    };
-                    let mut post_with_state = post_for_repost.clone();
-                    post_with_state.viewer_repost = if was_reposted { repost_uri } else { None };
-                    let row_weak = row.downgrade();
-                    w.imp()
-                        .repost_callback
-                        .borrow()
-                        .as_ref()
-                        .map(|cb| cb(post_with_state, row_weak));
-                });
-                let post_for_quote = post.clone();
-                let w = win.downgrade();
-                post_row.connect_quote_clicked(move || {
-                    let Some(w) = w.upgrade() else {
-                        return;
-                    };
-                    w.imp()
-                        .quote_callback
-                        .borrow()
-                        .as_ref()
-                        .map(|cb| cb(post_for_quote.clone()));
-                });
-                let post_clone = post.clone();
-                let w = win.downgrade();
-                post_row.connect_reply_clicked(move || {
-                    let Some(w) = w.upgrade() else {
-                        return;
-                    };
-                    w.imp()
-                        .reply_callback
-                        .borrow()
-                        .as_ref()
-                        .map(|cb| cb(post_clone.clone()));
-                });
+                win.wire_post_row(&post_row, &post);
             }
         });
 
@@ -3926,72 +3782,7 @@ impl HangarWindow {
                 post_row.set_visible(true);
                 post_row.bind(&post);
                 post_row.set_list_position(list_item.position());
-                let post_for_like = post.clone();
-                let w = win.downgrade();
-                post_row.connect_like_clicked(move |row, was_liked, like_uri| {
-                    let Some(w) = w.upgrade() else {
-                        return;
-                    };
-                    let mut post_with_state = post_for_like.clone();
-                    post_with_state.viewer_like = if was_liked { like_uri } else { None };
-                    let row_weak = row.downgrade();
-                    w.imp()
-                        .like_callback
-                        .borrow()
-                        .as_ref()
-                        .map(|cb| cb(post_with_state, row_weak));
-                });
-                let post_for_repost = post.clone();
-                let w = win.downgrade();
-                post_row.connect_repost_clicked(move |row, was_reposted, repost_uri| {
-                    let Some(w) = w.upgrade() else {
-                        return;
-                    };
-                    let mut post_with_state = post_for_repost.clone();
-                    post_with_state.viewer_repost = if was_reposted { repost_uri } else { None };
-                    let row_weak = row.downgrade();
-                    w.imp()
-                        .repost_callback
-                        .borrow()
-                        .as_ref()
-                        .map(|cb| cb(post_with_state, row_weak));
-                });
-                let post_for_quote = post.clone();
-                let w = win.downgrade();
-                post_row.connect_quote_clicked(move || {
-                    let Some(w) = w.upgrade() else {
-                        return;
-                    };
-                    w.imp()
-                        .quote_callback
-                        .borrow()
-                        .as_ref()
-                        .map(|cb| cb(post_for_quote.clone()));
-                });
-                let post_clone = post.clone();
-                let w = win.downgrade();
-                post_row.connect_reply_clicked(move || {
-                    let Some(w) = w.upgrade() else {
-                        return;
-                    };
-                    w.imp()
-                        .reply_callback
-                        .borrow()
-                        .as_ref()
-                        .map(|cb| cb(post_clone.clone()));
-                });
-                // Navigation callbacks for posts in profile
-                let w = win.downgrade();
-                post_row.set_post_clicked_callback(move |p| {
-                    let Some(w) = w.upgrade() else {
-                        return;
-                    };
-                    w.imp()
-                        .post_clicked_callback
-                        .borrow()
-                        .as_ref()
-                        .map(|cb| cb(p));
-                });
+                win.wire_post_row(&post_row, &post);
             }
         });
 
@@ -4450,72 +4241,7 @@ impl HangarWindow {
             {
                 post_row.bind(&post);
                 post_row.set_list_position(list_item.position());
-                let post_for_like = post.clone();
-                let w = win.downgrade();
-                post_row.connect_like_clicked(move |row, was_liked, like_uri| {
-                    let Some(w) = w.upgrade() else {
-                        return;
-                    };
-                    let mut post_with_state = post_for_like.clone();
-                    post_with_state.viewer_like = if was_liked { like_uri } else { None };
-                    let row_weak = row.downgrade();
-                    w.imp()
-                        .like_callback
-                        .borrow()
-                        .as_ref()
-                        .map(|cb| cb(post_with_state, row_weak));
-                });
-                let post_for_repost = post.clone();
-                let w = win.downgrade();
-                post_row.connect_repost_clicked(move |row, was_reposted, repost_uri| {
-                    let Some(w) = w.upgrade() else {
-                        return;
-                    };
-                    let mut post_with_state = post_for_repost.clone();
-                    post_with_state.viewer_repost = if was_reposted { repost_uri } else { None };
-                    let row_weak = row.downgrade();
-                    w.imp()
-                        .repost_callback
-                        .borrow()
-                        .as_ref()
-                        .map(|cb| cb(post_with_state, row_weak));
-                });
-                let post_for_quote = post.clone();
-                let w = win.downgrade();
-                post_row.connect_quote_clicked(move || {
-                    let Some(w) = w.upgrade() else {
-                        return;
-                    };
-                    w.imp()
-                        .quote_callback
-                        .borrow()
-                        .as_ref()
-                        .map(|cb| cb(post_for_quote.clone()));
-                });
-                let post_clone = post.clone();
-                let w = win.downgrade();
-                post_row.connect_reply_clicked(move || {
-                    let Some(w) = w.upgrade() else {
-                        return;
-                    };
-                    w.imp()
-                        .reply_callback
-                        .borrow()
-                        .as_ref()
-                        .map(|cb| cb(post_clone.clone()));
-                });
-                // Navigation callbacks for posts in likes
-                let w = win.downgrade();
-                post_row.set_post_clicked_callback(move |p| {
-                    let Some(w) = w.upgrade() else {
-                        return;
-                    };
-                    w.imp()
-                        .post_clicked_callback
-                        .borrow()
-                        .as_ref()
-                        .map(|cb| cb(p));
-                });
+                win.wire_post_row(&post_row, &post);
             }
         });
 
@@ -4722,72 +4448,7 @@ impl HangarWindow {
             {
                 post_row.bind(&post);
                 post_row.set_list_position(list_item.position());
-                let post_for_like = post.clone();
-                let w = win.downgrade();
-                post_row.connect_like_clicked(move |row, was_liked, like_uri| {
-                    let Some(w) = w.upgrade() else {
-                        return;
-                    };
-                    let mut post_with_state = post_for_like.clone();
-                    post_with_state.viewer_like = if was_liked { like_uri } else { None };
-                    let row_weak = row.downgrade();
-                    w.imp()
-                        .like_callback
-                        .borrow()
-                        .as_ref()
-                        .map(|cb| cb(post_with_state, row_weak));
-                });
-                let post_for_repost = post.clone();
-                let w = win.downgrade();
-                post_row.connect_repost_clicked(move |row, was_reposted, repost_uri| {
-                    let Some(w) = w.upgrade() else {
-                        return;
-                    };
-                    let mut post_with_state = post_for_repost.clone();
-                    post_with_state.viewer_repost = if was_reposted { repost_uri } else { None };
-                    let row_weak = row.downgrade();
-                    w.imp()
-                        .repost_callback
-                        .borrow()
-                        .as_ref()
-                        .map(|cb| cb(post_with_state, row_weak));
-                });
-                let post_for_quote = post.clone();
-                let w = win.downgrade();
-                post_row.connect_quote_clicked(move || {
-                    let Some(w) = w.upgrade() else {
-                        return;
-                    };
-                    w.imp()
-                        .quote_callback
-                        .borrow()
-                        .as_ref()
-                        .map(|cb| cb(post_for_quote.clone()));
-                });
-                let post_clone = post.clone();
-                let w = win.downgrade();
-                post_row.connect_reply_clicked(move || {
-                    let Some(w) = w.upgrade() else {
-                        return;
-                    };
-                    w.imp()
-                        .reply_callback
-                        .borrow()
-                        .as_ref()
-                        .map(|cb| cb(post_clone.clone()));
-                });
-                // Navigation callbacks for saved posts
-                let w = win.downgrade();
-                post_row.set_post_clicked_callback(move |p| {
-                    let Some(w) = w.upgrade() else {
-                        return;
-                    };
-                    w.imp()
-                        .post_clicked_callback
-                        .borrow()
-                        .as_ref()
-                        .map(|cb| cb(p));
-                });
+                win.wire_post_row(&post_row, &post);
             }
         });
 
@@ -5057,72 +4718,7 @@ impl HangarWindow {
             {
                 post_row.bind(&post);
                 post_row.set_list_position(list_item.position());
-                let post_for_like = post.clone();
-                let w = win.downgrade();
-                post_row.connect_like_clicked(move |row, was_liked, like_uri| {
-                    let Some(w) = w.upgrade() else {
-                        return;
-                    };
-                    let mut post_with_state = post_for_like.clone();
-                    post_with_state.viewer_like = if was_liked { like_uri } else { None };
-                    let row_weak = row.downgrade();
-                    w.imp()
-                        .like_callback
-                        .borrow()
-                        .as_ref()
-                        .map(|cb| cb(post_with_state, row_weak));
-                });
-                let post_for_repost = post.clone();
-                let w = win.downgrade();
-                post_row.connect_repost_clicked(move |row, was_reposted, repost_uri| {
-                    let Some(w) = w.upgrade() else {
-                        return;
-                    };
-                    let mut post_with_state = post_for_repost.clone();
-                    post_with_state.viewer_repost = if was_reposted { repost_uri } else { None };
-                    let row_weak = row.downgrade();
-                    w.imp()
-                        .repost_callback
-                        .borrow()
-                        .as_ref()
-                        .map(|cb| cb(post_with_state, row_weak));
-                });
-                let post_for_quote = post.clone();
-                let w = win.downgrade();
-                post_row.connect_quote_clicked(move || {
-                    let Some(w) = w.upgrade() else {
-                        return;
-                    };
-                    w.imp()
-                        .quote_callback
-                        .borrow()
-                        .as_ref()
-                        .map(|cb| cb(post_for_quote.clone()));
-                });
-                let post_clone = post.clone();
-                let w = win.downgrade();
-                post_row.connect_reply_clicked(move || {
-                    let Some(w) = w.upgrade() else {
-                        return;
-                    };
-                    w.imp()
-                        .reply_callback
-                        .borrow()
-                        .as_ref()
-                        .map(|cb| cb(post_clone.clone()));
-                });
-                // Navigation callbacks for posts in search results
-                let w = win.downgrade();
-                post_row.set_post_clicked_callback(move |p| {
-                    let Some(w) = w.upgrade() else {
-                        return;
-                    };
-                    w.imp()
-                        .post_clicked_callback
-                        .borrow()
-                        .as_ref()
-                        .map(|cb| cb(p));
-                });
+                win.wire_post_row(&post_row, &post);
             }
         });
 
@@ -7555,6 +7151,50 @@ mod tests {
             repost_reason: None,
             reply_context: None,
         }
+    }
+
+    /// One shared wiring path serves every post list: a row wired by
+    /// `wire_post_row` routes mention and profile clicks to the window
+    /// callbacks. Page-local wiring subsets are how mention clicks went
+    /// dead on the own profile and the likes, saved, and search lists.
+    #[test]
+    fn wired_rows_route_mention_and_profile_clicks() {
+        crate::ui::with_gtk(wired_rows_route_mention_and_profile_clicks_body);
+    }
+
+    fn wired_rows_route_mention_and_profile_clicks_body() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let window: HangarWindow = glib::Object::builder().build();
+        let mentions: Rc<RefCell<Vec<String>>> = Rc::default();
+        let sink = Rc::clone(&mentions);
+        window.set_mention_clicked_callback(move |handle| sink.borrow_mut().push(handle));
+        let profiles: Rc<RefCell<Vec<String>>> = Rc::default();
+        let sink = Rc::clone(&profiles);
+        window.set_profile_clicked_callback(move |profile| sink.borrow_mut().push(profile.did));
+
+        let row = PostRow::new();
+        row.bind(&a_post("wired"));
+        window.wire_post_row(&row, &a_post("wired"));
+
+        row.imp()
+            .mention_clicked_callback
+            .borrow()
+            .as_ref()
+            .expect("wire_post_row installs the mention route")("friend.bsky.social".into());
+        row.imp()
+            .profile_clicked_callback
+            .borrow()
+            .as_ref()
+            .expect("wire_post_row installs the profile route")(
+            a_post("wired").author.clone()
+        );
+
+        assert_eq!(*mentions.borrow(), vec!["friend.bsky.social".to_string()]);
+        assert_eq!(*profiles.borrow(), vec!["did:plc:test".to_string()]);
+
+        window.destroy();
     }
 
     /// Every click gesture on `widget`, as its propagation phase.
