@@ -310,6 +310,18 @@ pub struct ComposeData {
     pub threadgate: Option<ThreadgateConfig>,
     /// Postgate: quote controls. `None` means quoting allowed (no postgate record).
     pub postgate: Option<PostgateConfig>,
+    /// A processed video, exclusive with images. The upload already
+    /// happened at attach time; this is the finished blob.
+    pub video: Option<VideoAttachment>,
+}
+
+/// A video the service finished processing, ready to embed.
+#[derive(Debug, Clone)]
+pub struct VideoAttachment {
+    /// The blob reference as record-ready JSON.
+    pub blob: serde_json::Value,
+    pub alt_text: String,
+    pub aspect_ratio: Option<(u32, u32)>,
 }
 
 /// An image the user wants to attach to a post.

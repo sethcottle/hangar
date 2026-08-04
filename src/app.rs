@@ -1288,6 +1288,77 @@ impl HangarApplication {
         });
     }
 
+    /// Give a compose dialog its video upload flow. The dialog hands
+    /// over bytes at attach time; state comes back through its video_*
+    /// methods, addressed by token so slot shuffles cannot misroute it.
+    fn setup_video_upload(&self, dialog: &ComposeDialog) {
+        let app = self.clone();
+        let dialog_weak = dialog.downgrade();
+        dialog.set_video_upload_callback(move |token, data, mime, sent| {
+            enum Msg {
+                Event(crate::atproto::client::VideoUploadEvent),
+                Done(serde_json::Value),
+                Failed(String),
+            }
+
+            let (tx, rx) = std::sync::mpsc::channel::<Msg>();
+            let client = app.client();
+            let progress_tx = tx.clone();
+            thread::spawn(move || {
+                let result = runtime::block_on(async {
+                    client
+                        .upload_video(data, &mime, sent, |event| {
+                            let _ = progress_tx.send(Msg::Event(event));
+                        })
+                        .await
+                });
+                let _ = tx.send(match result {
+                    Ok(blob) => Msg::Done(blob),
+                    Err(e) => Msg::Failed(e.to_string()),
+                });
+            });
+
+            let app = app.clone();
+            let dialog_weak = dialog_weak.clone();
+            glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+                let Some(dialog) = dialog_weak.upgrade() else {
+                    return glib::ControlFlow::Break;
+                };
+                loop {
+                    match rx.try_recv() {
+                        Ok(Msg::Event(event)) => {
+                            use crate::atproto::client::VideoUploadEvent;
+                            match event {
+                                VideoUploadEvent::UploadDone => {
+                                    dialog.video_processing(token, None)
+                                }
+                                VideoUploadEvent::Processing(pct) => {
+                                    dialog.video_processing(token, pct)
+                                }
+                            }
+                        }
+                        Ok(Msg::Done(blob)) => {
+                            dialog.video_ready(token, blob);
+                            return glib::ControlFlow::Break;
+                        }
+                        Ok(Msg::Failed(e)) => {
+                            eprintln!("Video upload failed: {}", e);
+                            app.report_session_expiry();
+                            dialog.video_failed(token, &e);
+                            return glib::ControlFlow::Break;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            return glib::ControlFlow::Continue;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            return glib::ControlFlow::Break;
+                        }
+                    }
+                }
+            });
+        });
+    }
+
     fn setup_mention_search(&self, dialog: &ComposeDialog) {
         let client = self.client();
         let dialog_weak = dialog.downgrade();
@@ -1427,6 +1498,7 @@ impl HangarApplication {
         });
 
         self.setup_mention_search(&dialog);
+        self.setup_video_upload(&dialog);
         self.setup_link_card_fetch(&dialog);
         dialog.present(Some(&window));
         dialog.focus_composer();
@@ -1563,6 +1635,7 @@ impl HangarApplication {
         });
 
         self.setup_mention_search(&dialog);
+        self.setup_video_upload(&dialog);
         self.setup_link_card_fetch(&dialog);
         dialog.present(Some(&window));
         dialog.focus_composer();
@@ -1684,6 +1757,7 @@ impl HangarApplication {
         });
 
         self.setup_mention_search(&dialog);
+        self.setup_video_upload(&dialog);
         self.setup_link_card_fetch(&dialog);
         dialog.present(Some(&window));
         dialog.focus_composer();

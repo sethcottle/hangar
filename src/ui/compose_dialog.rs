@@ -163,12 +163,55 @@ pub struct ComposeImage {
     pub texture: gdk::Texture,
 }
 
+/// Where a composed video stands. The post waits for Ready.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VideoUploadState {
+    Uploading,
+    Processing,
+    Ready,
+    Failed,
+}
+
+/// What a picked file turns into.
+enum MediaKind {
+    Image,
+    Video(&'static str),
+}
+
+/// The video-related reasons a post cannot go yet.
+#[derive(Default)]
+struct VideoGate {
+    pending: bool,
+    failed: bool,
+    alt_missing: bool,
+}
+
+/// A video being composed. The upload starts the moment it attaches and
+/// the tile follows it to Ready or Failed. The token names it across the
+/// upload's lifetime; slots can shift while thread posts come and go.
+pub struct ComposeVideo {
+    pub token: u64,
+    pub mime_type: String,
+    pub file_name: String,
+    pub alt_text: String,
+    pub total_bytes: u64,
+    pub sent_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    pub state: VideoUploadState,
+    pub blob: Option<serde_json::Value>,
+    pub aspect_ratio: Option<(u32, u32)>,
+    /// Tile widgets, created once so the progress timer always has the
+    /// live ones no matter how often the strip rebuilds.
+    pub progress_icon: crate::ui::progress_icon::ProgressIcon,
+    pub status_label: gtk4::Label,
+}
+
 /// A single post block in the thread composer (Post 2, 3, etc.)
 pub struct ThreadPostBlock {
     pub container: gtk4::Box,
     pub text_view: gtk4::TextView,
     pub image_strip: gtk4::Box,
     pub images: Vec<ComposeImage>,
+    pub video: Option<ComposeVideo>,
     pub char_counter: gtk4::Label,
     /// Per-post content warning (each post can have its own CW)
     pub content_warning: Option<String>,
@@ -219,6 +262,21 @@ mod imp {
         /// every image while set.
         pub require_alt_text: Cell<bool>,
         pub add_image_button: RefCell<Option<gtk4::Button>>,
+        // Video attachment (main post; thread posts carry theirs in the block)
+        pub video: RefCell<Option<ComposeVideo>>,
+        pub video_token_counter: Cell<u64>,
+        /// Hands (token, bytes, mime, sent-counter) to the app, which owns
+        /// the network side and reports back through the video_* methods.
+        pub video_upload_callback: RefCell<
+            Option<
+                Box<
+                    dyn Fn(u64, Vec<u8>, String, std::sync::Arc<std::sync::atomic::AtomicU64>)
+                        + 'static,
+                >,
+            >,
+        >,
+        /// MediaFiles probing freshly attached videos for their pixel size.
+        pub video_probes: RefCell<Vec<gtk4::MediaFile>>,
         pub remove_all_images_button: RefCell<Option<gtk4::Button>>,
         // Language selection
         pub language_button: RefCell<Option<gtk4::Button>>,
@@ -894,22 +952,68 @@ impl ComposeDialog {
             }
         }
 
-        // Disable Post button when over limit or empty (unless images are attached)
-        let has_images = !imp.images.borrow().is_empty();
+        // Disable Post button when over limit or empty (unless media is attached)
+        let has_media = !imp.images.borrow().is_empty() || imp.video.borrow().is_some();
+        let gate = self.video_gate();
         // The setting turns a missing description into a hard stop.
         let alt_ok = !imp.require_alt_text.get()
-            || imp
+            || (imp
                 .images
                 .borrow()
                 .iter()
-                .all(|img| !img.alt_text.is_empty());
+                .all(|img| !img.alt_text.is_empty())
+                && !gate.alt_missing);
         if let Some(btn) = imp.post_button.borrow().as_ref() {
-            btn.set_sensitive((grapheme_count > 0 || has_images) && remaining >= 0 && alt_ok);
-            btn.set_tooltip_text(if alt_ok {
-                None
-            } else {
-                Some("Describe your images before posting")
-            });
+            btn.set_sensitive(
+                (grapheme_count > 0 || has_media)
+                    && remaining >= 0
+                    && alt_ok
+                    && !gate.pending
+                    && !gate.failed,
+            );
+            btn.set_tooltip_text(Self::media_gate_tooltip(alt_ok, &gate));
+        }
+    }
+
+    /// Video terms every post gate needs, across the main post and the
+    /// whole thread.
+    fn video_gate(&self) -> VideoGate {
+        let imp = self.imp();
+        let mut gate = VideoGate::default();
+        let mut tally = |video: &ComposeVideo| {
+            match video.state {
+                VideoUploadState::Uploading | VideoUploadState::Processing => {
+                    gate.pending = true;
+                }
+                VideoUploadState::Failed => gate.failed = true,
+                VideoUploadState::Ready => {}
+            }
+            if video.alt_text.is_empty() {
+                gate.alt_missing = true;
+            }
+        };
+        if let Some(v) = imp.video.borrow().as_ref() {
+            tally(v);
+        }
+        for block in imp.thread_posts.borrow().iter() {
+            if let Some(v) = block.video.as_ref() {
+                tally(v);
+            }
+        }
+        gate
+    }
+
+    /// Why the Post button is off, for its tooltip. Order matters: a
+    /// failure beats waiting beats missing descriptions.
+    fn media_gate_tooltip(alt_ok: bool, gate: &VideoGate) -> Option<&'static str> {
+        if gate.failed {
+            Some("Remove the failed video to post")
+        } else if gate.pending {
+            Some("The video is still uploading")
+        } else if !alt_ok {
+            Some("Describe your media before posting")
+        } else {
+            None
         }
     }
 
@@ -1306,16 +1410,50 @@ impl ComposeDialog {
             return;
         }
 
+        if self.imp().video.borrow().is_some() {
+            return;
+        }
+
+        self.choose_image(
+            Self::media_filter(),
+            |dialog, path| match Self::media_kind_for_path(path) {
+                MediaKind::Video(mime) => dialog.load_video_from_path(None, path, mime),
+                MediaKind::Image => dialog.load_image_from_path(path),
+            },
+        );
+    }
+
+    /// One filter for everything a post can carry: still images, videos,
+    /// and GIFs, which upload through the video service and stay animated.
+    fn media_filter() -> gtk4::FileFilter {
         let filter = gtk4::FileFilter::new();
-        filter.set_name(Some("Images"));
+        filter.set_name(Some("Images and videos"));
         filter.add_mime_type("image/jpeg");
         filter.add_mime_type("image/png");
-        filter.add_mime_type("image/gif");
         filter.add_mime_type("image/webp");
+        filter.add_mime_type("image/gif");
+        filter.add_mime_type("video/mp4");
+        filter.add_mime_type("video/webm");
+        filter.add_mime_type("video/quicktime");
+        filter.add_mime_type("video/mpeg");
+        filter
+    }
 
-        self.choose_image(filter, |dialog, path| {
-            dialog.load_image_from_path(path);
-        });
+    /// Which pipeline a picked file belongs to, by extension. GIFs count
+    /// as video: uploaded as an image blob they would freeze to a still.
+    fn media_kind_for_path(path: &std::path::Path) -> MediaKind {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_lowercase());
+        match ext.as_deref() {
+            Some("mp4") | Some("m4v") => MediaKind::Video("video/mp4"),
+            Some("webm") => MediaKind::Video("video/webm"),
+            Some("mov") => MediaKind::Video("video/quicktime"),
+            Some("mpeg") | Some("mpg") => MediaKind::Video("video/mpeg"),
+            Some("gif") => MediaKind::Video("image/gif"),
+            _ => MediaKind::Image,
+        }
     }
 
     /// Present the image picker and hand the chosen path to `on_chosen`.
@@ -1521,7 +1659,11 @@ impl ComposeDialog {
             strip.append(&thumb_box);
         }
 
-        strip.set_visible(has_images);
+        let has_video = imp.video.borrow().is_some();
+        if let Some(video) = imp.video.borrow().as_ref() {
+            strip.append(&self.build_video_tile(video, None));
+        }
+        strip.set_visible(has_images || has_video);
     }
 
     /// Remove a specific image by index.
@@ -1567,19 +1709,26 @@ impl ComposeDialog {
         let imp = self.imp();
         let count = imp.images.borrow().len();
         let at_max = count >= MAX_IMAGES;
-        let has_images = count > 0;
+        let has_video = imp.video.borrow().is_some();
+        let has_images = count > 0 || has_video;
 
         if let Some(btn) = imp.add_image_button.borrow().as_ref() {
-            btn.set_sensitive(!at_max);
-            btn.update_property(&[gtk4::accessible::Property::Label(&format!(
-                "Attach image, {} of {} attached",
-                count, MAX_IMAGES
-            ))]);
+            btn.set_sensitive(!at_max && !has_video);
+            btn.set_tooltip_text(Some(if has_video {
+                "One video per post"
+            } else {
+                "Attach media"
+            }));
+            btn.update_property(&[gtk4::accessible::Property::Label(&if has_video {
+                "Attach media, a video is attached".to_string()
+            } else {
+                format!("Attach media, {} of {} images attached", count, MAX_IMAGES)
+            })]);
         }
 
-        // Show/hide the action row (CW + Remove All) based on whether images are attached
+        // Show/hide the action row (CW + Remove All) based on whether media is attached
         if let Some(btn) = imp.remove_all_images_button.borrow().as_ref() {
-            btn.set_visible(has_images);
+            btn.set_visible(count > 0);
             // Show/hide the parent action row
             if let Some(parent) = btn.parent() {
                 parent.set_visible(has_images);
@@ -1722,6 +1871,548 @@ impl ComposeDialog {
         if let Some(win) = window.as_ref() {
             alt_dialog.present(Some(win));
         }
+    }
+
+    // ─── Video attachment methods ───
+
+    /// The app installs the upload flow here; the dialog reports state
+    /// back through the `video_*` methods, addressed by token.
+    pub fn set_video_upload_callback<
+        F: Fn(u64, Vec<u8>, String, std::sync::Arc<std::sync::atomic::AtomicU64>) + 'static,
+    >(
+        &self,
+        callback: F,
+    ) {
+        self.imp()
+            .video_upload_callback
+            .replace(Some(Box::new(callback)));
+    }
+
+    /// Read a picked video file and attach it to `slot` (None = main post).
+    fn load_video_from_path(
+        &self,
+        slot: Option<usize>,
+        path: &std::path::Path,
+        mime: &'static str,
+    ) {
+        let data = match std::fs::read(path) {
+            Ok(d) => d,
+            Err(e) => {
+                self.flash_compose_error(&format!("Couldn't read the file: {e}"));
+                return;
+            }
+        };
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("video")
+            .to_string();
+        self.attach_video_bytes(slot, data, mime.to_string(), file_name);
+        self.probe_video_aspect(path);
+    }
+
+    /// Attach video bytes to a slot and start the upload. Split from the
+    /// path reading so tests can feed bytes directly.
+    pub(crate) fn attach_video_bytes(
+        &self,
+        slot: Option<usize>,
+        data: Vec<u8>,
+        mime_type: String,
+        file_name: String,
+    ) {
+        let imp = self.imp();
+
+        // One video, and never beside images.
+        let (occupied, has_images) = match slot {
+            None => (
+                imp.video.borrow().is_some(),
+                !imp.images.borrow().is_empty(),
+            ),
+            Some(i) => {
+                let posts = imp.thread_posts.borrow();
+                match posts.get(i) {
+                    Some(b) => (b.video.is_some(), !b.images.is_empty()),
+                    None => return,
+                }
+            }
+        };
+        if occupied {
+            self.flash_compose_error("One video per post.");
+            return;
+        }
+        if has_images {
+            self.flash_compose_error("A post can hold images or a video, not both.");
+            return;
+        }
+
+        let token = imp.video_token_counter.get();
+        imp.video_token_counter.set(token + 1);
+        let sent_bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        let status_label = gtk4::Label::new(Some("Uploading\u{2026}"));
+        status_label.add_css_class("caption");
+        status_label.add_css_class("dim-label");
+        status_label.set_halign(gtk4::Align::Start);
+
+        let video = ComposeVideo {
+            token,
+            mime_type: mime_type.clone(),
+            file_name,
+            alt_text: String::new(),
+            total_bytes: data.len() as u64,
+            sent_bytes: sent_bytes.clone(),
+            state: VideoUploadState::Uploading,
+            blob: None,
+            aspect_ratio: None,
+            progress_icon: crate::ui::progress_icon::ProgressIcon::new(),
+            status_label,
+        };
+
+        match slot {
+            None => {
+                imp.video.replace(Some(video));
+                self.rebuild_image_strip();
+                self.update_image_button_state();
+                // Video outranks a link card, same as images.
+                self.clear_link_preview();
+            }
+            Some(i) => {
+                if let Some(block) = imp.thread_posts.borrow_mut().get_mut(i) {
+                    block.video = Some(video);
+                }
+                self.rebuild_thread_image_strip(i);
+            }
+        }
+        self.refresh_post_gates();
+
+        // With the setting on, attaching goes straight to describing.
+        if imp.require_alt_text.get() {
+            self.show_video_alt_dialog(token);
+        }
+
+        // Hand the bytes to the app and follow the counter while they go.
+        if let Some(cb) = imp.video_upload_callback.borrow().as_ref() {
+            cb(token, data, mime_type, sent_bytes);
+        }
+        self.start_video_progress_timer(token);
+    }
+
+    /// Tick the pie while bytes stream. Ends itself once the state moves
+    /// past Uploading or the video is gone.
+    fn start_video_progress_timer(&self, token: u64) {
+        let dialog_weak = self.downgrade();
+        glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+            let Some(dialog) = dialog_weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            let mut keep = glib::ControlFlow::Break;
+            dialog.with_video(token, |video| {
+                if video.state == VideoUploadState::Uploading {
+                    let sent = video.sent_bytes.load(std::sync::atomic::Ordering::Relaxed);
+                    let fraction = sent as f64 / video.total_bytes.max(1) as f64;
+                    video.progress_icon.set_fraction(fraction);
+                    video
+                        .status_label
+                        .set_text(&format!("Uploading {}%", (fraction * 100.0) as u32));
+                    keep = glib::ControlFlow::Continue;
+                }
+            });
+            keep
+        });
+    }
+
+    /// Run `f` on the video with this token, wherever it sits.
+    fn with_video(&self, token: u64, f: impl FnOnce(&mut ComposeVideo)) -> bool {
+        let imp = self.imp();
+        {
+            let mut video = imp.video.borrow_mut();
+            if let Some(v) = video.as_mut()
+                && v.token == token
+            {
+                f(v);
+                return true;
+            }
+        }
+        let mut posts = imp.thread_posts.borrow_mut();
+        for block in posts.iter_mut() {
+            if let Some(v) = block.video.as_mut()
+                && v.token == token
+            {
+                f(v);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The strip owning this token: None = main, Some(i) = thread post i.
+    fn video_slot(&self, token: u64) -> Option<Option<usize>> {
+        let imp = self.imp();
+        if imp
+            .video
+            .borrow()
+            .as_ref()
+            .is_some_and(|v| v.token == token)
+        {
+            return Some(None);
+        }
+        let posts = imp.thread_posts.borrow();
+        posts
+            .iter()
+            .position(|b| b.video.as_ref().is_some_and(|v| v.token == token))
+            .map(Some)
+    }
+
+    /// The service took the bytes and is transcoding.
+    pub fn video_processing(&self, token: u64, percent: Option<u8>) {
+        self.with_video(token, |video| {
+            video.state = VideoUploadState::Processing;
+            match percent {
+                Some(p) => {
+                    video.progress_icon.set_fraction(f64::from(p) / 100.0);
+                    video.status_label.set_text(&format!("Processing {p}%"));
+                }
+                None => {
+                    video.progress_icon.set_fraction(1.0);
+                    video.status_label.set_text("Processing\u{2026}");
+                }
+            }
+        });
+        self.refresh_post_gates();
+    }
+
+    /// The processed blob is in hand; the post can go.
+    pub fn video_ready(&self, token: u64, blob: serde_json::Value) {
+        let found = self.with_video(token, |video| {
+            video.state = VideoUploadState::Ready;
+            video.blob = Some(blob);
+        });
+        if found && let Some(slot) = self.video_slot(token) {
+            match slot {
+                None => self.rebuild_image_strip(),
+                Some(i) => self.rebuild_thread_image_strip(i),
+            }
+        }
+        self.refresh_post_gates();
+    }
+
+    /// The upload or processing failed; the tile says so and the post
+    /// stays blocked until the tile is removed.
+    pub fn video_failed(&self, token: u64, message: &str) {
+        let found = self.with_video(token, |video| {
+            video.state = VideoUploadState::Failed;
+        });
+        if found && let Some(slot) = self.video_slot(token) {
+            match slot {
+                None => self.rebuild_image_strip(),
+                Some(i) => self.rebuild_thread_image_strip(i),
+            }
+        }
+        self.flash_compose_error(&format!("Video upload failed: {message}"));
+        self.refresh_post_gates();
+    }
+
+    /// Record the probed pixel size for the embed's aspect ratio.
+    fn set_video_aspect(&self, token: u64, width: u32, height: u32) {
+        self.with_video(token, |video| {
+            video.aspect_ratio = Some((width, height));
+        });
+    }
+
+    /// Load the file into a muted MediaFile long enough to learn its
+    /// pixel size. Videos GStreamer cannot read just skip the ratio.
+    fn probe_video_aspect(&self, path: &std::path::Path) {
+        let imp = self.imp();
+        let token = imp.video_token_counter.get().saturating_sub(1);
+        let media = gtk4::MediaFile::for_filename(path);
+        media.set_muted(true);
+        let dialog_weak = self.downgrade();
+        media.connect_notify_local(Some("prerolled"), move |media, _| {
+            let Some(dialog) = dialog_weak.upgrade() else {
+                return;
+            };
+            let width = gdk::prelude::PaintableExt::intrinsic_width(media);
+            let height = gdk::prelude::PaintableExt::intrinsic_height(media);
+            if width > 0 && height > 0 {
+                dialog.set_video_aspect(token, width as u32, height as u32);
+            }
+            media.pause();
+            dialog.drop_video_probe(media);
+        });
+        let dialog_weak = self.downgrade();
+        media.connect_notify_local(Some("error"), move |media, _| {
+            if let Some(dialog) = dialog_weak.upgrade() {
+                dialog.drop_video_probe(media);
+            }
+        });
+        media.play();
+        imp.video_probes.borrow_mut().push(media);
+    }
+
+    fn drop_video_probe(&self, media: &gtk4::MediaFile) {
+        self.imp().video_probes.borrow_mut().retain(|m| m != media);
+    }
+
+    /// Remove the video in `slot`, upload and all. A late result for its
+    /// token finds nothing and falls away.
+    fn remove_video(&self, slot: Option<usize>) {
+        let imp = self.imp();
+        match slot {
+            None => {
+                imp.video.replace(None);
+                self.rebuild_image_strip();
+                self.update_image_button_state();
+                if let Some(tv) = imp.text_view.borrow().as_ref() {
+                    self.check_for_link_card(&tv.buffer());
+                }
+            }
+            Some(i) => {
+                if let Some(block) = imp.thread_posts.borrow_mut().get_mut(i) {
+                    block.video = None;
+                }
+                self.rebuild_thread_image_strip(i);
+            }
+        }
+        self.refresh_post_gates();
+    }
+
+    /// Build the tile a strip shows for its video.
+    fn build_video_tile(&self, video: &ComposeVideo, slot: Option<usize>) -> gtk4::Overlay {
+        let tile = gtk4::Overlay::new();
+        tile.set_size_request(200, 80);
+        tile.add_css_class("compose-thumbnail");
+
+        let inner = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+        inner.set_margin_top(10);
+        inner.set_margin_bottom(10);
+        inner.set_margin_start(10);
+        inner.set_margin_end(10);
+        inner.set_valign(gtk4::Align::Center);
+
+        let name_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+        let icon_name = if video.mime_type == "image/gif" {
+            "image-x-generic-symbolic"
+        } else {
+            "video-x-generic-symbolic"
+        };
+        name_row.append(&gtk4::Image::from_icon_name(icon_name));
+        let name = gtk4::Label::new(Some(&video.file_name));
+        name.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
+        name.set_max_width_chars(18);
+        name.add_css_class("caption-heading");
+        name_row.append(&name);
+        inner.append(&name_row);
+
+        let status_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+        // The stored widgets move between rebuilds; unhook them first.
+        for widget in [
+            video.progress_icon.clone().upcast::<gtk4::Widget>(),
+            video.status_label.clone().upcast::<gtk4::Widget>(),
+        ] {
+            if let Some(parent) = widget.parent()
+                && let Some(parent) = parent.downcast_ref::<gtk4::Box>()
+            {
+                parent.remove(&widget);
+            }
+        }
+        status_row.append(&video.progress_icon);
+        status_row.append(&video.status_label);
+        match video.state {
+            VideoUploadState::Ready => {
+                video.progress_icon.set_visible(false);
+                video.status_label.set_text("Ready");
+            }
+            VideoUploadState::Failed => {
+                video.progress_icon.set_visible(false);
+                video.status_label.set_text("Upload failed");
+                video.status_label.remove_css_class("dim-label");
+                video.status_label.add_css_class("error");
+            }
+            _ => video.progress_icon.set_visible(true),
+        }
+        inner.append(&status_row);
+        tile.set_child(Some(&inner));
+
+        // Remove button, top-right like the image tiles.
+        let remove_btn = gtk4::Button::from_icon_name("window-close-symbolic");
+        remove_btn.add_css_class("circular");
+        remove_btn.add_css_class("osd");
+        remove_btn.set_halign(gtk4::Align::End);
+        remove_btn.set_valign(gtk4::Align::Start);
+        remove_btn.set_margin_top(4);
+        remove_btn.set_margin_end(4);
+        remove_btn.set_tooltip_text(Some("Remove video"));
+        remove_btn.update_property(&[gtk4::accessible::Property::Label("Remove video")]);
+        let dialog_weak = self.downgrade();
+        remove_btn.connect_clicked(move |_| {
+            if let Some(dialog) = dialog_weak.upgrade() {
+                dialog.remove_video(slot);
+            }
+        });
+        tile.add_overlay(&remove_btn);
+
+        // ALT badge once described, click to describe; both as on images.
+        if !video.alt_text.is_empty() {
+            let alt_badge = gtk4::Label::new(Some("ALT"));
+            alt_badge.add_css_class("compose-alt-badge");
+            alt_badge.add_css_class("osd");
+            alt_badge.set_halign(gtk4::Align::Start);
+            alt_badge.set_valign(gtk4::Align::End);
+            alt_badge.set_margin_bottom(4);
+            alt_badge.set_margin_start(4);
+            alt_badge.update_property(&[gtk4::accessible::Property::Label("Alt text provided")]);
+            tile.add_overlay(&alt_badge);
+        }
+
+        let click = gtk4::GestureClick::new();
+        let dialog_weak = self.downgrade();
+        let token = video.token;
+        click.connect_released(move |gesture, _, _, _| {
+            gesture.set_state(gtk4::EventSequenceState::Claimed);
+            if let Some(dialog) = dialog_weak.upgrade() {
+                dialog.show_video_alt_dialog(token);
+            }
+        });
+        inner.add_controller(click);
+
+        let alt_desc = if video.alt_text.is_empty() {
+            "No alt text".to_string()
+        } else {
+            format!("Alt text: {}", video.alt_text)
+        };
+        tile.update_property(&[gtk4::accessible::Property::Label(&format!(
+            "Video {}. {}. Click to edit alt text.",
+            video.file_name, alt_desc
+        ))]);
+
+        tile
+    }
+
+    /// The describe dialog for a video, mirroring the image one.
+    fn show_video_alt_dialog(&self, token: u64) {
+        let mut current = None;
+        self.with_video(token, |video| {
+            current = Some(video.alt_text.clone());
+        });
+        let Some(current_alt) = current else {
+            return;
+        };
+
+        let alt_dialog = adw::Dialog::new();
+        alt_dialog.set_title("Add Descriptive Text");
+        alt_dialog.set_content_width(360);
+
+        let header = adw::HeaderBar::new();
+        header.set_show_start_title_buttons(false);
+        header.set_show_end_title_buttons(false);
+        let done_btn = gtk4::Button::with_label("Done");
+        done_btn.add_css_class("suggested-action");
+        header.pack_end(&done_btn);
+
+        let toolbar = adw::ToolbarView::new();
+        toolbar.add_top_bar(&header);
+
+        let content = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+        content.set_margin_start(24);
+        content.set_margin_end(24);
+        content.set_margin_top(12);
+        content.set_margin_bottom(24);
+
+        let desc_label = gtk4::Label::new(Some(
+            "Help the blind and vision impaired to understand your posts by adding descriptive text to your videos.",
+        ));
+        desc_label.set_wrap(true);
+        desc_label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+        desc_label.set_halign(gtk4::Align::Start);
+        desc_label.add_css_class("dim-label");
+        content.append(&desc_label);
+
+        let label = gtk4::Label::new(Some("Describe this video"));
+        label.set_halign(gtk4::Align::Start);
+        label.add_css_class("heading");
+        content.append(&label);
+
+        let text_view = gtk4::TextView::new();
+        text_view.set_wrap_mode(gtk4::WrapMode::WordChar);
+        text_view.set_vexpand(true);
+        text_view.set_left_margin(8);
+        text_view.set_right_margin(8);
+        text_view.set_top_margin(8);
+        text_view.set_bottom_margin(8);
+        text_view.add_css_class("card");
+        text_view.update_property(&[gtk4::accessible::Property::Label("Video description")]);
+        if !current_alt.is_empty() {
+            text_view.buffer().set_text(&current_alt);
+        }
+
+        let scrolled = gtk4::ScrolledWindow::new();
+        scrolled.set_vexpand(true);
+        scrolled.set_child(Some(&text_view));
+        content.append(&scrolled);
+
+        toolbar.set_content(Some(&content));
+        alt_dialog.set_child(Some(&toolbar));
+
+        let dialog_weak = self.downgrade();
+        let alt_dialog_weak = alt_dialog.downgrade();
+        let text_view_for_done = text_view.clone();
+        done_btn.connect_clicked(move |_| {
+            let buffer = text_view_for_done.buffer();
+            let alt_text = buffer
+                .text(&buffer.start_iter(), &buffer.end_iter(), false)
+                .to_string()
+                .trim()
+                .to_string();
+            if let Some(dialog) = dialog_weak.upgrade() {
+                dialog.with_video(token, |video| {
+                    video.alt_text = alt_text;
+                });
+                if let Some(slot) = dialog.video_slot(token) {
+                    match slot {
+                        None => dialog.rebuild_image_strip(),
+                        Some(i) => dialog.rebuild_thread_image_strip(i),
+                    }
+                }
+                dialog.refresh_post_gates();
+            }
+            if let Some(alt_dlg) = alt_dialog_weak.upgrade() {
+                alt_dlg.close();
+            }
+        });
+
+        let window = self.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
+        if let Some(win) = window.as_ref() {
+            alt_dialog.present(Some(win));
+        }
+    }
+
+    /// Re-run whichever post gate applies right now.
+    fn refresh_post_gates(&self) {
+        if self.imp().thread_posts.borrow().is_empty() {
+            if let Some(tv) = self.imp().text_view.borrow().as_ref() {
+                self.update_char_counter(&tv.buffer());
+            }
+        } else {
+            self.update_thread_post_button_state();
+        }
+    }
+
+    /// Show a short-lived error line under the composer.
+    fn flash_compose_error(&self, message: &str) {
+        let Some(label) = self.imp().error_label.borrow().clone() else {
+            return;
+        };
+        label.set_text(message);
+        label.set_visible(true);
+        let label_weak = label.downgrade();
+        let shown = message.to_string();
+        glib::timeout_add_local_once(std::time::Duration::from_secs(6), move || {
+            if let Some(label) = label_weak.upgrade()
+                && label.text() == shown
+            {
+                label.set_visible(false);
+            }
+        });
     }
 
     // ─── Language picker ───
@@ -2362,6 +3053,7 @@ impl ComposeDialog {
             text_view,
             image_strip,
             images: Vec::new(),
+            video: None,
             char_counter,
             content_warning: None,
             cw_button,
@@ -2514,8 +3206,8 @@ impl ComposeDialog {
                     buffer.text(&start, &end, false).to_string()
                 };
                 let count = text.graphemes(true).count() as i32;
-                let has_images = !imp.images.borrow().is_empty();
-                (count > 0 || has_images) && count <= MAX_GRAPHEMES
+                let has_media = !imp.images.borrow().is_empty() || imp.video.borrow().is_some();
+                (count > 0 || has_media) && count <= MAX_GRAPHEMES
             })
             .unwrap_or(false);
 
@@ -2528,11 +3220,12 @@ impl ComposeDialog {
                 buffer.text(&start, &end, false).to_string()
             };
             let count = text.graphemes(true).count() as i32;
-            let has_images = !block.images.is_empty();
-            (count > 0 || has_images) && count <= MAX_GRAPHEMES
+            let has_media = !block.images.is_empty() || block.video.is_some();
+            (count > 0 || has_media) && count <= MAX_GRAPHEMES
         });
 
         // The require-alt gate covers every post in the thread.
+        let gate = self.video_gate();
         let alt_ok = !imp.require_alt_text.get()
             || (imp
                 .images
@@ -2543,15 +3236,12 @@ impl ComposeDialog {
                     .thread_posts
                     .borrow()
                     .iter()
-                    .all(|block| block.images.iter().all(|img| !img.alt_text.is_empty())));
+                    .all(|block| block.images.iter().all(|img| !img.alt_text.is_empty()))
+                && !gate.alt_missing);
 
         if let Some(btn) = imp.post_button.borrow().as_ref() {
-            btn.set_sensitive(main_ok && thread_ok && alt_ok);
-            btn.set_tooltip_text(if alt_ok {
-                None
-            } else {
-                Some("Describe your images before posting")
-            });
+            btn.set_sensitive(main_ok && thread_ok && alt_ok && !gate.pending && !gate.failed);
+            btn.set_tooltip_text(Self::media_gate_tooltip(alt_ok, &gate));
         }
     }
 
@@ -2568,16 +3258,24 @@ impl ComposeDialog {
             return;
         }
 
-        let filter = gtk4::FileFilter::new();
-        filter.set_name(Some("Images"));
-        filter.add_mime_type("image/jpeg");
-        filter.add_mime_type("image/png");
-        filter.add_mime_type("image/gif");
-        filter.add_mime_type("image/webp");
+        let has_video = {
+            let posts = self.imp().thread_posts.borrow();
+            posts
+                .get(post_index)
+                .map(|b| b.video.is_some())
+                .unwrap_or(true)
+        };
+        if has_video {
+            return;
+        }
 
-        self.choose_image(filter, move |dialog, path| {
-            dialog.load_thread_image(post_index, path);
-        });
+        self.choose_image(
+            Self::media_filter(),
+            move |dialog, path| match Self::media_kind_for_path(path) {
+                MediaKind::Video(mime) => dialog.load_video_from_path(Some(post_index), path, mime),
+                MediaKind::Image => dialog.load_thread_image(post_index, path),
+            },
+        );
     }
 
     /// Load an image for a thread post.
@@ -2725,18 +3423,24 @@ impl ComposeDialog {
             block.image_strip.append(&thumb_box);
         }
 
-        block.image_strip.set_visible(has_images);
+        if let Some(video) = block.video.as_ref() {
+            block
+                .image_strip
+                .append(&self.build_video_tile(video, Some(post_index)));
+        }
+        let has_media = has_images || block.video.is_some();
+        block.image_strip.set_visible(has_media);
 
         // Show/hide the per-post action buttons (CW + Remove All)
-        block.cw_button.set_visible(has_images);
+        block.cw_button.set_visible(has_media);
         block.remove_all_button.set_visible(has_images);
         // The action row parent is visible when either button is visible
         if let Some(parent) = block.cw_button.parent() {
-            parent.set_visible(has_images);
+            parent.set_visible(has_media);
         }
 
         // Update CW button label based on current content warning
-        if has_images {
+        if has_media {
             if let Some(ref cw) = block.content_warning {
                 let display = match cw.as_str() {
                     "sexual" => "Suggestive",
@@ -2755,8 +3459,8 @@ impl ComposeDialog {
             }
         }
 
-        // Clear CW if all images removed
-        if !has_images {
+        // Clear CW once no media is left
+        if !has_media {
             // Need to drop borrow first, then re-borrow mutably
             drop(posts);
             let mut posts = imp.thread_posts.borrow_mut();
@@ -3269,8 +3973,10 @@ impl ComposeDialog {
         let threadgate = imp.threadgate_config.borrow().clone();
         let postgate = imp.postgate_config.borrow().clone();
 
-        // Link card, only when no images are attached (images take precedence)
-        let link_card = if images.is_empty() {
+        let video = Self::ready_video_attachment(imp.video.borrow().as_ref());
+
+        // Link card, only when no other media is attached (media wins)
+        let link_card = if images.is_empty() && video.is_none() {
             imp.link_card_data.borrow().clone()
         } else {
             None
@@ -3284,6 +3990,22 @@ impl ComposeDialog {
             link_card,
             threadgate,
             postgate,
+            video,
+        })
+    }
+
+    /// The embeddable form of a slot's video, once it is Ready.
+    fn ready_video_attachment(
+        video: Option<&ComposeVideo>,
+    ) -> Option<crate::atproto::VideoAttachment> {
+        let video = video?;
+        if video.state != VideoUploadState::Ready {
+            return None;
+        }
+        Some(crate::atproto::VideoAttachment {
+            blob: video.blob.clone()?,
+            alt_text: video.alt_text.clone(),
+            aspect_ratio: video.aspect_ratio,
         })
     }
 
@@ -3318,7 +4040,9 @@ impl ComposeDialog {
                     })
                     .collect();
 
-                if text.is_empty() && images.is_empty() {
+                let video = Self::ready_video_attachment(block.video.as_ref());
+
+                if text.is_empty() && images.is_empty() && video.is_none() {
                     return None;
                 }
 
@@ -3333,6 +4057,7 @@ impl ComposeDialog {
                     link_card: None,
                     threadgate: None, // only on root post
                     postgate: None,   // only on root post
+                    video,
                 })
             })
             .collect()
@@ -3513,5 +4238,119 @@ mod tests {
         imp.images.borrow_mut()[0].alt_text.clear();
         dialog.update_char_counter(&buffer);
         assert!(btn.is_sensitive(), "the gate only exists when asked for");
+    }
+
+    /// A video attaches, hands its bytes to the app, blocks the Post
+    /// button until the service is done, and lands in the compose data.
+    #[test]
+    fn a_video_upload_gates_the_post_button() {
+        crate::ui::with_gtk(a_video_upload_gates_the_post_button_body);
+    }
+
+    fn a_video_upload_gates_the_post_button_body() {
+        use std::cell::RefCell as StdRefCell;
+        use std::rc::Rc;
+
+        let dialog = ComposeDialog::new();
+        let imp = dialog.imp();
+        let requests: Rc<StdRefCell<Vec<(u64, usize, String)>>> = Rc::default();
+        let sink = Rc::clone(&requests);
+        dialog.set_video_upload_callback(move |token, data, mime, _sent| {
+            sink.borrow_mut().push((token, data.len(), mime));
+        });
+
+        let buffer = imp.text_view.borrow().as_ref().unwrap().buffer();
+        buffer.set_text("words to post");
+        let btn = imp.post_button.borrow().clone().unwrap();
+
+        dialog.attach_video_bytes(None, vec![7; 32], "video/mp4".into(), "clip.mp4".into());
+        assert_eq!(
+            *requests.borrow(),
+            vec![(0, 32, "video/mp4".to_string())],
+            "the bytes go straight to the app"
+        );
+        assert!(
+            !btn.is_sensitive(),
+            "an uploading video blocks posting even with text"
+        );
+        assert_eq!(
+            btn.tooltip_text().as_deref(),
+            Some("The video is still uploading")
+        );
+
+        dialog.video_processing(0, Some(40));
+        assert!(!btn.is_sensitive(), "processing still blocks");
+
+        // A second video has nowhere to go.
+        dialog.attach_video_bytes(None, vec![7; 8], "video/mp4".into(), "again.mp4".into());
+        assert_eq!(requests.borrow().len(), 1, "one video per post");
+
+        dialog.video_ready(0, serde_json::json!({ "$type": "blob" }));
+        assert!(btn.is_sensitive(), "a finished video frees the button");
+        let data = dialog.build_compose_data().expect("composable");
+        let video = data.video.expect("the video rides the compose data");
+        assert_eq!(video.blob["$type"], "blob");
+
+        // A failure blocks until the tile is removed.
+        dialog.with_video(0, |v| v.state = VideoUploadState::Failed);
+        dialog.refresh_post_gates();
+        assert!(!btn.is_sensitive());
+        assert_eq!(
+            btn.tooltip_text().as_deref(),
+            Some("Remove the failed video to post")
+        );
+        dialog.remove_video(None);
+        assert!(btn.is_sensitive(), "removing the failed video unblocks");
+        assert!(
+            dialog.build_compose_data().unwrap().video.is_none(),
+            "nothing left to embed"
+        );
+    }
+
+    /// A thread post's video gates the same button, lands in that post's
+    /// data, and honors the require-alt setting.
+    #[test]
+    fn a_thread_video_rides_its_own_post() {
+        crate::ui::with_gtk(a_thread_video_rides_its_own_post_body);
+    }
+
+    fn a_thread_video_rides_its_own_post_body() {
+        let dialog = ComposeDialog::new();
+        let imp = dialog.imp();
+        dialog.set_video_upload_callback(|_, _, _, _| {});
+
+        let buffer = imp.text_view.borrow().as_ref().unwrap().buffer();
+        buffer.set_text("first post");
+        dialog.add_thread_post();
+        imp.thread_posts.borrow()[0]
+            .text_view
+            .buffer()
+            .set_text("second post");
+
+        dialog.attach_video_bytes(Some(0), vec![1; 16], "image/gif".into(), "fun.gif".into());
+        let btn = imp.post_button.borrow().clone().unwrap();
+        dialog.update_thread_post_button_state();
+        assert!(!btn.is_sensitive(), "the thread waits for the upload");
+
+        dialog.video_ready(0, serde_json::json!({ "$type": "blob" }));
+        assert!(btn.is_sensitive());
+        let posts = dialog.build_thread_data();
+        assert_eq!(posts.len(), 1);
+        assert!(
+            posts[0].video.is_some(),
+            "the video belongs to its own post"
+        );
+
+        // The require-alt gate covers thread videos too.
+        imp.require_alt_text.set(true);
+        dialog.update_thread_post_button_state();
+        assert!(!btn.is_sensitive(), "an undescribed video blocks posting");
+        assert_eq!(
+            btn.tooltip_text().as_deref(),
+            Some("Describe your media before posting")
+        );
+        dialog.with_video(0, |v| v.alt_text = "a described video".into());
+        dialog.update_thread_post_button_state();
+        assert!(btn.is_sensitive(), "a description frees it");
     }
 }

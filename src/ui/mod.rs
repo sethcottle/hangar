@@ -11,6 +11,7 @@ mod login_dialog;
 pub mod media_viewer;
 mod message_page;
 pub mod post_row;
+pub mod progress_icon;
 #[cfg(test)]
 mod rebind_audit;
 pub mod report_dialog;

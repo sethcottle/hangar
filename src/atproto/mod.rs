@@ -10,7 +10,8 @@ pub use gif::GifEmbed;
 pub use types::{
     ChatMessage, ComposeData, Conversation, Embed, ExternalEmbed, ImageAttachment, ImageEmbed,
     LinkCardData, Notification, Post, PostgateConfig, Profile, QuoteEmbed, ReplyContext,
-    RepostReason, SavedFeed, Session, ThreadgateConfig, ThreadgateRule, VideoEmbed,
+    RepostReason, SavedFeed, Session, ThreadgateConfig, ThreadgateRule, VideoAttachment,
+    VideoEmbed,
 };
 // Only test fixtures build reactions by hand so far.
 #[cfg(test)]

@@ -8,6 +8,10 @@ use crate::atproto::types::{
     ReplyContext, RepostReason, SavedFeed, Session, ThreadgateConfig, ThreadgateRule, VideoEmbed,
 };
 use crate::config::DEFAULT_PDS;
+
+/// Bluesky's video processing service; uploads land here, not on the PDS.
+const VIDEO_SERVICE: &str = "https://video.bsky.app";
+const VIDEO_SERVICE_DID: &str = "did:web:video.bsky.app";
 use atrium_api::agent::atp_agent::AtpAgent;
 use atrium_api::agent::atp_agent::store::MemorySessionStore;
 use atrium_api::com::atproto::repo::{create_record, delete_record};
@@ -41,6 +45,16 @@ use atrium_api::agent::Agent as OAuthAgent;
 
 type CredentialAgent = AtpAgent<MemorySessionStore, ReqwestClient>;
 type OAuthAgentType = OAuthAgent<HangarOAuthSession>;
+
+/// What a video upload reports back while it runs. Byte progress moves
+/// through a shared counter instead; these are the state changes.
+#[derive(Debug)]
+pub enum VideoUploadEvent {
+    /// Every byte is on the wire; the service takes over.
+    UploadDone,
+    /// Transcoding, with a percentage when the service offers one.
+    Processing(Option<u8>),
+}
 
 /// What a moderation report points at.
 pub enum ReportSubject {
@@ -1288,6 +1302,251 @@ impl HangarClient {
         })
     }
 
+    /// Mint a service auth token from the PDS, bound to one method on one
+    /// audience, expiring `exp_in` seconds out.
+    #[allow(clippy::await_holding_lock)]
+    async fn service_auth_token(
+        &self,
+        aud: &str,
+        lxm: &str,
+        exp_in: i64,
+    ) -> Result<String, ClientError> {
+        with_agent!(self, agent => {
+        let aud = atrium_api::types::string::Did::new(aud.to_string())
+            .map_err(|e| ClientError::InvalidResponse(format!("bad service DID: {e}")))?;
+        let lxm = atrium_api::types::string::Nsid::new(lxm.to_string())
+            .map_err(|e| ClientError::InvalidResponse(format!("bad lxm: {e}")))?;
+        let params = atrium_api::com::atproto::server::get_service_auth::ParametersData {
+            aud,
+            exp: Some(chrono::Utc::now().timestamp() + exp_in),
+            lxm: Some(lxm),
+        };
+        let output = agent
+            .api
+            .com
+            .atproto
+            .server
+            .get_service_auth(params.into())
+            .await
+            .map_err(|e| self.xrpc_error(e))?;
+        Ok(output.data.token)
+        })
+    }
+
+    /// The signed-in user's DID document, straight from the server.
+    #[allow(clippy::await_holding_lock)]
+    async fn describe_repo_did_doc(&self, did: &str) -> Result<serde_json::Value, ClientError> {
+        with_agent!(self, agent => {
+        let repo = did
+            .parse::<atrium_api::types::string::AtIdentifier>()
+            .map_err(|e| ClientError::InvalidResponse(format!("bad DID: {e}")))?;
+        let params = atrium_api::com::atproto::repo::describe_repo::ParametersData { repo };
+        let output = agent
+            .api
+            .com
+            .atproto
+            .repo
+            .describe_repo(params.into())
+            .await
+            .map_err(|e| self.xrpc_error(e))?;
+        serde_json::to_value(&output.data.did_doc)
+            .map_err(|e| ClientError::InvalidResponse(e.to_string()))
+        })
+    }
+
+    /// The PDS hosting this DID document, named as a `did:web`. That is the
+    /// audience the video service needs its upload token bound to.
+    fn pds_did_from_doc(doc: &serde_json::Value) -> Option<String> {
+        let services = doc.get("service")?.as_array()?;
+        let pds = services.iter().find(|s| {
+            s.get("id").and_then(|i| i.as_str()) == Some("#atproto_pds")
+                || s.get("type").and_then(|t| t.as_str()) == Some("AtprotoPersonalDataServer")
+        })?;
+        let endpoint = pds.get("serviceEndpoint")?.as_str()?;
+        let host = endpoint
+            .strip_prefix("https://")
+            .or_else(|| endpoint.strip_prefix("http://"))?
+            .split('/')
+            .next()?;
+        // A port rides a did:web percent-encoded.
+        (!host.is_empty()).then(|| format!("did:web:{}", host.replace(':', "%3A")))
+    }
+
+    /// The file name extension the video service expects for a mime type.
+    fn video_file_ext(mime: &str) -> &'static str {
+        match mime {
+            "video/webm" => "webm",
+            "video/quicktime" => "mov",
+            "video/mpeg" => "mpeg",
+            "image/gif" => "gif",
+            _ => "mp4",
+        }
+    }
+
+    /// Read a job status out of a video service response body. The success
+    /// shape wraps it in `jobStatus`; the upload endpoint has been seen
+    /// answering bare; errors carry `error`/`message`.
+    fn parse_job_status(
+        body: &[u8],
+    ) -> Result<atrium_api::app::bsky::video::defs::JobStatus, String> {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Envelope {
+            job_status: atrium_api::app::bsky::video::defs::JobStatus,
+        }
+        if let Ok(env) = serde_json::from_slice::<Envelope>(body) {
+            return Ok(env.job_status);
+        }
+        if let Ok(job) =
+            serde_json::from_slice::<atrium_api::app::bsky::video::defs::JobStatus>(body)
+        {
+            return Ok(job);
+        }
+        #[derive(serde::Deserialize)]
+        struct ErrorBody {
+            error: Option<String>,
+            message: Option<String>,
+        }
+        match serde_json::from_slice::<ErrorBody>(body) {
+            Ok(e) => Err(e
+                .message
+                .or(e.error)
+                .unwrap_or_else(|| "unrecognized video service response".into())),
+            Err(_) => Err("unrecognized video service response".into()),
+        }
+    }
+
+    /// Upload a video (or GIF; the service converts those) and wait for
+    /// processing. Byte progress ticks through `sent_bytes` as the upload
+    /// streams; state changes arrive through `on_event`. Returns the
+    /// processed blob as record-ready JSON.
+    pub async fn upload_video(
+        &self,
+        data: Vec<u8>,
+        mime_type: &str,
+        sent_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        on_event: impl Fn(VideoUploadEvent) + Send,
+    ) -> Result<serde_json::Value, ClientError> {
+        let did = self.current_did().await?;
+        let net = |e: reqwest::Error| ClientError::Network(e.to_string());
+
+        // The upload token's audience is the user's own PDS; the service
+        // passes the finished blob through to it.
+        let doc = self.describe_repo_did_doc(&did).await?;
+        let pds_did = Self::pds_did_from_doc(&doc)
+            .ok_or_else(|| ClientError::InvalidResponse("no PDS in the DID document".into()))?;
+
+        let http = reqwest::Client::new();
+
+        // Ask about quota first; the refusal message beats a failed upload.
+        let limits_token = self
+            .service_auth_token(VIDEO_SERVICE_DID, "app.bsky.video.getUploadLimits", 60)
+            .await?;
+        let limits = http
+            .get(format!(
+                "{VIDEO_SERVICE}/xrpc/app.bsky.video.getUploadLimits"
+            ))
+            .bearer_auth(&limits_token)
+            .send()
+            .await
+            .map_err(net)?
+            .bytes()
+            .await
+            .map_err(net)?;
+        if let Ok(limits) = serde_json::from_slice::<
+            atrium_api::app::bsky::video::get_upload_limits::OutputData,
+        >(&limits)
+            && !limits.can_upload
+        {
+            return Err(ClientError::Network(limits.message.unwrap_or_else(|| {
+                "the video service is not taking uploads from this account right now".into()
+            })));
+        }
+
+        let upload_token = self
+            .service_auth_token(&pds_did, "com.atproto.repo.uploadBlob", 30 * 60)
+            .await?;
+        let name = format!(
+            "hangar-{}.{}",
+            chrono::Utc::now().timestamp_millis(),
+            Self::video_file_ext(mime_type)
+        );
+        let total = data.len();
+
+        // Stream in chunks so the counter tracks bytes as they leave.
+        let counter = sent_bytes;
+        let chunks: Vec<Vec<u8>> = data.chunks(256 * 1024).map(|c| c.to_vec()).collect();
+        let stream = futures_util::stream::iter(chunks.into_iter().map(move |c| {
+            counter.fetch_add(c.len() as u64, Ordering::Relaxed);
+            Ok::<Vec<u8>, std::io::Error>(c)
+        }));
+
+        let resp = http
+            .post(format!("{VIDEO_SERVICE}/xrpc/app.bsky.video.uploadVideo"))
+            .query(&[("did", did.as_str()), ("name", name.as_str())])
+            .bearer_auth(&upload_token)
+            .header("Content-Type", mime_type)
+            .header("Content-Length", total.to_string())
+            .body(reqwest::Body::wrap_stream(stream))
+            .send()
+            .await
+            .map_err(net)?;
+        let body = resp.bytes().await.map_err(net)?;
+        let mut job = Self::parse_job_status(&body).map_err(ClientError::Network)?;
+        on_event(VideoUploadEvent::UploadDone);
+
+        // Poll until the service settles. Ten minutes is far past any real
+        // processing time; hitting it means something is stuck.
+        let poll_token = self
+            .service_auth_token(VIDEO_SERVICE_DID, "app.bsky.video.getJobStatus", 30 * 60)
+            .await?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+        loop {
+            match job.state.as_str() {
+                "JOB_STATE_COMPLETED" => {
+                    let blob = job.data.blob.ok_or_else(|| {
+                        ClientError::InvalidResponse("completed job carries no blob".into())
+                    })?;
+                    return serde_json::to_value(&blob)
+                        .map_err(|e| ClientError::InvalidResponse(e.to_string()));
+                }
+                "JOB_STATE_FAILED" => {
+                    return Err(ClientError::Network(
+                        job.data
+                            .message
+                            .clone()
+                            .or(job.data.error.clone())
+                            .unwrap_or_else(|| "the video service rejected the video".into()),
+                    ));
+                }
+                _ => on_event(VideoUploadEvent::Processing(
+                    job.data.progress.map(u8::from),
+                )),
+            }
+            if std::time::Instant::now() > deadline {
+                return Err(ClientError::Network("video processing timed out".into()));
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            let body = http
+                .get(format!("{VIDEO_SERVICE}/xrpc/app.bsky.video.getJobStatus"))
+                .query(&[("jobId", job.data.job_id.as_str())])
+                .bearer_auth(&poll_token)
+                .send()
+                .await
+                .map_err(net)?
+                .bytes()
+                .await
+                .map_err(net)?;
+            job = Self::parse_job_status(&body).map_err(ClientError::Network)?;
+        }
+    }
+
+    /// The signed-in DID, from whichever agent is active.
+    #[allow(clippy::await_holding_lock)]
+    async fn current_did(&self) -> Result<String, ClientError> {
+        with_agent_and_did!(self, _agent, did => Ok(did.to_string()))
+    }
+
     /// Create a post with full compose data (images, language, CW, threadgate, etc.)
     /// Returns `(uri, cid)` of the created post.
     #[allow(clippy::await_holding_lock)]
@@ -1359,9 +1618,22 @@ impl HangarClient {
         }
 
         // Build embed based on what's attached.
-        // Priority: images > link card (images win when both present).
+        // Priority: video > images > link card; the composer only allows
+        // one kind of media, so the order just settles ties.
         // Quote embed can be combined with media via recordWithMedia.
-        let media_embed = if !image_blobs.is_empty() {
+        let media_embed = if let Some(ref video) = data.video {
+            let mut embed = serde_json::json!({
+                "$type": "app.bsky.embed.video",
+                "video": video.blob
+            });
+            if !video.alt_text.is_empty() {
+                embed["alt"] = serde_json::json!(video.alt_text);
+            }
+            if let Some((w, h)) = video.aspect_ratio {
+                embed["aspectRatio"] = serde_json::json!({ "width": w, "height": h });
+            }
+            Some(embed)
+        } else if !image_blobs.is_empty() {
             // Image embed
             let images: Vec<serde_json::Value> = image_blobs
                 .iter()
@@ -3507,6 +3779,66 @@ mod tests {
     use super::*;
     use atrium_api::app::bsky::embed::record_with_media::ViewMediaRefs;
     use atrium_api::types::{Union, UnknownData};
+
+    /// The video service's answers parse from every shape it uses: the
+    /// documented envelope, a bare status, and an error body.
+    #[test]
+    fn job_status_parses_from_every_service_shape() {
+        let envelope = br#"{"jobStatus":{"jobId":"j1","did":"did:plc:abc","state":"JOB_STATE_ENCODING","progress":42}}"#;
+        let job = HangarClient::parse_job_status(envelope).expect("envelope parses");
+        assert_eq!(job.data.job_id, "j1");
+        assert_eq!(job.data.state, "JOB_STATE_ENCODING");
+        assert_eq!(job.data.progress.map(u8::from), Some(42));
+
+        let bare = br#"{"jobId":"j2","did":"did:plc:abc","state":"JOB_STATE_COMPLETED","blob":{"$type":"blob","ref":{"$link":"bafkreidgvpkjawlxz6sffxzwgooowe5yt7i6wsyg236mfoks77nywkptdq"},"mimeType":"video/mp4","size":9}}"#;
+        let job = HangarClient::parse_job_status(bare).expect("bare status parses");
+        assert_eq!(job.data.state, "JOB_STATE_COMPLETED");
+        assert!(job.data.blob.is_some(), "the finished blob comes along");
+
+        let error =
+            br#"{"error":"VideoTooLong","message":"Videos must be shorter than 3 minutes"}"#;
+        let err = HangarClient::parse_job_status(error).unwrap_err();
+        assert_eq!(err, "Videos must be shorter than 3 minutes");
+
+        assert!(HangarClient::parse_job_status(b"not json").is_err());
+    }
+
+    /// The upload token's audience comes from the DID document's PDS
+    /// entry, ports encoded the way did:web wants them.
+    #[test]
+    fn the_pds_did_comes_from_the_did_document() {
+        let doc = serde_json::json!({
+            "service": [
+                { "id": "#atproto_labeler", "type": "Labeler", "serviceEndpoint": "https://mod.example" },
+                { "id": "#atproto_pds", "type": "AtprotoPersonalDataServer",
+                  "serviceEndpoint": "https://amanita.us-east.host.bsky.network" }
+            ]
+        });
+        assert_eq!(
+            HangarClient::pds_did_from_doc(&doc).as_deref(),
+            Some("did:web:amanita.us-east.host.bsky.network")
+        );
+
+        let with_port = serde_json::json!({
+            "service": [{ "id": "#atproto_pds", "serviceEndpoint": "http://localhost:3000" }]
+        });
+        assert_eq!(
+            HangarClient::pds_did_from_doc(&with_port).as_deref(),
+            Some("did:web:localhost%3A3000")
+        );
+
+        assert_eq!(HangarClient::pds_did_from_doc(&serde_json::json!({})), None);
+    }
+
+    /// Upload names carry the extension the service keys formats off,
+    /// GIFs included since those ride the video pipeline.
+    #[test]
+    fn video_upload_names_follow_the_mime_type() {
+        assert_eq!(HangarClient::video_file_ext("video/mp4"), "mp4");
+        assert_eq!(HangarClient::video_file_ext("video/quicktime"), "mov");
+        assert_eq!(HangarClient::video_file_ext("image/gif"), "gif");
+        assert_eq!(HangarClient::video_file_ext("anything/else"), "mp4");
+    }
 
     fn quote() -> QuoteEmbed {
         QuoteEmbed {
