@@ -2444,7 +2444,7 @@ impl ComposeDialog {
         let thread_count = 1 + imp.thread_posts.borrow().len();
         if let Some(btn) = imp.post_button.borrow().as_ref() {
             if thread_count > 1 {
-                btn.set_label(&format!("Post Thread ({} posts)", thread_count));
+                btn.set_label(&format!("Post Thread ({})", thread_count));
             } else {
                 btn.set_label("Post");
             }
