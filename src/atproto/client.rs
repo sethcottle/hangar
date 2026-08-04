@@ -1930,10 +1930,14 @@ impl HangarClient {
 
     /// Get an author's feed (posts by a specific user)
     #[allow(clippy::await_holding_lock)]
+    /// `filter` is a lexicon value: posts_and_author_threads,
+    /// posts_with_replies, posts_with_media. None leaves the server's
+    /// default, which includes replies.
     pub async fn get_author_feed(
         &self,
         actor: &str,
         cursor: Option<&str>,
+        filter: Option<&str>,
     ) -> Result<(Vec<Post>, Option<String>), ClientError> {
         with_agent!(self, agent => {
 
@@ -1942,7 +1946,7 @@ impl HangarClient {
                 .parse()
                 .map_err(|e| ClientError::InvalidResponse(format!("invalid actor: {e}")))?,
             cursor: cursor.map(String::from),
-            filter: None,
+            filter: filter.map(String::from),
             include_pins: None,
             limit: None,
         };

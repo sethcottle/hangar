@@ -68,6 +68,32 @@ pub enum FollowListPush {
     PoppedBack(FollowListPage),
 }
 
+/// One drill-down profile page's feed state, shared between its tab
+/// buttons, its scroll handler, and the app's fetch completions. The
+/// generation strands a fetch whose tab was switched away mid-flight.
+pub struct ProfileFeedCtx {
+    pub did: String,
+    pub filter: Cell<&'static str>,
+    pub cursor: RefCell<Option<String>>,
+    pub fetching: Cell<bool>,
+    pub generation: Cell<u64>,
+    model: gio::ListStore,
+}
+
+impl ProfileFeedCtx {
+    /// Posts landing from a fetch; the model stays this module's business.
+    pub fn append_posts(&self, posts: Vec<Post>) {
+        for post in posts {
+            self.model.append(&PostObject::new(post));
+        }
+    }
+
+    #[cfg(test)]
+    fn listed(&self) -> u32 {
+        self.model.n_items()
+    }
+}
+
 mod notification_object {
     use super::*;
 
@@ -226,6 +252,8 @@ mod imp {
         /// Args: the profile to message and the button that asked.
         pub message_callback:
             RefCell<Option<Box<dyn Fn(Profile, glib::WeakRef<gtk4::Button>) + 'static>>>,
+        /// Args: the page's feed context and whether this is a first page.
+        pub profile_tab_callback: RefCell<Option<Box<dyn Fn(Rc<ProfileFeedCtx>, bool) + 'static>>>,
         pub nav_changed_callback:
             RefCell<Option<Box<dyn Fn(crate::ui::sidebar::NavItem) + 'static>>>,
         // Mentions page state
@@ -1100,6 +1128,16 @@ impl HangarWindow {
             .replace(Some(Box::new(callback)));
     }
 
+    /// Args: the page's feed context and whether this is a first page.
+    pub fn set_profile_tab_callback<F>(&self, callback: F)
+    where
+        F: Fn(Rc<ProfileFeedCtx>, bool) + 'static,
+    {
+        self.imp()
+            .profile_tab_callback
+            .replace(Some(Box::new(callback)));
+    }
+
     /// One StatusPage, hidden until its list turns out empty.
     fn empty_state_page(icon: &str, title: &str, description: &str) -> adw::StatusPage {
         let page = adw::StatusPage::new();
@@ -1601,7 +1639,12 @@ impl HangarWindow {
     }
 
     /// Push a profile view page onto the current section's navigation stack
-    pub fn push_profile_page(&self, profile: &Profile, posts: Vec<Post>) {
+    pub fn push_profile_page(
+        &self,
+        profile: &Profile,
+        posts: Vec<Post>,
+        feed_cursor: Option<String>,
+    ) {
         let nav_view = self.current_nav_view();
         let Some(nav_view) = nav_view else {
             return;
@@ -1619,7 +1662,7 @@ impl HangarWindow {
             return;
         }
 
-        let page = self.build_profile_page(profile, posts);
+        let page = self.build_profile_page(profile, posts, feed_cursor);
         page.set_tag(Some(&tag));
         nav_view.push(&page);
     }
@@ -2065,7 +2108,12 @@ impl HangarWindow {
     }
 
     /// Build a profile view page
-    fn build_profile_page(&self, profile: &Profile, posts: Vec<Post>) -> adw::NavigationPage {
+    fn build_profile_page(
+        &self,
+        profile: &Profile,
+        posts: Vec<Post>,
+        feed_cursor: Option<String>,
+    ) -> adw::NavigationPage {
         let no_posts = posts.is_empty();
         let content_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         content_box.set_hexpand(true);
@@ -2234,31 +2282,79 @@ impl HangarWindow {
         }
 
         // The profile header itself is already in the tree through the
-        // banner overlay; only the separator and posts label follow it.
+        // banner overlay; only the separator and the tabs follow it.
         header_block.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
-
-        let posts_label = gtk4::Label::new(Some("Posts"));
-        posts_label.add_css_class("title-4");
-        posts_label.set_halign(gtk4::Align::Start);
-        posts_label.set_margin_start(16);
-        posts_label.set_margin_top(12);
-        posts_label.set_margin_bottom(8);
-        header_block.append(&posts_label);
-
-        // The page is built once with its posts; nothing arrives later, so
-        // an empty list can say so statically.
-        if no_posts {
-            let none = gtk4::Label::new(Some("No posts yet"));
-            none.add_css_class("dim-label");
-            none.set_margin_top(12);
-            none.set_margin_bottom(12);
-            header_block.append(&none);
-        }
 
         // The header scrolls with the posts: row 0 of the list is a marker
         // the factory answers with the header widget. Same mechanism as the
         // own profile page; see `build_own_profile_content`.
         let model = gio::ListStore::new::<PostObject>();
+
+        let feed_ctx = Rc::new(ProfileFeedCtx {
+            did: profile.did.clone(),
+            filter: Cell::new("posts_and_author_threads"),
+            cursor: RefCell::new(feed_cursor),
+            fetching: Cell::new(false),
+            generation: Cell::new(0),
+            model: model.clone(),
+        });
+
+        // Posts, Replies, Media. Switching clears the list and asks the app
+        // for the tab's own feed; the shared context strands stale fetches.
+        let tabs = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        tabs.add_css_class("linked");
+        tabs.set_halign(gtk4::Align::Start);
+        tabs.set_margin_start(16);
+        tabs.set_margin_top(12);
+        tabs.set_margin_bottom(8);
+        let mut first_tab: Option<gtk4::ToggleButton> = None;
+        for (label, filter) in [
+            ("Posts", "posts_and_author_threads"),
+            ("Replies", "posts_with_replies"),
+            ("Media", "posts_with_media"),
+        ] {
+            let tab = gtk4::ToggleButton::with_label(label);
+            match &first_tab {
+                Some(first) => tab.set_group(Some(first)),
+                None => {
+                    tab.set_active(true);
+                    first_tab = Some(tab.clone());
+                }
+            }
+            let win = self.downgrade();
+            let ctx = feed_ctx.clone();
+            tab.connect_toggled(move |tab| {
+                if !tab.is_active() || ctx.filter.get() == filter {
+                    return;
+                }
+                ctx.filter.set(filter);
+                ctx.generation.set(ctx.generation.get() + 1);
+                ctx.cursor.replace(None);
+                ctx.fetching.set(false);
+                ctx.model.remove_all();
+                if let Some(win) = win.upgrade()
+                    && let Some(cb) = win.imp().profile_tab_callback.borrow().as_ref()
+                {
+                    cb(ctx.clone(), true);
+                }
+            });
+            tabs.append(&tab);
+        }
+        header_block.append(&tabs);
+
+        // Follows the model, so every tab can say when it has nothing.
+        let none = gtk4::Label::new(Some("No posts yet"));
+        none.add_css_class("dim-label");
+        none.set_margin_top(12);
+        none.set_margin_bottom(12);
+        none.set_visible(no_posts);
+        let none_weak = none.downgrade();
+        model.connect_items_changed(move |model, _, _, _| {
+            if let Some(none) = none_weak.upgrade() {
+                none.set_visible(model.n_items() == 0);
+            }
+        });
+        header_block.append(&none);
         let header_marker = gio::ListStore::new::<gtk4::StringObject>();
         header_marker.append(&gtk4::StringObject::new("profile-header"));
         let sections = gio::ListStore::new::<gio::ListStore>();
@@ -2502,6 +2598,21 @@ impl HangarWindow {
         revealer.set_transition_type(gtk4::RevealerTransitionType::SlideDown);
         revealer.set_valign(gtk4::Align::Start);
         revealer.set_child(Some(&bar));
+
+        // Near the bottom, ask for the current tab's next page.
+        let win = self.downgrade();
+        let ctx = feed_ctx.clone();
+        scrolled.vadjustment().connect_value_changed(move |adj| {
+            let near_bottom = adj.value() >= adj.upper() - adj.page_size() - 400.0;
+            if near_bottom
+                && ctx.cursor.borrow().is_some()
+                && !ctx.fetching.get()
+                && let Some(win) = win.upgrade()
+                && let Some(cb) = win.imp().profile_tab_callback.borrow().as_ref()
+            {
+                cb(ctx.clone(), false);
+            }
+        });
 
         // Reveal once the full header is out of view. Re-sync the bar's
         // follow button on each toggle; the header's copy may have settled
@@ -7490,7 +7601,7 @@ mod tests {
             Some("Other".into()),
             None,
         );
-        let profile_page = window.build_profile_page(&profile, vec![a_post("one")]);
+        let profile_page = window.build_profile_page(&profile, vec![a_post("one")], None);
         let profile_content = profile_page
             .child()
             .expect("the other-user profile page has content");
@@ -7601,7 +7712,7 @@ mod tests {
         );
 
         // The pushed profile page.
-        let page = window.build_profile_page(&profile, vec![a_post("one")]);
+        let page = window.build_profile_page(&profile, vec![a_post("one")], None);
         let content = page.child().expect("the profile page has content");
         let mut widgets = Vec::new();
         walk(&content, 0, &mut widgets);
@@ -7745,7 +7856,7 @@ mod tests {
             Some("Other".into()),
             None,
         );
-        window.push_profile_page(&profile, vec![a_post("doomed"), a_post("kept")]);
+        window.push_profile_page(&profile, vec![a_post("doomed"), a_post("kept")], None);
         // A thread rooted elsewhere that shows the doomed post as a parent.
         window.push_thread_page(&a_post("kept"), vec![a_post("doomed"), a_post("kept")]);
         // The thread rooted at the doomed post itself, on top of it.
@@ -7952,7 +8063,7 @@ mod tests {
         );
         profile.followers_count = Some(1200);
         // following_count stays None: the target must still be clickable.
-        window.push_profile_page(&profile, vec![]);
+        window.push_profile_page(&profile, vec![], None);
 
         let nav_view = window
             .imp()
@@ -8206,6 +8317,78 @@ mod tests {
         window.destroy();
     }
 
+    /// The profile tabs ask the app for their own feed: switching clears
+    /// the list, hands over the tab's filter as a first page, and bumps
+    /// the generation so a fetch from the abandoned tab lands nowhere.
+    #[test]
+    fn profile_tabs_fetch_their_own_feed() {
+        crate::ui::with_gtk(profile_tabs_fetch_their_own_feed_body);
+    }
+
+    fn profile_tabs_fetch_their_own_feed_body() {
+        let window: HangarWindow = glib::Object::builder().build();
+
+        type Asked = (String, bool, u64);
+        let asked: Rc<RefCell<Vec<Asked>>> = Rc::new(RefCell::new(vec![]));
+        let ctx_cell: Rc<RefCell<Option<Rc<ProfileFeedCtx>>>> = Rc::new(RefCell::new(None));
+        let sink = asked.clone();
+        let stash = ctx_cell.clone();
+        window.set_profile_tab_callback(move |ctx, first| {
+            sink.borrow_mut()
+                .push((ctx.filter.get().to_string(), first, ctx.generation.get()));
+            stash.borrow_mut().replace(ctx);
+        });
+
+        let profile =
+            Profile::minimal("did:plc:tabs".into(), "tabs.bsky.social".into(), None, None);
+        window.push_profile_page(&profile, vec![a_post("p1")], Some("cursor-1".into()));
+
+        let nav_view = window.imp().home_nav_view.borrow().clone().unwrap();
+        let page = nav_view.find_page("profile:did:plc:tabs").unwrap();
+        let mut widgets = Vec::new();
+        walk(&page.upcast::<gtk4::Widget>(), 0, &mut widgets);
+        let tab = |label: &str| -> gtk4::ToggleButton {
+            widgets
+                .iter()
+                .find_map(|(_, w)| {
+                    let t = w.downcast_ref::<gtk4::ToggleButton>()?;
+                    (t.label().as_deref() == Some(label)).then(|| t.clone())
+                })
+                .unwrap_or_else(|| panic!("no {label} tab"))
+        };
+
+        assert!(tab("Posts").is_active(), "Posts is the opening tab");
+        assert!(
+            asked.borrow().is_empty(),
+            "the opening tab rides the pushed posts, no refetch"
+        );
+
+        tab("Replies").set_active(true);
+        assert_eq!(
+            asked.borrow().as_slice(),
+            [("posts_with_replies".to_string(), true, 1)],
+            "a switch asks for the tab's filter as a first page"
+        );
+        let ctx = ctx_cell.borrow().clone().unwrap();
+        assert_eq!(ctx.listed(), 0, "the switch cleared the old tab's posts");
+        assert!(ctx.cursor.borrow().is_none(), "and its cursor");
+
+        // The app lands a page; the model carries it.
+        ctx.append_posts(vec![a_post("r1")]);
+        assert_eq!(ctx.listed(), 1);
+
+        tab("Media").set_active(true);
+        assert_eq!(asked.borrow().len(), 2);
+        assert_eq!(
+            asked.borrow()[1],
+            ("posts_with_media".to_string(), true, 2),
+            "each switch bumps the generation"
+        );
+        assert_eq!(ctx.listed(), 0, "the replies page left with its tab");
+
+        window.destroy();
+    }
+
     /// A pushed profile page holds one list whose first row is the header
     /// marker, so the whole page scrolls; the condensed bar waits unrevealed
     /// on top of the scroller.
@@ -8223,7 +8406,7 @@ mod tests {
             None,
             None,
         );
-        window.push_profile_page(&profile, vec![a_post("p1"), a_post("p2")]);
+        window.push_profile_page(&profile, vec![a_post("p1"), a_post("p2")], None);
 
         let nav_view = window.imp().home_nav_view.borrow().clone().unwrap();
         let page = nav_view.find_page("profile:did:plc:scrolls").unwrap();
@@ -8277,7 +8460,7 @@ mod tests {
 
         let profile =
             Profile::minimal("did:plc:back".into(), "back.bsky.social".into(), None, None);
-        window.push_profile_page(&profile, vec![]);
+        window.push_profile_page(&profile, vec![], None);
         let nav_view = window.imp().home_nav_view.borrow().clone().unwrap();
         assert!(nav_view.find_page("profile:did:plc:back").is_some());
 
@@ -8506,7 +8689,7 @@ mod tests {
             None,
         );
         stranger.viewer_followed_by = Some("at://did:plc:stranger/app.bsky.graph.follow/1".into());
-        window.push_profile_page(&stranger, vec![]);
+        window.push_profile_page(&stranger, vec![], None);
 
         let btn = follow_button_on("profile:did:plc:stranger");
         assert_eq!(btn.label().as_deref(), Some("Follow"));
@@ -8558,7 +8741,7 @@ mod tests {
             None,
         );
         followed.viewer_following = Some("at://did:plc:me/app.bsky.graph.follow/2".into());
-        window.push_profile_page(&followed, vec![]);
+        window.push_profile_page(&followed, vec![], None);
         let btn = follow_button_on("profile:did:plc:followed");
         assert_eq!(btn.label().as_deref(), Some("Following"));
         assert!(!btn.has_css_class("suggested-action"));
@@ -8566,7 +8749,7 @@ mod tests {
         // Your own page carries no follow button.
         window.set_current_user_did("did:plc:me");
         let me = Profile::minimal("did:plc:me".into(), "me.bsky.social".into(), None, None);
-        window.push_profile_page(&me, vec![]);
+        window.push_profile_page(&me, vec![], None);
         let nav_view = window.imp().home_nav_view.borrow().clone().unwrap();
         let page = nav_view.find_page("profile:did:plc:me").unwrap();
         let mut widgets = Vec::new();
@@ -8614,7 +8797,7 @@ mod tests {
             None,
             None,
         );
-        window.push_profile_page(&stranger, vec![]);
+        window.push_profile_page(&stranger, vec![], None);
 
         let btn = message_button_on("profile:did:plc:stranger").expect("a Message button");
         btn.emit_clicked();
@@ -8623,7 +8806,7 @@ mod tests {
 
         window.set_current_user_did("did:plc:me");
         let me = Profile::minimal("did:plc:me".into(), "me.bsky.social".into(), None, None);
-        window.push_profile_page(&me, vec![]);
+        window.push_profile_page(&me, vec![], None);
         assert!(
             message_button_on("profile:did:plc:me").is_none(),
             "no Message button on your own page"

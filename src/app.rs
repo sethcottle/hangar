@@ -285,6 +285,11 @@ mod imp {
             });
 
             let app_clone = app.clone();
+            window.set_profile_tab_callback(move |ctx, first_page| {
+                app_clone.fetch_profile_tab(ctx, first_page);
+            });
+
+            let app_clone = app.clone();
             window.set_compose_callback(move || {
                 app_clone.open_compose_dialog();
             });
@@ -2276,13 +2281,16 @@ impl HangarApplication {
 
     /// Open the profile view for a user
     fn open_profile_view(&self, profile: Profile) {
-        let (tx, rx) = std::sync::mpsc::channel::<Result<(Profile, Vec<Post>), String>>();
+        let (tx, rx) =
+            std::sync::mpsc::channel::<Result<(Profile, Vec<Post>, Option<String>), String>>();
         let client = self.client();
         let actor = profile.did.clone();
 
         thread::spawn(move || {
             let result = runtime::block_on(async {
-                let feed = client.get_author_feed(&actor, None).await;
+                let feed = client
+                    .get_author_feed(&actor, None, Some("posts_and_author_threads"))
+                    .await;
                 // Avatar clicks arrive with the post author, a minimal
                 // profile missing its bio, and search results come without
                 // counts. Fetch the full one so the pushed page can show
@@ -2293,7 +2301,7 @@ impl HangarApplication {
                     } else {
                         None
                     };
-                feed.map(|(posts, _cursor)| (full_profile.unwrap_or(profile), posts))
+                feed.map(|(posts, cursor)| (full_profile.unwrap_or(profile), posts, cursor))
             });
             let _ = tx.send(result.map_err(|e| e.to_string()));
         });
@@ -2301,9 +2309,9 @@ impl HangarApplication {
         let app = self.clone();
         glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
             match rx.try_recv() {
-                Ok(Ok((profile, posts))) => {
+                Ok(Ok((profile, posts, cursor))) => {
                     if let Some(window) = app.imp().window.borrow().as_ref() {
-                        window.push_profile_page(&profile, posts);
+                        window.push_profile_page(&profile, posts, cursor);
                     }
                     glib::ControlFlow::Break
                 }
@@ -3438,7 +3446,8 @@ impl HangarApplication {
         let client = self.client();
 
         thread::spawn(move || {
-            let result = runtime::block_on(async { client.get_author_feed(&user_did, None).await });
+            let result =
+                runtime::block_on(async { client.get_author_feed(&user_did, None, None).await });
             let _ = tx.send(result.map_err(|e| e.to_string()));
         });
 
@@ -3488,8 +3497,9 @@ impl HangarApplication {
         let client = self.client();
 
         thread::spawn(move || {
-            let result =
-                runtime::block_on(async { client.get_author_feed(&user_did, Some(&cursor)).await });
+            let result = runtime::block_on(async {
+                client.get_author_feed(&user_did, Some(&cursor), None).await
+            });
             let _ = tx.send(result.map_err(|e| e.to_string()));
         });
 
@@ -3951,6 +3961,61 @@ impl HangarApplication {
                 Ok(new_uri) => row.set_viewer_following(new_uri),
                 // The button showed the hoped-for state; put it back.
                 Err(_) => row.set_viewer_following(current_uri.clone()),
+            }
+        });
+    }
+
+    /// One page of a profile tab's feed. First pages were cleared by the
+    /// tab switch; later pages append. The context's generation strands a
+    /// fetch whose tab was switched away while it was out.
+    fn fetch_profile_tab(&self, ctx: std::rc::Rc<crate::ui::ProfileFeedCtx>, first_page: bool) {
+        if ctx.fetching.get() {
+            return;
+        }
+        ctx.fetching.set(true);
+        let generation = ctx.generation.get();
+        let did = ctx.did.clone();
+        let filter = ctx.filter.get();
+        let cursor = if first_page {
+            None
+        } else {
+            ctx.cursor.borrow().clone()
+        };
+
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(Vec<Post>, Option<String>), String>>();
+        let client = self.client();
+        thread::spawn(move || {
+            let result = runtime::block_on(async {
+                client
+                    .get_author_feed(&did, cursor.as_deref(), Some(filter))
+                    .await
+            });
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+
+        let app = self.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            if ctx.generation.get() != generation {
+                return glib::ControlFlow::Break;
+            }
+            match rx.try_recv() {
+                Ok(Ok((posts, next_cursor))) => {
+                    ctx.fetching.set(false);
+                    ctx.cursor.replace(next_cursor);
+                    ctx.append_posts(posts);
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(e)) => {
+                    ctx.fetching.set(false);
+                    eprintln!("Failed to fetch profile tab: {}", e);
+                    app.toast_unless_offline("Couldn't load these posts");
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    ctx.fetching.set(false);
+                    glib::ControlFlow::Break
+                }
             }
         });
     }
