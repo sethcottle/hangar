@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
+mod actor_row;
 pub mod avatar_cache;
 mod compose_dialog;
 pub mod external;
@@ -9,6 +10,7 @@ pub mod media_viewer;
 pub mod post_row;
 #[cfg(test)]
 mod rebind_audit;
+pub(crate) mod rich_text;
 pub mod sidebar;
 pub mod video_player;
 mod window;

@@ -42,6 +42,33 @@ fn rearm_click<F: Fn(&gtk4::Button) + 'static>(
     slot.replace(Some(btn.connect_clicked(f)));
 }
 
+thread_local! {
+    /// The signed-in user's DID. `bind` compares each post's author against
+    /// it to decide whether the menu offers Delete.
+    static CURRENT_USER_DID: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+    /// What a Delete click does. The app installs one handler and every row
+    /// dispatches to it, so the list factories need no per-bind wiring.
+    static DELETE_POST_HANDLER: std::cell::RefCell<Option<Box<dyn Fn(Post)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Record whose posts are deletable. `None` on sign-out.
+pub fn set_current_user_did(did: Option<&str>) {
+    CURRENT_USER_DID.with(|cell| {
+        cell.replace(did.map(str::to_string));
+    });
+}
+
+/// Install the app-level delete flow. Thread-local for the same reason the
+/// video director is: rows are built in half a dozen factories and this
+/// spares each one the wiring.
+pub fn set_delete_post_handler<F: Fn(Post) + 'static>(handler: F) {
+    DELETE_POST_HANDLER.with(|cell| {
+        cell.replace(Some(Box::new(handler)));
+    });
+}
+
 mod imp {
     use super::*;
     use std::cell::{Cell, RefCell};
@@ -93,6 +120,10 @@ mod imp {
         pub view_post_item: RefCell<Option<gtk4::Button>>,
         pub copy_link_item: RefCell<Option<gtk4::Button>>,
         pub open_link_item: RefCell<Option<gtk4::Button>>,
+        pub delete_item: RefCell<Option<gtk4::Button>>,
+        /// Separator plus Delete button, shown and hidden as one block so no
+        /// stray separator trails the menu on other people's posts.
+        pub delete_section: RefCell<Option<gtk4::Box>>,
         // Track current like/repost state (may differ from original post after user actions)
         pub is_liked: RefCell<bool>,
         pub is_reposted: RefCell<bool>,
@@ -392,11 +423,33 @@ impl PostRow {
         actions.append(&spacer);
 
         // Post overflow menu button
-        let (menu_btn, view_post_item, copy_link_item, open_link_item) =
+        let (menu_btn, view_post_item, copy_link_item, open_link_item, delete_item, delete_section) =
             Self::create_post_menu_button();
         menu_btn.set_tooltip_text(Some("More options"));
         menu_btn.update_property(&[gtk4::accessible::Property::Label("More options")]);
         actions.append(&menu_btn);
+
+        // Wired once, here. The handler reads the row's current post when
+        // clicked, so rebinding has nothing to disarm. Weak for the usual
+        // reason: the button is a descendant of the row.
+        let row_weak = self.downgrade();
+        let delete_popover = menu_btn.popover();
+        delete_item.connect_clicked(move |_| {
+            if let Some(p) = &delete_popover {
+                p.popdown();
+            }
+            let Some(row) = row_weak.upgrade() else {
+                return;
+            };
+            let post = row.imp().post.borrow().clone();
+            if let Some(post) = post {
+                DELETE_POST_HANDLER.with(|cell| {
+                    if let Some(handler) = cell.borrow().as_ref() {
+                        handler(post);
+                    }
+                });
+            }
+        });
 
         content_column.append(&actions);
 
@@ -451,6 +504,8 @@ impl PostRow {
         imp.view_post_item.replace(Some(view_post_item));
         imp.copy_link_item.replace(Some(copy_link_item));
         imp.open_link_item.replace(Some(open_link_item));
+        imp.delete_item.replace(Some(delete_item));
+        imp.delete_section.replace(Some(delete_section));
         imp.main_box.replace(Some(main_box));
     }
 
@@ -538,8 +593,16 @@ impl PostRow {
     }
 
     /// Create a post overflow menu button with View Post, Bookmark, Report, etc.
-    /// Returns: (menu_btn, view_item, copy_link_item, open_link_item)
-    fn create_post_menu_button() -> (gtk4::MenuButton, gtk4::Button, gtk4::Button, gtk4::Button) {
+    /// Returns: (menu_btn, view_item, copy_link_item, open_link_item,
+    /// delete_item, delete_section)
+    fn create_post_menu_button() -> (
+        gtk4::MenuButton,
+        gtk4::Button,
+        gtk4::Button,
+        gtk4::Button,
+        gtk4::Button,
+        gtk4::Box,
+    ) {
         let popover_box = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
         popover_box.set_margin_top(6);
         popover_box.set_margin_bottom(6);
@@ -594,6 +657,25 @@ impl PostRow {
         report_item.add_css_class("flat");
         popover_box.append(&report_item);
 
+        // Delete Post, in a block of its own. Hidden until bind sees the post
+        // belongs to the signed-in user.
+        let delete_section = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+        let sep3 = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+        sep3.set_margin_top(4);
+        sep3.set_margin_bottom(4);
+        delete_section.append(&sep3);
+
+        let delete_item = gtk4::Button::new();
+        let delete_content = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        delete_content.append(&gtk4::Image::from_icon_name("user-trash-symbolic"));
+        delete_content.append(&gtk4::Label::new(Some("Delete Post...")));
+        delete_item.set_child(Some(&delete_content));
+        delete_item.add_css_class("flat");
+        delete_item.add_css_class("destructive-action");
+        delete_section.append(&delete_item);
+        delete_section.set_visible(false);
+        popover_box.append(&delete_section);
+
         let popover = gtk4::Popover::new();
         popover.set_child(Some(&popover_box));
         popover.add_css_class("menu");
@@ -605,7 +687,14 @@ impl PostRow {
         menu_btn.add_css_class("circular");
         menu_btn.set_popover(Some(&popover));
 
-        (menu_btn, view_item, copy_link_item, open_link_item)
+        (
+            menu_btn,
+            view_item,
+            copy_link_item,
+            open_link_item,
+            delete_item,
+            delete_section,
+        )
     }
 
     pub fn connect_like_clicked<F: Fn(&PostRow, bool, Option<String>) + 'static>(&self, f: F) {
@@ -1061,6 +1150,14 @@ impl PostRow {
             .as_ref()
             .and_then(|m| m.popover());
 
+        // Delete is offered only on the signed-in user's own posts, decided
+        // fresh on every bind so a recycled row cannot keep the offer.
+        if let Some(section) = imp.delete_section.borrow().as_ref() {
+            let own = CURRENT_USER_DID
+                .with(|cell| cell.borrow().as_deref() == Some(post.author.did.as_str()));
+            section.set_visible(own);
+        }
+
         // The View Post action reuses post_clicked_callback
         if let Some(view_item) = imp.view_post_item.borrow().as_ref() {
             let post_row = self.downgrade();
@@ -1113,6 +1210,11 @@ impl PostRow {
         // Extract the rkey from the AT URI (e.g., at://did:plc:xxx/app.bsky.feed.post/rkey)
         let rkey = uri.rsplit('/').next().unwrap_or("");
         format!("https://bsky.app/profile/{}/post/{}", handle, rkey)
+    }
+
+    /// The URI of the post this row is currently showing
+    pub fn post_uri(&self) -> Option<String> {
+        self.imp().post.borrow().as_ref().map(|p| p.uri.clone())
     }
 
     /// Check if the post is currently liked (tracks local state after user actions)
@@ -1819,87 +1921,12 @@ impl PostRow {
         }
     }
 
-    /// One linkified span, as byte offsets into the raw post text.
-    fn text_links(text: &str) -> Vec<(std::ops::Range<usize>, String)> {
-        use std::sync::LazyLock;
-
-        // Compiled once. These used to be rebuilt on every bind, which in a
-        // ListView means four regex compilations per row per scroll.
-        static URL: LazyLock<regex::Regex> = LazyLock::new(|| {
-            regex::Regex::new(r"https?://[^\s<>\[\]{}|\\^`\x00-\x1f\x7f]+").unwrap()
-        });
-        static MENTION: LazyLock<regex::Regex> = LazyLock::new(|| {
-            regex::Regex::new(
-                r"@([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+[a-zA-Z]([a-zA-Z0-9-]*[a-zA-Z0-9])?",
-            )
-            .unwrap()
-        });
-        // Bare domains, matched after mentions so that a handle ending in
-        // `.social` is a mention rather than a link to a website.
-        static BARE_URL: LazyLock<regex::Regex> = LazyLock::new(|| {
-            regex::Regex::new(
-                r"\b([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+(?:com|org|net|io|co|app|dev|edu|gov|me|info|biz|social)[/a-zA-Z0-9._~:/?#@!$&'()*+,;=-]*",
-            )
-            .unwrap()
-        });
-        static HASHTAG: LazyLock<regex::Regex> =
-            LazyLock::new(|| regex::Regex::new(r"#[a-zA-Z][a-zA-Z0-9_]*").unwrap());
-
-        let mut links: Vec<(std::ops::Range<usize>, String)> = Vec::new();
-        let mut claim = |range: std::ops::Range<usize>, href: String| {
-            if !links
-                .iter()
-                .any(|(taken, _)| range.start < taken.end && range.end > taken.start)
-            {
-                links.push((range, href));
-            }
-        };
-
-        for m in URL.find_iter(text) {
-            claim(m.range(), m.as_str().to_string());
-        }
-        for m in MENTION.find_iter(text) {
-            claim(m.range(), format!("bsky-mention://{}", &m.as_str()[1..]));
-        }
-        for m in BARE_URL.find_iter(text) {
-            claim(m.range(), format!("https://{}", m.as_str()));
-        }
-        for m in HASHTAG.find_iter(text) {
-            claim(m.range(), format!("bsky-tag://{}", &m.as_str()[1..]));
-        }
-
-        links.sort_by_key(|(range, _)| range.start);
-        links
-    }
-
     /// Format post text with clickable links, mentions and hashtags as Pango
-    /// markup. URLs become `<a>` tags; mentions use the `bsky-mention://`
-    /// scheme and hashtags `bsky-tag://`, both handled in `connect_activate_link`.
-    ///
-    /// Spans are found in the raw text and escaped on the way out, never the
-    /// other way round: with escaping first, a pattern can match inside an
-    /// entity the escaper just produced. GLib escapes U+001F as `&#x1f;`, the
-    /// hashtag pattern took `#x1f` out of the middle, and Pango then rejected
-    /// the whole string with "Entity did not end with a semicolon", leaving a
-    /// blank post.
+    /// markup. The rules live in [`crate::ui::rich_text`], shared with
+    /// profile bios; the `bsky-mention://` and `bsky-tag://` schemes are
+    /// handled in `connect_activate_link`.
     fn format_post_text(text: &str) -> String {
-        let links = Self::text_links(text);
-        let mut out = String::with_capacity(text.len() + links.len() * 48);
-        let mut cursor = 0;
-
-        for (range, href) in &links {
-            out.push_str(&glib::markup_escape_text(&text[cursor..range.start]));
-            out.push_str("<a href=\"");
-            // The href is wire text too.
-            out.push_str(&glib::markup_escape_text(href));
-            out.push_str("\">");
-            out.push_str(&glib::markup_escape_text(&text[range.clone()]));
-            out.push_str("</a>");
-            cursor = range.end;
-        }
-        out.push_str(&glib::markup_escape_text(&text[cursor..]));
-
-        out
+        crate::ui::rich_text::linkify(text)
     }
 
     fn format_timestamp(indexed_at: &str) -> String {
@@ -3157,5 +3184,77 @@ mod tests {
             Some("pointer"),
             "and it says so under the pointer"
         );
+    }
+
+    /// Delete shows itself only on the signed-in user's own posts, and one
+    /// click asks for one delete however often the row has been recycled.
+    #[test]
+    fn delete_is_offered_only_on_own_posts_and_fires_once() {
+        crate::ui::with_gtk(delete_is_offered_only_on_own_posts_and_fires_once_body);
+    }
+
+    fn delete_is_offered_only_on_own_posts_and_fires_once_body() {
+        use std::cell::RefCell as StdRefCell;
+        use std::rc::Rc;
+
+        let deleted: Rc<StdRefCell<Vec<String>>> = Rc::default();
+        let sink = Rc::clone(&deleted);
+        super::set_delete_post_handler(move |post| sink.borrow_mut().push(post.uri));
+
+        let row = PostRow::new();
+        let section = row
+            .imp()
+            .delete_section
+            .borrow()
+            .clone()
+            .expect("built in setup_ui");
+
+        let mine = || {
+            let mut post = post_with(None, "at://did:plc:me/app.bsky.feed.post/mine");
+            post.author = Profile {
+                did: "did:plc:me".into(),
+                ..profile()
+            };
+            post
+        };
+        let theirs = post_with(None, "at://did:plc:test/app.bsky.feed.post/theirs");
+
+        // Signed out, nothing is deletable.
+        super::set_current_user_did(None);
+        row.bind(&mine());
+        assert!(!section.get_visible(), "no signed-in user, no Delete");
+
+        super::set_current_user_did(Some("did:plc:me"));
+        row.bind(&mine());
+        assert!(section.get_visible(), "an own post offers Delete");
+
+        row.bind(&theirs);
+        assert!(
+            !section.get_visible(),
+            "recycled onto someone else's post, the offer has to go away"
+        );
+
+        // Bound many times over, one click still asks for one delete, and of
+        // the post the row shows now.
+        for _ in 0..4 {
+            row.bind(&mine());
+            row.bind(&theirs);
+        }
+        row.bind(&mine());
+        assert!(section.get_visible());
+        row.imp()
+            .delete_item
+            .borrow()
+            .as_ref()
+            .expect("built in setup_ui")
+            .emit_clicked();
+        assert_eq!(
+            *deleted.borrow(),
+            vec!["at://did:plc:me/app.bsky.feed.post/mine".to_string()],
+            "one click on Delete must request exactly one deletion"
+        );
+
+        // Other tests bind posts authored by did:plc:test; leave nothing set.
+        super::set_current_user_did(None);
     }
 }

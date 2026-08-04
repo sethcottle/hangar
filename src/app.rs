@@ -26,6 +26,31 @@ use crate::ui::{ComposeDialog, HangarWindow, LoginDialog, NavItem, QuoteContext,
 /// Limit concurrent API requests to prevent overwhelming the server during rapid scrolling
 static API_SEMAPHORE: Lazy<Arc<Semaphore>> = Lazy::new(|| Arc::new(Semaphore::new(4)));
 
+/// Which search owns the results lists.
+///
+/// Every new query bumps it. A fetch carries the token it started under and
+/// drops its results if a newer search has run since, so a slow page from
+/// the old query cannot splice into the new query's list.
+#[derive(Default)]
+pub(crate) struct SearchGeneration(std::cell::Cell<u64>);
+
+impl SearchGeneration {
+    /// Start a new search. Every earlier token goes stale.
+    fn bump(&self) {
+        self.0.set(self.0.get().wrapping_add(1));
+    }
+
+    /// The token a fetch spawned now should carry.
+    fn token(&self) -> u64 {
+        self.0.get()
+    }
+
+    /// Whether a fetch holding `token` may still apply its results.
+    fn is_current(&self, token: u64) -> bool {
+        self.0.get() == token
+    }
+}
+
 /// Why a stored session could not be resumed on launch.
 ///
 /// The receiving end used to discard the error and put up a bare login dialog
@@ -78,6 +103,11 @@ mod imp {
         pub search_query: RefCell<Option<String>>,
         pub search_cursor: RefCell<Option<String>>,
         pub search_loading_more: RefCell<bool>,
+        /// People results page on its own cursor
+        pub search_people_cursor: RefCell<Option<String>>,
+        pub search_people_loading_more: RefCell<bool>,
+        /// Which query the in-flight search fetches belong to
+        pub(crate) search_generation: SearchGeneration,
         /// Whether new posts polling has been started
         pub polling_started: RefCell<bool>,
     }
@@ -174,6 +204,12 @@ mod imp {
                 app_clone.open_reply_dialog(post);
             });
 
+            // One handler serves every PostRow; see post_row.rs.
+            let app_clone = app.clone();
+            crate::ui::post_row::set_delete_post_handler(move |post| {
+                app_clone.confirm_delete_post(post);
+            });
+
             let app_clone = app.clone();
             window.set_compose_callback(move || {
                 app_clone.open_compose_dialog();
@@ -242,6 +278,11 @@ mod imp {
             let app_clone = app.clone();
             window.set_search_load_more_callback(move || {
                 app_clone.fetch_search_more();
+            });
+
+            let app_clone = app.clone();
+            window.set_search_people_load_more_callback(move || {
+                app_clone.fetch_search_people_more();
             });
 
             let app_clone = app.clone();
@@ -411,6 +452,8 @@ impl HangarApplication {
         imp.current_feed.replace(None);
         imp.user_did.replace(None);
         imp.cache.replace(None);
+        // The next account must not inherit this one's Delete offers.
+        crate::ui::post_row::set_current_user_did(None);
 
         // Clear the stored session
         thread::spawn(move || {
@@ -689,6 +732,8 @@ impl HangarApplication {
     fn fetch_user_profile(&self, did: &str) {
         // Store the user DID for later use
         self.imp().user_did.replace(Some(did.to_string()));
+        // Rows check post authorship against this before offering Delete
+        crate::ui::post_row::set_current_user_did(Some(did));
 
         // Try cache first for instant display
         let mut skip_fetch = false;
@@ -877,6 +922,62 @@ impl HangarApplication {
                 Ok(Err(e)) => {
                     eprintln!("Like/unlike failed: {}", e);
                     // TODO: Revert visual state on failure
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+            }
+        });
+    }
+
+    /// Ask before deleting; there is no undo.
+    fn confirm_delete_post(&self, post: Post) {
+        let window = match self.imp().window.borrow().as_ref() {
+            Some(w) => w.clone(),
+            None => return,
+        };
+
+        let dialog = adw::AlertDialog::new(Some("Delete post?"), Some("This can't be undone."));
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("delete", "Delete");
+        dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+
+        let app = self.clone();
+        dialog.connect_response(Some("delete"), move |_, _| {
+            app.delete_post(post.clone());
+        });
+        dialog.present(Some(&window));
+    }
+
+    fn delete_post(&self, post: Post) {
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let client = self.client();
+        let uri = post.uri.clone();
+        thread::spawn(move || {
+            let result = runtime::block_on(async { client.delete_post(&uri).await });
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+
+        let app = self.clone();
+        let uri = post.uri;
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            match rx.try_recv() {
+                Ok(Ok(())) => {
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.remove_post(&uri);
+                        window.show_toast("Post deleted");
+                    }
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(e)) => {
+                    eprintln!("Failed to delete post: {}", e);
+                    app.report_session_expiry();
+                    // The post stays where it was; nothing was removed early.
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.show_toast("Couldn't delete post");
+                    }
                     glib::ControlFlow::Break
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
@@ -1769,11 +1870,19 @@ impl HangarApplication {
                 }
                 Ok(Err(e)) => {
                     eprintln!("Failed to fetch thread: {}", e);
+                    // Clicking a quote of a deleted post lands here. Silence
+                    // read as a dead click.
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.show_toast("Couldn't load this post");
+                    }
                     glib::ControlFlow::Break
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     eprintln!("Failed to fetch thread: connection lost");
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.show_toast("Couldn't load this post");
+                    }
                     glib::ControlFlow::Break
                 }
             }
@@ -1813,22 +1922,32 @@ impl HangarApplication {
 
     /// Open the profile view for a user
     fn open_profile_view(&self, profile: Profile) {
-        let (tx, rx) = std::sync::mpsc::channel::<Result<(Vec<Post>, Option<String>), String>>();
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(Profile, Vec<Post>), String>>();
         let client = self.client();
         let actor = profile.did.clone();
-        let profile_clone = profile.clone();
 
         thread::spawn(move || {
-            let result = runtime::block_on(async { client.get_author_feed(&actor, None).await });
+            let result = runtime::block_on(async {
+                let feed = client.get_author_feed(&actor, None).await;
+                // Avatar clicks arrive with the post author, a minimal
+                // profile with no bio. Fetch the full one so the pushed
+                // page can show it; if that fails, push what we had.
+                let full_profile = if profile.description.is_none() {
+                    client.get_profile(&actor).await.ok()
+                } else {
+                    None
+                };
+                feed.map(|(posts, _cursor)| (full_profile.unwrap_or(profile), posts))
+            });
             let _ = tx.send(result.map_err(|e| e.to_string()));
         });
 
         let app = self.clone();
         glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
             match rx.try_recv() {
-                Ok(Ok((posts, _cursor))) => {
+                Ok(Ok((profile, posts))) => {
                     if let Some(window) = app.imp().window.borrow().as_ref() {
-                        window.push_profile_page(&profile_clone, posts);
+                        window.push_profile_page(&profile, posts);
                     }
                     glib::ControlFlow::Break
                 }
@@ -2452,17 +2571,24 @@ impl HangarApplication {
 
     /// Execute a search with the given query
     fn execute_search(&self, query: String) {
-        // Clear previous results and reset state
+        // Strand any fetch still out for the previous query
+        self.imp().search_generation.bump();
+
+        // Clear previous results and reset state, both pages
         self.imp().search_query.replace(Some(query.clone()));
         self.imp().search_cursor.replace(None);
         self.imp().search_loading_more.replace(false);
+        self.imp().search_people_cursor.replace(None);
+        self.imp().search_people_loading_more.replace(false);
 
         if let Some(window) = self.imp().window.borrow().as_ref() {
             window.clear_search_results();
             window.set_search_loading(true);
+            window.set_search_people_loading(true);
         }
 
         self.fetch_search(&query);
+        self.fetch_search_people(&query);
     }
 
     /// Fetch search results
@@ -2470,6 +2596,7 @@ impl HangarApplication {
         let (tx, rx) = std::sync::mpsc::channel::<Result<(Vec<Post>, Option<String>), String>>();
         let client = self.client();
         let query = query.to_string();
+        let generation = self.imp().search_generation.token();
 
         thread::spawn(move || {
             let result = runtime::block_on(async { client.search_posts(&query, None).await });
@@ -2478,6 +2605,10 @@ impl HangarApplication {
 
         let app = self.clone();
         glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            if !app.imp().search_generation.is_current(generation) {
+                // A newer search owns the list now; drop these results.
+                return glib::ControlFlow::Break;
+            }
             match rx.try_recv() {
                 Ok(Ok((posts, next_cursor))) => {
                     app.imp().search_cursor.replace(next_cursor);
@@ -2528,6 +2659,7 @@ impl HangarApplication {
         let (tx, rx) = std::sync::mpsc::channel::<Result<(Vec<Post>, Option<String>), String>>();
         let client = self.client();
         let semaphore = API_SEMAPHORE.clone();
+        let generation = self.imp().search_generation.token();
 
         thread::spawn(move || {
             let result = runtime::block_on(async {
@@ -2539,6 +2671,10 @@ impl HangarApplication {
 
         let app = self.clone();
         glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            if !app.imp().search_generation.is_current(generation) {
+                // A newer search reset the loading flags already.
+                return glib::ControlFlow::Break;
+            }
             match rx.try_recv() {
                 Ok(Ok((posts, next_cursor))) => {
                     app.imp().search_loading_more.replace(false);
@@ -2570,10 +2706,161 @@ impl HangarApplication {
             }
         });
     }
+
+    /// Fetch people results for the search page
+    fn fetch_search_people(&self, query: &str) {
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(Vec<Profile>, Option<String>), String>>();
+        let client = self.client();
+        let query = query.to_string();
+        let generation = self.imp().search_generation.token();
+
+        thread::spawn(move || {
+            let result = runtime::block_on(async { client.search_actors(&query, None).await });
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+
+        let app = self.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            if !app.imp().search_generation.is_current(generation) {
+                // A newer search owns the list now; drop these results.
+                return glib::ControlFlow::Break;
+            }
+            match rx.try_recv() {
+                Ok(Ok((profiles, next_cursor))) => {
+                    app.imp().search_people_cursor.replace(next_cursor);
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.set_search_people_loading(false);
+                        window.set_search_people_results(profiles);
+                    }
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(e)) => {
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.set_search_people_loading(false);
+                    }
+                    eprintln!("Failed to search people: {}", e);
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.set_search_people_loading(false);
+                    }
+                    eprintln!("Failed to search people: connection lost");
+                    glib::ControlFlow::Break
+                }
+            }
+        });
+    }
+
+    /// Fetch more people results for infinite scroll
+    fn fetch_search_people_more(&self) {
+        if *self.imp().search_people_loading_more.borrow() {
+            return;
+        }
+        let cursor = match self.imp().search_people_cursor.borrow().as_ref() {
+            Some(c) => c.clone(),
+            None => return,
+        };
+        let query = match self.imp().search_query.borrow().as_ref() {
+            Some(q) => q.clone(),
+            None => return,
+        };
+        self.imp().search_people_loading_more.replace(true);
+
+        if let Some(window) = self.imp().window.borrow().as_ref() {
+            window.set_search_people_loading(true);
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(Vec<Profile>, Option<String>), String>>();
+        let client = self.client();
+        let semaphore = API_SEMAPHORE.clone();
+        let generation = self.imp().search_generation.token();
+
+        thread::spawn(move || {
+            let result = runtime::block_on(async {
+                let _permit = semaphore.acquire().await;
+                client.search_actors(&query, Some(&cursor)).await
+            });
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+
+        let app = self.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            if !app.imp().search_generation.is_current(generation) {
+                // A newer search reset the loading flags already.
+                return glib::ControlFlow::Break;
+            }
+            match rx.try_recv() {
+                Ok(Ok((profiles, next_cursor))) => {
+                    app.imp().search_people_loading_more.replace(false);
+                    app.imp().search_people_cursor.replace(next_cursor);
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.set_search_people_loading(false);
+                        if !profiles.is_empty() {
+                            window.append_search_people_results(profiles);
+                        }
+                    }
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(e)) => {
+                    app.imp().search_people_loading_more.replace(false);
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.set_search_people_loading(false);
+                    }
+                    eprintln!("Failed to fetch more people results: {}", e);
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    app.imp().search_people_loading_more.replace(false);
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.set_search_people_loading(false);
+                    }
+                    glib::ControlFlow::Break
+                }
+            }
+        });
+    }
 }
 
 impl Default for HangarApplication {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SearchGeneration;
+
+    /// A late page from the old query must not splice into the new list.
+    #[test]
+    fn a_new_search_strands_fetches_from_the_old_one() {
+        let generation = SearchGeneration::default();
+
+        let old = generation.token();
+        assert!(
+            generation.is_current(old),
+            "a token is current until a new search runs"
+        );
+
+        generation.bump();
+        assert!(
+            !generation.is_current(old),
+            "the old query's fetch must be dropped"
+        );
+
+        let new = generation.token();
+        assert!(
+            generation.is_current(new),
+            "the new query's fetch still applies"
+        );
+
+        generation.bump();
+        assert!(
+            !generation.is_current(new),
+            "every bump strands earlier fetches"
+        );
     }
 }

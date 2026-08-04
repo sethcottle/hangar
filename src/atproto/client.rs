@@ -1045,19 +1045,19 @@ impl HangarClient {
         self.delete_record(repost_uri, "app.bsky.feed.repost").await
     }
 
+    /// Delete one of the user's own posts
+    /// `post_uri` is the AT-URI of the post record
+    #[allow(clippy::await_holding_lock)]
+    pub async fn delete_post(&self, post_uri: &str) -> Result<(), ClientError> {
+        self.delete_record(post_uri, "app.bsky.feed.post").await
+    }
+
     /// Generic delete record helper
     #[allow(clippy::await_holding_lock)]
     async fn delete_record(&self, record_uri: &str, collection: &str) -> Result<(), ClientError> {
         with_agent!(self, agent => {
 
-        // Parse the AT-URI to extract repo and rkey
-        // Format: at://did:plc:xxx/app.bsky.feed.like/rkey
-        let parts: Vec<&str> = record_uri.split('/').collect();
-        if parts.len() < 5 {
-            return Err(ClientError::InvalidResponse("invalid record URI".into()));
-        }
-        let repo = parts[2]; // did:plc:xxx
-        let rkey = parts[4]; // the record key
+        let (repo, rkey) = parse_record_uri(record_uri, collection)?;
 
         let collection = atrium_api::types::string::Nsid::new(collection.to_string())
             .map_err(|_| ClientError::InvalidResponse("invalid collection".into()))?;
@@ -2259,8 +2259,6 @@ impl HangarClient {
         })
     }
 
-    /// Search actors (users) by query string
-    #[allow(clippy::await_holding_lock)]
     /// Fast typeahead search for actors (used by mention autocomplete).
     /// Returns a lightweight list of matching profiles.
     #[allow(clippy::await_holding_lock)]
@@ -2317,6 +2315,7 @@ impl HangarClient {
         })
     }
 
+    /// Search actors (users) by query string, with cursor pagination
     #[allow(clippy::await_holding_lock)]
     pub async fn search_actors(
         &self,
@@ -2495,6 +2494,26 @@ pub async fn fetch_link_card_meta(url: &str) -> Result<LinkCardData, ClientError
     })
 }
 
+/// Split an AT-URI like `at://did:plc:xxx/app.bsky.feed.post/rkey` into its
+/// repo DID and rkey. Refuses a URI from any other collection, so a like URI
+/// can never reach the post delete path.
+fn parse_record_uri<'a>(
+    record_uri: &'a str,
+    collection: &str,
+) -> Result<(&'a str, &'a str), ClientError> {
+    let parts: Vec<&str> = record_uri.split('/').collect();
+    if parts.len() < 5 {
+        return Err(ClientError::InvalidResponse("invalid record URI".into()));
+    }
+    if parts[3] != collection {
+        return Err(ClientError::InvalidResponse(format!(
+            "expected a {collection} URI, got {}",
+            parts[3]
+        )));
+    }
+    Ok((parts[2], parts[4]))
+}
+
 /// Basic HTML entity decoding for OG metadata values.
 fn html_decode(s: &str) -> String {
     s.replace("&amp;", "&")
@@ -2639,5 +2658,37 @@ mod tests {
             serde_json::from_str(r#"{"$type":"app.bsky.embed.gallery#view","items":[]}"#)
                 .expect("empty gallery");
         assert!(HangarClient::extract_unknown_embed(&empty, "post").is_none());
+    }
+
+    /// The AT-URI parser feeding every delete.
+    #[test]
+    fn a_record_uri_parses_into_repo_and_rkey_or_is_refused() {
+        let (repo, rkey) = parse_record_uri(
+            "at://did:plc:abc123/app.bsky.feed.post/3kxyz",
+            "app.bsky.feed.post",
+        )
+        .expect("a well-formed post URI parses");
+        assert_eq!(repo, "did:plc:abc123");
+        assert_eq!(rkey, "3kxyz");
+
+        // A like URI handed to the post delete path would delete whatever
+        // post happens to share the rkey, so the collection has to match.
+        assert!(
+            parse_record_uri(
+                "at://did:plc:abc123/app.bsky.feed.like/3kxyz",
+                "app.bsky.feed.post",
+            )
+            .is_err()
+        );
+
+        // Too short to carry an rkey.
+        assert!(parse_record_uri("at://did:plc:abc123", "app.bsky.feed.post").is_err());
+        assert!(parse_record_uri("", "app.bsky.feed.post").is_err());
+
+        // The other collections the app deletes from still parse.
+        for coll in ["app.bsky.feed.like", "app.bsky.feed.repost"] {
+            let uri = format!("at://did:plc:a/{coll}/rkey");
+            assert!(parse_record_uri(&uri, coll).is_ok());
+        }
     }
 }

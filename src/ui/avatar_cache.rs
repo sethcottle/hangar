@@ -7,6 +7,7 @@
 use crate::cache::CacheDb;
 use gtk4::gdk;
 use gtk4::glib;
+use gtk4::prelude::*;
 use libadwaita as adw;
 use once_cell::sync::Lazy;
 use std::cell::{Cell, RefCell};
@@ -158,9 +159,32 @@ pub fn cached_bytes(url: &str) -> Option<Vec<u8>> {
         .cloned()
 }
 
-/// Load an avatar image from URL
+/// Object-data key for the widget's newest load generation.
+const LOAD_GENERATION_KEY: &str = "hangar-avatar-load-generation";
+
+/// The generation of the newest `load_avatar` call on this widget.
+fn load_generation(avatar: &adw::Avatar) -> u64 {
+    // SAFETY: the key only ever holds a u64, set in bump_load_generation.
+    unsafe { avatar.data::<u64>(LOAD_GENERATION_KEY) }.map_or(0, |v| unsafe { *v.as_ref() })
+}
+
+/// Mark a new load on this widget. Every earlier load goes stale.
+fn bump_load_generation(avatar: &adw::Avatar) -> u64 {
+    let next = load_generation(avatar).wrapping_add(1);
+    // SAFETY: same u64 type as load_generation reads.
+    unsafe { avatar.set_data(LOAD_GENERATION_KEY, next) };
+    next
+}
+
+/// Load an avatar image from URL.
+///
+/// A recycled row calls this again with a new URL while the old fetch is
+/// still out, and the old bytes must never land on the new occupant. Each
+/// call bumps a per-widget generation; a poll from an earlier call sees the
+/// newer generation and stops without touching the widget.
 pub fn load_avatar(avatar: adw::Avatar, url: String) {
     let url = ensure_jpeg_format(&url);
+    let generation = bump_load_generation(&avatar);
 
     // Check the memory cache first; hits return immediately
     if let Some(cached) = AVATAR_CACHE.read().unwrap().get(&url).cloned() {
@@ -171,21 +195,25 @@ pub fn load_avatar(avatar: adw::Avatar, url: String) {
     // Kick off a fetch if not already in progress (deduplicates)
     spawn_fetch_if_needed(&url);
 
-    // Poll the cache on the GTK main thread until the image arrives
-    let poll_url = url.clone();
-    glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
-        if let Some(bytes) = AVATAR_CACHE.read().unwrap().get(&poll_url).cloned() {
+    // Poll the cache on the GTK main thread until the image arrives. The
+    // poll holds the widget weakly so it cannot outlive a discarded row.
+    let weak = avatar.downgrade();
+    glib::timeout_add_local(POLL_INTERVAL, move || {
+        let Some(avatar) = weak.upgrade() else {
+            return glib::ControlFlow::Break;
+        };
+        if load_generation(&avatar) != generation {
+            // A newer load owns this widget now.
+            return glib::ControlFlow::Break;
+        }
+        if let Some(bytes) = AVATAR_CACHE.read().unwrap().get(&url).cloned() {
             apply_avatar_bytes(&avatar, &bytes);
             glib::ControlFlow::Break
+        } else if IN_FLIGHT.read().unwrap().contains(&url) {
+            glib::ControlFlow::Continue
         } else {
-            // Check if fetch is still in progress
-            let still_in_flight = IN_FLIGHT.read().unwrap().contains(&poll_url);
-            if still_in_flight {
-                glib::ControlFlow::Continue
-            } else {
-                // Fetch completed but no data in cache = fetch failed
-                glib::ControlFlow::Break
-            }
+            // Fetch completed but no data in cache = fetch failed
+            glib::ControlFlow::Break
         }
     });
 }
@@ -327,5 +355,121 @@ fn decode_result(picture: &gtk4::Picture, bytes: &[u8]) -> ImageLoadResult {
         ImageLoadResult::Shown
     } else {
         ImageLoadResult::Failed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    /// Run the GTK main loop for `ms`. The loads under test are polls on the
+    /// main thread, so nothing happens without the loop turning.
+    fn pump(ms: u64) {
+        let context = glib::MainContext::default();
+        let deadline = Instant::now() + Duration::from_millis(ms);
+        while Instant::now() < deadline {
+            while context.iteration(false) {}
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// A solid PNG of a given size. Which image landed is read off the width.
+    fn png(size: i32) -> Vec<u8> {
+        let pixbuf =
+            gdk::gdk_pixbuf::Pixbuf::new(gdk::gdk_pixbuf::Colorspace::Rgb, false, 8, size, size)
+                .expect("allocate pixbuf");
+        pixbuf.fill(0x00_88_44_ff);
+        pixbuf
+            .save_to_bufferv("png", &[])
+            .expect("encode png")
+            .to_vec()
+    }
+
+    /// Serve a fast 8px image at once and a slow 24px one after a delay.
+    fn start_server() -> u16 {
+        let fast = png(8);
+        let slow = png(24);
+
+        let server = tiny_http::Server::http("127.0.0.1:0").expect("bind test server");
+        let port = server
+            .server_addr()
+            .to_ip()
+            .expect("test server address")
+            .port();
+
+        std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                let (fast, slow) = (fast.clone(), slow.clone());
+                // One thread per request, so the slow image is still
+                // outstanding while the fast one is asked for.
+                std::thread::spawn(move || {
+                    let path = request
+                        .url()
+                        .split('?')
+                        .next()
+                        .unwrap_or_default()
+                        .to_string();
+                    let response = match path.as_str() {
+                        "/fast.png" => tiny_http::Response::from_data(fast).boxed(),
+                        "/slow.png" => {
+                            std::thread::sleep(Duration::from_millis(600));
+                            tiny_http::Response::from_data(slow).boxed()
+                        }
+                        _ => tiny_http::Response::empty(404).boxed(),
+                    };
+                    let _ = request.respond(response);
+                });
+            }
+        });
+
+        port
+    }
+
+    /// The refuter's repro: bind a slow avatar, rebind to a fast one, pump
+    /// until the slow fetch lands. The slow bytes must not win.
+    #[test]
+    fn a_rebind_drops_the_previous_loads_slow_fetch() {
+        crate::ui::with_gtk(a_rebind_drops_the_previous_loads_slow_fetch_body);
+    }
+
+    fn a_rebind_drops_the_previous_loads_slow_fetch_body() {
+        let port = start_server();
+        let slow = format!("http://127.0.0.1:{port}/slow.png?rebind");
+        let fast = format!("http://127.0.0.1:{port}/fast.png?rebind");
+
+        let avatar = adw::Avatar::new(32, None, false);
+        load_avatar(avatar.clone(), slow);
+        load_avatar(avatar.clone(), fast);
+        pump(1500);
+
+        let paintable = avatar.custom_image().expect("the second load landed");
+        assert_eq!(
+            paintable.intrinsic_width(),
+            8,
+            "the first load's slow fetch landed on a widget since bound to someone else"
+        );
+    }
+
+    /// The poll must hold the widget weakly. A strong capture kept every
+    /// discarded row alive until its fetch resolved.
+    #[test]
+    fn a_pending_load_does_not_keep_the_widget_alive() {
+        crate::ui::with_gtk(a_pending_load_does_not_keep_the_widget_alive_body);
+    }
+
+    fn a_pending_load_does_not_keep_the_widget_alive_body() {
+        let port = start_server();
+        let slow = format!("http://127.0.0.1:{port}/slow.png?lifetime");
+
+        let avatar = adw::Avatar::new(32, None, false);
+        let weak = avatar.downgrade();
+        load_avatar(avatar, slow);
+
+        pump(100);
+        assert!(
+            weak.upgrade().is_none(),
+            "the pending load held a strong reference to the widget"
+        );
     }
 }

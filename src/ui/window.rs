@@ -4,6 +4,7 @@
 #![allow(clippy::collapsible_if)]
 #![allow(clippy::collapsible_else_if)]
 
+use super::actor_row::{ActorObject, ActorRow};
 use super::post_row::PostRow;
 use super::sidebar::Sidebar;
 use crate::atproto::{Conversation, Notification, Post, SavedFeed};
@@ -228,6 +229,12 @@ mod imp {
         pub search_spinner: RefCell<Option<gtk4::Spinner>>,
         pub search_entry: RefCell<Option<gtk4::SearchEntry>>,
         pub search_callback: RefCell<Option<Box<dyn Fn(String) + 'static>>>,
+        // People results live beside the post results on their own stack
+        // page; the two lists paginate on independent cursors.
+        pub search_people_model: RefCell<Option<gio::ListStore>>,
+        pub search_people_load_more_callback: RefCell<Option<Box<dyn Fn() + 'static>>>,
+        pub search_people_scrolled_window: RefCell<Option<gtk4::ScrolledWindow>>,
+        pub search_people_spinner: RefCell<Option<gtk4::Spinner>>,
         // Toast overlay for notifications
         pub toast_overlay: RefCell<Option<adw::ToastOverlay>>,
         // Settings page
@@ -1675,6 +1682,20 @@ impl HangarWindow {
         handle_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         profile_header.append(&handle_label);
 
+        // Bio, with links. Wire text: it wraps and caps its line length,
+        // there is no horizontal scrollbar to save it.
+        if let Some(bio) = profile.description.as_deref().filter(|b| !b.is_empty()) {
+            let bio_label = gtk4::Label::new(None);
+            bio_label.set_wrap(true);
+            bio_label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+            bio_label.set_max_width_chars(60);
+            bio_label.set_justify(gtk4::Justification::Center);
+            bio_label.set_use_markup(true);
+            crate::ui::rich_text::set_linkified(&bio_label, bio);
+            self.connect_bio_links(&bio_label);
+            profile_header.append(&bio_label);
+        }
+
         content_box.append(&profile_header);
 
         // Separator
@@ -2754,7 +2775,11 @@ impl HangarWindow {
         bio_label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
         bio_label.set_halign(gtk4::Align::Start);
         bio_label.set_xalign(0.0);
+        bio_label.set_use_markup(true); // Bio links
         bio_label.set_visible(false); // Hidden until profile loads
+        // Wired once here. update_profile_header runs twice per login,
+        // cache then network, and would stack handlers.
+        self.connect_bio_links(&bio_label);
         info_box.append(&bio_label);
 
         // Stats row
@@ -2807,6 +2832,29 @@ impl HangarWindow {
         header_box
     }
 
+    /// Route link activations on a bio label, matching post text: mentions
+    /// open the profile in-app, hashtags do nothing yet, and anything else
+    /// is a real URL for the browser, with a toast either way.
+    fn connect_bio_links(&self, label: &gtk4::Label) {
+        let win = self.downgrade();
+        label.connect_activate_link(move |label, uri| {
+            if let Some(handle) = uri.strip_prefix("bsky-mention://") {
+                if let Some(win) = win.upgrade()
+                    && let Some(cb) = win.imp().mention_clicked_callback.borrow().as_ref()
+                {
+                    cb(handle.to_string());
+                }
+                glib::Propagation::Stop
+            } else if uri.starts_with("bsky-tag://") {
+                // Styled only, like hashtags in posts.
+                glib::Propagation::Stop
+            } else {
+                crate::ui::external::open_url(label, uri, "link");
+                glib::Propagation::Stop
+            }
+        });
+    }
+
     /// Update the profile page header with profile data
     pub fn update_profile_header(&self, profile: &Profile) {
         let imp = self.imp();
@@ -2826,8 +2874,8 @@ impl HangarWindow {
 
         // Update bio
         if let Some(label) = imp.profile_bio_label.borrow().as_ref() {
-            if let Some(bio) = &profile.description {
-                label.set_text(bio);
+            if let Some(bio) = profile.description.as_deref().filter(|b| !b.is_empty()) {
+                crate::ui::rich_text::set_linkified(label, bio);
                 label.set_visible(true);
             } else {
                 label.set_visible(false);
@@ -3158,7 +3206,7 @@ impl HangarWindow {
 
         // Search entry
         let search_entry = gtk4::SearchEntry::new();
-        search_entry.set_placeholder_text(Some("Search posts…"));
+        search_entry.set_placeholder_text(Some("Search…"));
         search_entry.set_margin_start(12);
         search_entry.set_margin_end(12);
         search_entry.set_margin_top(12);
@@ -3183,7 +3231,19 @@ impl HangarWindow {
         // Store search entry reference
         self.imp().search_entry.replace(Some(search_entry));
 
-        // Results list in overlay (for spinner)
+        // One stack page per result kind. Posts and people paginate on
+        // independent cursors, so each keeps its own list and scroller.
+        let results_stack = adw::ViewStack::new();
+        results_stack.set_vexpand(true);
+
+        let switcher = adw::ViewSwitcher::new();
+        switcher.set_policy(adw::ViewSwitcherPolicy::Wide);
+        switcher.set_stack(Some(&results_stack));
+        switcher.set_halign(gtk4::Align::Center);
+        switcher.set_margin_bottom(8);
+        search_box.append(&switcher);
+
+        // Post results list in overlay (for spinner)
         let overlay = gtk4::Overlay::new();
         overlay.set_vexpand(true);
 
@@ -3305,7 +3365,7 @@ impl HangarWindow {
         spinner.set_margin_bottom(16);
         overlay.add_overlay(&spinner);
 
-        search_box.append(&overlay);
+        results_stack.add_titled_with_icon(&overlay, Some("posts"), "Posts", "view-list-symbolic");
 
         // Store references
         let imp = self.imp();
@@ -3330,7 +3390,108 @@ impl HangarWindow {
             }
         });
 
+        self.build_search_people_page(&results_stack);
+        search_box.append(&results_stack);
+
         search_box
+    }
+
+    /// Build the People page of the search results stack.
+    ///
+    /// The same virtualized chain as every feed: scroller over clamp
+    /// scrollable over list view, nothing between. See `build_timeline`.
+    fn build_search_people_page(&self, results_stack: &adw::ViewStack) {
+        let overlay = gtk4::Overlay::new();
+        overlay.set_vexpand(true);
+
+        let model = gio::ListStore::new::<ActorObject>();
+        let factory = gtk4::SignalListItemFactory::new();
+
+        factory.connect_setup(|_, item| {
+            let row = ActorRow::new();
+            if let Some(list_item) = item.downcast_ref::<gtk4::ListItem>() {
+                list_item.set_child(Some(&row));
+            }
+        });
+
+        let win = self.downgrade();
+        factory.connect_bind(move |_, item| {
+            let Some(win) = win.upgrade() else {
+                return;
+            };
+            if let Some(list_item) = item.downcast_ref::<gtk4::ListItem>()
+                && let Some(actor_object) = list_item.item().and_downcast::<ActorObject>()
+                && let Some(profile) = actor_object.profile()
+                && let Some(row) = list_item.child().and_downcast::<ActorRow>()
+            {
+                row.bind(&profile);
+                // Open the profile in-app on click
+                let w = win.downgrade();
+                row.set_activated_callback(move |profile| {
+                    let Some(w) = w.upgrade() else {
+                        return;
+                    };
+                    w.imp()
+                        .profile_clicked_callback
+                        .borrow()
+                        .as_ref()
+                        .map(|cb| cb(profile));
+                });
+            }
+        });
+
+        let selection = gtk4::NoSelection::new(Some(model.clone()));
+        let list_view = gtk4::ListView::new(Some(selection), Some(factory));
+        list_view.add_css_class("background");
+
+        let clamp = adw::ClampScrollable::new();
+        clamp.set_maximum_size(800);
+        clamp.set_tightening_threshold(600);
+        clamp.set_child(Some(&list_view));
+
+        let scrolled = gtk4::ScrolledWindow::new();
+        scrolled.set_vexpand(true);
+        scrolled.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
+        scrolled.set_child(Some(&clamp));
+        overlay.set_child(Some(&scrolled));
+
+        // Loading spinner
+        let spinner = gtk4::Spinner::new();
+        spinner.set_visible(false);
+        spinner.set_halign(gtk4::Align::Center);
+        spinner.set_valign(gtk4::Align::End);
+        spinner.set_margin_bottom(16);
+        overlay.add_overlay(&spinner);
+
+        let imp = self.imp();
+        imp.search_people_model.replace(Some(model));
+        imp.search_people_scrolled_window
+            .replace(Some(scrolled.clone()));
+        imp.search_people_spinner.replace(Some(spinner));
+
+        // Infinite scroll
+        let adj = scrolled.vadjustment();
+        let win = self.downgrade();
+        adj.connect_value_changed(move |adj| {
+            let Some(win) = win.upgrade() else {
+                return;
+            };
+            let value = adj.value();
+            let upper = adj.upper();
+            let page_size = adj.page_size();
+            if value >= upper - page_size - 200.0 {
+                if let Some(cb) = win.imp().search_people_load_more_callback.borrow().as_ref() {
+                    cb();
+                }
+            }
+        });
+
+        results_stack.add_titled_with_icon(
+            &overlay,
+            Some("people"),
+            "People",
+            "system-users-symbolic",
+        );
     }
 
     /// Show the search page (top-level navigation, instant switch)
@@ -3377,9 +3538,46 @@ impl HangarWindow {
         self.imp().search_callback.replace(Some(Box::new(callback)));
     }
 
-    /// Clear search results
+    /// Set people results in the search list
+    pub fn set_search_people_results(&self, profiles: Vec<Profile>) {
+        if let Some(model) = self.imp().search_people_model.borrow().as_ref() {
+            model.remove_all();
+            for profile in profiles {
+                model.append(&ActorObject::new(profile));
+            }
+        }
+    }
+
+    /// Append more people results to the list
+    pub fn append_search_people_results(&self, profiles: Vec<Profile>) {
+        if let Some(model) = self.imp().search_people_model.borrow().as_ref() {
+            for profile in profiles {
+                model.append(&ActorObject::new(profile));
+            }
+        }
+    }
+
+    /// Set loading state for the people page of search
+    pub fn set_search_people_loading(&self, loading: bool) {
+        if let Some(spinner) = self.imp().search_people_spinner.borrow().as_ref() {
+            spinner.set_visible(loading);
+            spinner.set_spinning(loading);
+        }
+    }
+
+    /// Set callback for loading more people results
+    pub fn set_search_people_load_more_callback<F: Fn() + 'static>(&self, callback: F) {
+        self.imp()
+            .search_people_load_more_callback
+            .replace(Some(Box::new(callback)));
+    }
+
+    /// Clear search results, both pages
     pub fn clear_search_results(&self) {
         if let Some(model) = self.imp().search_model.borrow().as_ref() {
+            model.remove_all();
+        }
+        if let Some(model) = self.imp().search_people_model.borrow().as_ref() {
             model.remove_all();
         }
     }
@@ -3415,6 +3613,108 @@ impl HangarWindow {
                 action();
             });
             overlay.add_toast(toast);
+        }
+    }
+
+    // ======== Post removal ========
+
+    /// Take a deleted post out of every list that is showing it.
+    ///
+    /// Walks the widget tree rather than keeping a registry: a pushed profile
+    /// page builds a model nothing else holds, and a thread page holds bare
+    /// `PostRow`s in a box. A virtualized list is edited through its model
+    /// only; a `PostRow` met outside any `GtkListView` is a thread row and
+    /// comes straight out of its box.
+    pub fn remove_post(&self, uri: &str) {
+        let mut thread_rows = Vec::new();
+        Self::collect_post_removals(self.upcast_ref::<gtk4::Widget>(), uri, &mut thread_rows);
+        for row in thread_rows {
+            if let Some(parent) = row.parent().and_downcast::<gtk4::Box>() {
+                parent.remove(&row);
+            }
+        }
+        self.pop_thread_pages_for(uri);
+    }
+
+    /// Close any open thread page rooted at a deleted post. Without this,
+    /// deleting the root left the thread page up with nothing to show.
+    fn pop_thread_pages_for(&self, uri: &str) {
+        let tag = format!("thread:{uri}");
+        for section in [
+            "home", "mentions", "activity", "chat", "profile", "likes", "search",
+        ] {
+            let Some(nav_view) = self.nav_view_named(section) else {
+                continue;
+            };
+            let Some(page) = nav_view.find_page(&tag) else {
+                continue;
+            };
+            // Pop to the page underneath, taking the thread page and anything
+            // stacked on top of it off in one transition.
+            let stack = nav_view.navigation_stack();
+            let index = (0..stack.n_items())
+                .find(|&i| stack.item(i).as_ref() == Some(page.upcast_ref::<glib::Object>()));
+            let Some(index) = index else { continue };
+            if index == 0 {
+                continue;
+            }
+            if let Some(below) = stack.item(index - 1).and_downcast::<adw::NavigationPage>() {
+                nav_view.pop_to_page(&below);
+            }
+        }
+    }
+
+    /// Remove `uri` from every post model under `widget`. Rows inside a
+    /// `GtkListView` are pooled, so those subtrees are never descended into;
+    /// matching rows found elsewhere are collected for the caller to unparent.
+    fn collect_post_removals(widget: &gtk4::Widget, uri: &str, thread_rows: &mut Vec<PostRow>) {
+        if let Some(list) = widget.downcast_ref::<gtk4::ListView>() {
+            let model = list
+                .model()
+                .and_then(|m| m.downcast::<gtk4::NoSelection>().ok())
+                .and_then(|ns| ns.model());
+            if let Some(model) = model {
+                if let Some(store) = model.downcast_ref::<gio::ListStore>() {
+                    Self::remove_post_from_store(store, uri);
+                } else if let Some(flat) = model.downcast_ref::<gtk4::FlattenListModel>() {
+                    // The own profile page: a store of stores, with the posts
+                    // in one of them and the header marker in another.
+                    if let Some(sections) = flat.model() {
+                        for i in 0..sections.n_items() {
+                            if let Some(store) = sections.item(i).and_downcast::<gio::ListStore>() {
+                                Self::remove_post_from_store(&store, uri);
+                            }
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        if let Some(row) = widget.downcast_ref::<PostRow>() {
+            if row.post_uri().as_deref() == Some(uri) {
+                thread_rows.push(row.clone());
+            }
+            return;
+        }
+        let mut child = widget.first_child();
+        while let Some(c) = child {
+            child = c.next_sibling();
+            Self::collect_post_removals(&c, uri, thread_rows);
+        }
+    }
+
+    fn remove_post_from_store(store: &gio::ListStore, uri: &str) {
+        let mut i = store.n_items();
+        while i > 0 {
+            i -= 1;
+            let matches = store
+                .item(i)
+                .and_downcast::<PostObject>()
+                .and_then(|o| o.post())
+                .is_some_and(|p| p.uri == uri);
+            if matches {
+                store.remove(i);
+            }
         }
     }
 
@@ -5466,12 +5766,12 @@ mod tests {
 
     /// Every feed page this window builds, and the one it builds on demand.
     ///
-    /// The seven `AdwClamp` to `AdwClampScrollable` swaps only count at the
+    /// The `AdwClamp` to `AdwClampScrollable` swaps only count at the
     /// call sites, and a clamp built inside a test says nothing about what
-    /// `window.rs` uses. So this walks the trees the app constructs: six feeds
-    /// off the window's own fields, plus the other-user profile page, which is
-    /// built per profile. Reverting any one of the seven turns this red on that
-    /// page's name.
+    /// `window.rs` uses. So this walks the trees the app constructs: seven
+    /// feeds off the window's own fields, plus the other-user profile page,
+    /// which is built per profile. Reverting any one of the eight turns this
+    /// red on that page's name.
     ///
     /// The pages that keep a plain `AdwClamp` are covered by
     /// [`the_thread_page_keeps_the_viewport_its_box_of_rows_needs`].
@@ -5492,6 +5792,7 @@ mod tests {
             ("chat", &imp.chat_scrolled_window),
             ("likes", &imp.likes_scrolled_window),
             ("search", &imp.search_scrolled_window),
+            ("search people", &imp.search_people_scrolled_window),
         ] {
             let scrolled = cell
                 .borrow()
@@ -5518,8 +5819,8 @@ mod tests {
 
         assert_eq!(
             feeds.len(),
-            7,
-            "this test is meant to cover all seven swapped feeds"
+            8,
+            "this test is meant to cover all eight virtualized feeds"
         );
 
         for (page, scrolled) in &feeds {
@@ -5573,6 +5874,247 @@ mod tests {
             find_list_view(&child).is_none(),
             "the thread page has become a GtkListView, so it should be virtualized \
              and covered by the feed table above rather than kept on a viewport"
+        );
+
+        window.destroy();
+    }
+
+    /// Both profile pages linkify the bio, and hostile text in it must not
+    /// blank the label.
+    #[test]
+    fn profile_bios_come_out_linkified() {
+        crate::ui::with_gtk(profile_bios_come_out_linkified_body);
+    }
+
+    fn profile_bios_come_out_linkified_body() {
+        let bio = "hi @user.bsky.social & <you>, see https://example.com";
+
+        let window: HangarWindow = glib::Object::builder().build();
+
+        let mut profile = Profile::minimal(
+            "did:plc:bio".into(),
+            "bio.bsky.social".into(),
+            Some("Bio".into()),
+            None,
+        );
+        profile.description = Some(bio.into());
+
+        // The own profile header. The app updates it twice per login, cache
+        // then network, so run it twice here.
+        window.update_profile_header(&profile);
+        window.update_profile_header(&profile);
+        let label = window
+            .imp()
+            .profile_bio_label
+            .borrow()
+            .clone()
+            .expect("the profile header built a bio label");
+        assert_eq!(
+            label.text().as_str(),
+            bio,
+            "the bio must survive `&` and `<`"
+        );
+        assert!(
+            label.uses_markup(),
+            "the bio fell back to plain text; its links are dead"
+        );
+
+        // The pushed profile page.
+        let page = window.build_profile_page(&profile, vec![a_post("one")]);
+        let content = page.child().expect("the profile page has content");
+        let mut widgets = Vec::new();
+        walk(&content, 0, &mut widgets);
+        let bio_label = widgets
+            .iter()
+            .filter_map(|(_, w)| w.downcast_ref::<gtk4::Label>())
+            .find(|l| l.text().as_str() == bio)
+            .expect("the pushed profile page shows the bio");
+        assert!(
+            bio_label.uses_markup(),
+            "the pushed page's bio fell back to plain text"
+        );
+
+        window.destroy();
+    }
+
+    /// People results land in their own model, replace on a new search, and
+    /// clear together with the post results.
+    #[test]
+    fn search_people_results_follow_the_search_lifecycle() {
+        crate::ui::with_gtk(search_people_results_follow_the_search_lifecycle_body);
+    }
+
+    fn search_people_results_follow_the_search_lifecycle_body() {
+        let window: HangarWindow = glib::Object::builder().build();
+        let imp = window.imp();
+
+        let someone = |handle: &str| {
+            Profile::minimal(
+                format!("did:plc:{handle}"),
+                format!("{handle}.bsky.social"),
+                None,
+                None,
+            )
+        };
+
+        window.set_search_people_results(vec![someone("a"), someone("b")]);
+        window.append_search_people_results(vec![someone("c")]);
+
+        let model = imp
+            .search_people_model
+            .borrow()
+            .clone()
+            .expect("the search page built a people model");
+        assert_eq!(model.n_items(), 3);
+
+        window.set_search_people_results(vec![someone("d")]);
+        assert_eq!(model.n_items(), 1, "a new search replaces the people list");
+
+        window.clear_search_results();
+        assert_eq!(model.n_items(), 0);
+        let posts_model = imp
+            .search_model
+            .borrow()
+            .clone()
+            .expect("the search page built a posts model");
+        assert_eq!(posts_model.n_items(), 0);
+
+        window.destroy();
+    }
+
+    /// Deleting a post has to take it out of everything showing it.
+    ///
+    /// The stored models, a pushed profile page whose model nothing else
+    /// holds, and a thread page whose rows sit in a plain box. A thread page
+    /// rooted at the deleted post pops entirely. Everything not deleted has
+    /// to survive, the own profile header row included.
+    #[test]
+    fn remove_post_takes_the_post_out_of_every_list_showing_it() {
+        crate::ui::with_gtk(remove_post_takes_the_post_out_of_every_list_showing_it_body);
+    }
+
+    fn remove_post_takes_the_post_out_of_every_list_showing_it_body() {
+        let window: HangarWindow = glib::Object::builder().build();
+        let imp = window.imp();
+
+        window.set_posts(vec![a_post("doomed"), a_post("kept")]);
+        window.set_likes(vec![a_post("doomed")]);
+        window.set_search_results(vec![a_post("kept"), a_post("doomed")]);
+        window.set_profile_posts(vec![a_post("doomed"), a_post("kept")]);
+
+        let profile = Profile::minimal(
+            "did:plc:other".into(),
+            "other.bsky.social".into(),
+            Some("Other".into()),
+            None,
+        );
+        window.push_profile_page(&profile, vec![a_post("doomed"), a_post("kept")]);
+        // A thread rooted elsewhere that shows the doomed post as a parent.
+        window.push_thread_page(&a_post("kept"), vec![a_post("doomed"), a_post("kept")]);
+        // The thread rooted at the doomed post itself, on top of it.
+        window.push_thread_page(&a_post("doomed"), vec![a_post("doomed"), a_post("kept")]);
+
+        let doomed = a_post("doomed").uri;
+        window.remove_post(&doomed);
+
+        // Let the pop settle; the unmapped view may finish through idles.
+        let ctx = glib::MainContext::default();
+        while ctx.iteration(false) {}
+
+        let uris = |model: &gio::ListStore| -> Vec<String> {
+            (0..model.n_items())
+                .filter_map(|i| model.item(i).and_downcast::<PostObject>())
+                .filter_map(|o| o.post())
+                .map(|p| p.uri)
+                .collect()
+        };
+        for (page, cell) in [
+            ("timeline", &imp.timeline_model),
+            ("likes", &imp.likes_model),
+            ("search", &imp.search_model),
+            ("own profile", &imp.profile_page_model),
+        ] {
+            let model = cell
+                .borrow()
+                .clone()
+                .unwrap_or_else(|| panic!("the {page} page has a model"));
+            assert!(
+                !uris(&model).contains(&doomed),
+                "{page}: the deleted post is still in the model"
+            );
+        }
+        assert_eq!(
+            uris(&imp.timeline_model.borrow().clone().unwrap()),
+            vec![a_post("kept").uri],
+            "the timeline lost more than the deleted post"
+        );
+
+        // The own profile page keeps its header row.
+        let own_list = find_list_view(
+            &imp.profile_page_scrolled
+                .borrow()
+                .clone()
+                .expect("own profile scroller")
+                .upcast::<gtk4::Widget>(),
+        )
+        .expect("own profile list");
+        assert!(
+            own_list
+                .model()
+                .and_then(|m| m.item(0))
+                .and_downcast::<gtk4::StringObject>()
+                .is_some(),
+            "removing a post must not take the profile header row with it"
+        );
+
+        // The pushed profile page's own model.
+        let nav_view = imp
+            .home_nav_view
+            .borrow()
+            .clone()
+            .expect("the home section has a navigation view");
+        let profile_page = nav_view
+            .find_page("profile:did:plc:other")
+            .expect("the pushed profile page is in the stack");
+        let profile_list = find_list_view(&profile_page.clone().upcast::<gtk4::Widget>())
+            .expect("the pushed profile page has a list");
+        let profile_model = profile_list
+            .model()
+            .and_then(|m| m.downcast::<gtk4::NoSelection>().ok())
+            .and_then(|ns| ns.model())
+            .and_downcast::<gio::ListStore>()
+            .expect("the pushed profile list sits on a plain store");
+        assert_eq!(
+            uris(&profile_model),
+            vec![a_post("kept").uri],
+            "the pushed profile page kept the wrong posts"
+        );
+
+        // The thread page rooted at the deleted post closes.
+        assert!(
+            nav_view.find_page(&format!("thread:{doomed}")).is_none(),
+            "deleting the root of an open thread must pop its page"
+        );
+
+        // A thread rooted elsewhere stays; the deleted row leaves its box.
+        let thread_page = nav_view
+            .find_page(&format!("thread:{}", a_post("kept").uri))
+            .expect("the surviving thread page is in the stack");
+        let mut widgets = Vec::new();
+        walk(
+            &thread_page.clone().upcast::<gtk4::Widget>(),
+            0,
+            &mut widgets,
+        );
+        let thread_uris: Vec<String> = widgets
+            .iter()
+            .filter_map(|(_, w)| w.downcast_ref::<PostRow>())
+            .filter_map(|row| row.post_uri())
+            .collect();
+        assert_eq!(
+            thread_uris,
+            vec![a_post("kept").uri],
+            "the thread page should hold exactly the surviving post"
         );
 
         window.destroy();
