@@ -203,6 +203,9 @@ pub struct ComposeVideo {
     /// live ones no matter how often the strip rebuilds.
     pub progress_icon: crate::ui::progress_icon::ProgressIcon,
     pub status_label: gtk4::Label,
+    /// The probe's MediaFile, kept paused on its first frame so the tile
+    /// can show a real preview. None when GStreamer cannot read the file.
+    pub preview: Option<gtk4::MediaFile>,
 }
 
 /// A single post block in the thread composer (Post 2, 3, etc.)
@@ -1966,6 +1969,7 @@ impl ComposeDialog {
             aspect_ratio: None,
             progress_icon: crate::ui::progress_icon::ProgressIcon::new(),
             status_label,
+            preview: None,
         };
 
         match slot {
@@ -2136,7 +2140,18 @@ impl ComposeDialog {
             if width > 0 && height > 0 {
                 dialog.set_video_aspect(token, width as u32, height as u32);
             }
+            // Paused on its first frame, the probe doubles as the tile's
+            // preview.
             media.pause();
+            let kept = dialog.with_video(token, |video| {
+                video.preview = Some(media.clone());
+            });
+            if kept && let Some(slot) = dialog.video_slot(token) {
+                match slot {
+                    None => dialog.rebuild_image_strip(),
+                    Some(i) => dialog.rebuild_thread_image_strip(i),
+                }
+            }
             dialog.drop_video_probe(media);
         });
         let dialog_weak = self.downgrade();
@@ -2176,34 +2191,12 @@ impl ComposeDialog {
         self.refresh_post_gates();
     }
 
-    /// Build the tile a strip shows for its video.
+    /// Build the tile a strip shows for its video: the first frame when
+    /// GStreamer could read the file, a filename card when it could not.
     fn build_video_tile(&self, video: &ComposeVideo) -> gtk4::Overlay {
         let tile = gtk4::Overlay::new();
-        tile.set_size_request(200, 80);
         tile.add_css_class("compose-thumbnail");
 
-        let inner = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
-        inner.set_margin_top(10);
-        inner.set_margin_bottom(10);
-        inner.set_margin_start(10);
-        inner.set_margin_end(10);
-        inner.set_valign(gtk4::Align::Center);
-
-        let name_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
-        let icon_name = if video.mime_type == "image/gif" {
-            "image-x-generic-symbolic"
-        } else {
-            "video-x-generic-symbolic"
-        };
-        name_row.append(&gtk4::Image::from_icon_name(icon_name));
-        let name = gtk4::Label::new(Some(&video.file_name));
-        name.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
-        name.set_max_width_chars(18);
-        name.add_css_class("caption-heading");
-        name_row.append(&name);
-        inner.append(&name_row);
-
-        let status_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
         // The stored widgets move between rebuilds; unhook them first.
         for widget in [
             video.progress_icon.clone().upcast::<gtk4::Widget>(),
@@ -2215,12 +2208,16 @@ impl ComposeDialog {
                 parent.remove(&widget);
             }
         }
+
+        let status_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
         status_row.append(&video.progress_icon);
         status_row.append(&video.status_label);
         match video.state {
             VideoUploadState::Ready => {
                 video.progress_icon.set_visible(false);
                 video.status_label.set_text("Ready");
+                video.status_label.remove_css_class("error");
+                video.status_label.add_css_class("dim-label");
             }
             VideoUploadState::Failed => {
                 video.progress_icon.set_visible(false);
@@ -2230,8 +2227,55 @@ impl ComposeDialog {
             }
             _ => video.progress_icon.set_visible(true),
         }
-        inner.append(&status_row);
-        tile.set_child(Some(&inner));
+
+        let inner: gtk4::Widget = if let Some(preview) = &video.preview {
+            tile.set_size_request(142, 80);
+            let picture = gtk4::Picture::new();
+            picture.set_paintable(Some(preview));
+            picture.set_can_shrink(true);
+            picture.set_content_fit(gtk4::ContentFit::Cover);
+            picture.set_size_request(142, 80);
+            picture.add_css_class("compose-thumbnail-image");
+            tile.set_child(Some(&picture));
+
+            // Progress floats over the frame and leaves once Ready.
+            let chip = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+            chip.add_css_class("osd");
+            chip.add_css_class("compose-video-status");
+            chip.set_halign(gtk4::Align::Start);
+            chip.set_valign(gtk4::Align::End);
+            chip.set_margin_start(4);
+            chip.set_margin_bottom(4);
+            chip.append(&status_row);
+            chip.set_visible(video.state != VideoUploadState::Ready);
+            tile.add_overlay(&chip);
+            picture.upcast()
+        } else {
+            tile.set_size_request(200, 80);
+            let card = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+            card.set_margin_top(10);
+            card.set_margin_bottom(10);
+            card.set_margin_start(10);
+            card.set_margin_end(10);
+            card.set_valign(gtk4::Align::Center);
+
+            let name_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+            let icon_name = if video.mime_type == "image/gif" {
+                "image-x-generic-symbolic"
+            } else {
+                "video-x-generic-symbolic"
+            };
+            name_row.append(&gtk4::Image::from_icon_name(icon_name));
+            let name = gtk4::Label::new(Some(&video.file_name));
+            name.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
+            name.set_max_width_chars(18);
+            name.add_css_class("caption-heading");
+            name_row.append(&name);
+            card.append(&name_row);
+            card.append(&status_row);
+            tile.set_child(Some(&card));
+            card.upcast()
+        };
 
         // Remove button, top-right like the image tiles.
         let remove_btn = gtk4::Button::from_icon_name("window-close-symbolic");

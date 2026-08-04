@@ -626,6 +626,18 @@ popover.mention-popover > contents {
     color: white;
 }
 
+/* Upload progress floating over the video tile's preview frame */
+.compose-video-status {
+    padding: 2px 8px;
+    border-radius: 8px;
+    background-color: alpha(black, 0.6);
+    color: white;
+}
+
+.compose-video-status label {
+    color: white;
+}
+
 /* Compose dialog character counter */
 .char-counter {
     font-variant-numeric: tabular-nums;
