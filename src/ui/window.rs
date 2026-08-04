@@ -172,6 +172,19 @@ mod imp {
         pub reply_callback: RefCell<Option<Box<dyn Fn(Post) + 'static>>>,
         pub compose_callback: RefCell<Option<Box<dyn Fn() + 'static>>>,
         pub loading_spinner: RefCell<Option<gtk4::Spinner>>,
+        // Empty states: each list's overlay and StatusPage trade places
+        // when a load turns out empty. Search keeps its pages inside the
+        // results stack, so those two toggle alone.
+        pub timeline_overlay: RefCell<Option<gtk4::Overlay>>,
+        pub timeline_empty_state: RefCell<Option<adw::StatusPage>>,
+        pub mentions_overlay: RefCell<Option<gtk4::Overlay>>,
+        pub mentions_empty_state: RefCell<Option<adw::StatusPage>>,
+        pub activity_overlay: RefCell<Option<gtk4::Overlay>>,
+        pub activity_empty_state: RefCell<Option<adw::StatusPage>>,
+        pub likes_overlay: RefCell<Option<gtk4::Overlay>>,
+        pub likes_empty_state: RefCell<Option<adw::StatusPage>>,
+        pub search_empty_state: RefCell<Option<adw::StatusPage>>,
+        pub search_people_empty_state: RefCell<Option<adw::StatusPage>>,
         pub new_posts_banner: RefCell<Option<gtk4::Button>>,
         pub new_posts_callback: RefCell<Option<Box<dyn Fn() + 'static>>>,
         pub scrolled_window: RefCell<Option<gtk4::ScrolledWindow>>,
@@ -787,6 +800,15 @@ impl HangarWindow {
 
         timeline_box.append(&overlay);
 
+        let empty_state = Self::empty_state_page(
+            "go-home-symbolic",
+            "Your feed is empty",
+            "Posts from accounts you follow will appear here.",
+        );
+        timeline_box.append(&empty_state);
+        self.imp().timeline_overlay.replace(Some(overlay.clone()));
+        self.imp().timeline_empty_state.replace(Some(empty_state));
+
         // Autoplay is scoped to this scroller. Other feeds play inline only on
         // a press.
         if let Some(director) = self.imp().video_director.borrow().as_ref() {
@@ -964,6 +986,31 @@ impl HangarWindow {
             .replace(Some(Box::new(callback)));
     }
 
+    /// One StatusPage, hidden until its list turns out empty.
+    fn empty_state_page(icon: &str, title: &str, description: &str) -> adw::StatusPage {
+        let page = adw::StatusPage::new();
+        page.set_icon_name(Some(icon));
+        page.set_title(title);
+        page.set_description(Some(description));
+        page.set_vexpand(true);
+        page.set_visible(false);
+        page
+    }
+
+    /// Show the list or its empty state, whichever holds the truth.
+    fn apply_empty_state(
+        overlay: &RefCell<Option<gtk4::Overlay>>,
+        empty_state: &RefCell<Option<adw::StatusPage>>,
+        empty: bool,
+    ) {
+        if let Some(overlay) = overlay.borrow().as_ref() {
+            overlay.set_visible(!empty);
+        }
+        if let Some(page) = empty_state.borrow().as_ref() {
+            page.set_visible(empty);
+        }
+    }
+
     /// Point a Follow button at the given state: label, style, and back on.
     pub fn sync_follow_button(button: &gtk4::Button, following: bool) {
         button.set_label(if following { "Following" } else { "Follow" });
@@ -1008,6 +1055,7 @@ impl HangarWindow {
 
     pub fn set_posts(&self, posts: Vec<Post>) {
         let posts = Self::filter_feed_posts(posts);
+        let empty = posts.is_empty();
         if let Some(model) = self.imp().timeline_model.borrow().as_ref() {
             model.remove_all();
 
@@ -1016,6 +1064,8 @@ impl HangarWindow {
                 model.append(&post_object);
             }
         }
+        let imp = self.imp();
+        Self::apply_empty_state(&imp.timeline_overlay, &imp.timeline_empty_state, empty);
     }
 
     pub fn append_posts(&self, posts: Vec<Post>) {
@@ -1053,6 +1103,12 @@ impl HangarWindow {
     }
 
     pub fn show_new_posts_banner(&self, count: usize) {
+        // At the top there is nothing to announce: the posts just appeared
+        // in view. A banner here had nowhere to go when clicked.
+        if self.timeline_at_top() {
+            return;
+        }
+
         // Each poll reports only its own batch, so keep a running total
         // until the user actually looks at the top of the feed.
         let total = self.imp().unseen_posts.get().saturating_add(count);
@@ -1197,6 +1253,9 @@ impl HangarWindow {
         let adj = scrolled.vadjustment();
         let current_scroll = adj.value();
         let old_upper = adj.upper();
+        // At the top the new posts should simply appear in view; keeping
+        // the old position would shove the reader down past them.
+        let at_top = current_scroll < 50.0;
 
         // Collect all existing posts
         let existing_count = model.n_items();
@@ -1222,6 +1281,9 @@ impl HangarWindow {
         // The new content adds height at the top, so we add that difference
         // to the current scroll to keep viewing the same content.
         glib::idle_add_local_once(move || {
+            if at_top {
+                return;
+            }
             let new_upper = adj.upper();
             let height_added = new_upper - old_upper;
 
@@ -1231,6 +1293,16 @@ impl HangarWindow {
                 adj.set_value(new_scroll);
             }
         });
+    }
+
+    /// Whether the timeline is scrolled to (or near) the top, where new
+    /// posts land straight in view.
+    fn timeline_at_top(&self) -> bool {
+        self.imp()
+            .scrolled_window
+            .borrow()
+            .as_ref()
+            .is_some_and(|scrolled| scrolled.vadjustment().value() < 50.0)
     }
 
     /// Refresh all visible post timestamps
@@ -1814,6 +1886,7 @@ impl HangarWindow {
 
     /// Build a profile view page
     fn build_profile_page(&self, profile: &Profile, posts: Vec<Post>) -> adw::NavigationPage {
+        let no_posts = posts.is_empty();
         let content_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         content_box.set_hexpand(true);
 
@@ -2062,6 +2135,15 @@ impl HangarWindow {
         scrolled.set_vexpand(true);
         scrolled.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
         scrolled.set_child(Some(&clamp));
+
+        // The page is built once with its posts; nothing arrives later, so
+        // an empty list can say so statically.
+        if no_posts {
+            let none = gtk4::Label::new(Some("No posts yet"));
+            none.add_css_class("dim-label");
+            none.set_margin_top(12);
+            content_box.append(&none);
+        }
         content_box.append(&scrolled);
 
         // The tag is set by push_profile_page, which derives it from the DID so
@@ -2187,6 +2269,15 @@ impl HangarWindow {
 
         mentions_box.append(&overlay);
 
+        let empty_state = Self::empty_state_page(
+            "system-users-symbolic",
+            "No mentions yet",
+            "Replies, mentions, and quotes of you will appear here.",
+        );
+        mentions_box.append(&empty_state);
+        self.imp().mentions_overlay.replace(Some(overlay.clone()));
+        self.imp().mentions_empty_state.replace(Some(empty_state));
+
         let imp = self.imp();
         imp.mentions_model.replace(Some(model));
         imp.mentions_scrolled_window.replace(Some(scrolled.clone()));
@@ -2224,12 +2315,15 @@ impl HangarWindow {
 
     /// Set notifications/mentions in the mentions list
     pub fn set_mentions(&self, notifications: Vec<Notification>) {
+        let empty = notifications.is_empty();
         if let Some(model) = self.imp().mentions_model.borrow().as_ref() {
             model.remove_all();
             for notif in notifications {
                 model.append(&NotificationObject::new(notif));
             }
         }
+        let imp = self.imp();
+        Self::apply_empty_state(&imp.mentions_overlay, &imp.mentions_empty_state, empty);
     }
 
     /// Append more notifications to the mentions list
@@ -2374,6 +2468,15 @@ impl HangarWindow {
 
         activity_box.append(&overlay);
 
+        let empty_state = Self::empty_state_page(
+            "preferences-system-notifications-symbolic",
+            "No activity yet",
+            "Likes, reposts, and new followers will appear here.",
+        );
+        activity_box.append(&empty_state);
+        self.imp().activity_overlay.replace(Some(overlay.clone()));
+        self.imp().activity_empty_state.replace(Some(empty_state));
+
         let imp = self.imp();
         imp.activity_model.replace(Some(model));
         imp.activity_scrolled_window.replace(Some(scrolled.clone()));
@@ -2406,12 +2509,15 @@ impl HangarWindow {
 
     /// Set notifications in the activity list
     pub fn set_activity(&self, notifications: Vec<Notification>) {
+        let empty = notifications.is_empty();
         if let Some(model) = self.imp().activity_model.borrow().as_ref() {
             model.remove_all();
             for notif in notifications {
                 model.append(&NotificationObject::new(notif));
             }
         }
+        let imp = self.imp();
+        Self::apply_empty_state(&imp.activity_overlay, &imp.activity_empty_state, empty);
     }
 
     /// Append more notifications to the activity list
@@ -3577,6 +3683,15 @@ impl HangarWindow {
 
         likes_box.append(&overlay);
 
+        let empty_state = Self::empty_state_page(
+            "emote-love-symbolic",
+            "No likes yet",
+            "Posts you like will appear here.",
+        );
+        likes_box.append(&empty_state);
+        self.imp().likes_overlay.replace(Some(overlay.clone()));
+        self.imp().likes_empty_state.replace(Some(empty_state));
+
         // Store references
         let imp = self.imp();
         imp.likes_model.replace(Some(model));
@@ -3610,12 +3725,15 @@ impl HangarWindow {
 
     /// Set liked posts in the likes list
     pub fn set_likes(&self, posts: Vec<Post>) {
+        let empty = posts.is_empty();
         if let Some(model) = self.imp().likes_model.borrow().as_ref() {
             model.remove_all();
             for post in posts {
                 model.append(&PostObject::new(post));
             }
         }
+        let imp = self.imp();
+        Self::apply_empty_state(&imp.likes_overlay, &imp.likes_empty_state, empty);
     }
 
     /// Append more liked posts to the likes list
@@ -4091,6 +4209,16 @@ impl HangarWindow {
         spinner.set_margin_bottom(16);
         overlay.add_overlay(&spinner);
 
+        // Inside the overlay: the stack owns this page, so the empty state
+        // cannot be a sibling the way the other lists have one.
+        let empty_state = Self::empty_state_page(
+            "system-search-symbolic",
+            "No posts found",
+            "Nothing matched this search. Try different words.",
+        );
+        overlay.add_overlay(&empty_state);
+        self.imp().search_empty_state.replace(Some(empty_state));
+
         results_stack.add_titled_with_icon(&overlay, Some("posts"), "Posts", "view-list-symbolic");
 
         // Store references
@@ -4213,6 +4341,17 @@ impl HangarWindow {
             }
         });
 
+        // Same overlay placement as the posts page; see there.
+        let empty_state = Self::empty_state_page(
+            "system-search-symbolic",
+            "No people found",
+            "Nothing matched this search. Try a name or handle.",
+        );
+        overlay.add_overlay(&empty_state);
+        self.imp()
+            .search_people_empty_state
+            .replace(Some(empty_state));
+
         results_stack.add_titled_with_icon(
             &overlay,
             Some("people"),
@@ -4228,11 +4367,17 @@ impl HangarWindow {
 
     /// Set search results in the search list
     pub fn set_search_results(&self, posts: Vec<Post>) {
+        let empty = posts.is_empty();
         if let Some(model) = self.imp().search_model.borrow().as_ref() {
             model.remove_all();
             for post in posts {
                 model.append(&PostObject::new(post));
             }
+        }
+        // Only a completed search lands here, so empty means no results,
+        // not no search yet.
+        if let Some(page) = self.imp().search_empty_state.borrow().as_ref() {
+            page.set_visible(empty);
         }
     }
 
@@ -4267,11 +4412,16 @@ impl HangarWindow {
 
     /// Set people results in the search list
     pub fn set_search_people_results(&self, profiles: Vec<Profile>) {
+        let empty = profiles.is_empty();
         if let Some(model) = self.imp().search_people_model.borrow().as_ref() {
             model.remove_all();
             for profile in profiles {
                 model.append(&ActorObject::new(profile));
             }
+        }
+        // See set_search_results.
+        if let Some(page) = self.imp().search_people_empty_state.borrow().as_ref() {
+            page.set_visible(empty);
         }
     }
 
@@ -4306,6 +4456,13 @@ impl HangarWindow {
         }
         if let Some(model) = self.imp().search_people_model.borrow().as_ref() {
             model.remove_all();
+        }
+        // A fresh search is not a search with no results.
+        if let Some(page) = self.imp().search_empty_state.borrow().as_ref() {
+            page.set_visible(false);
+        }
+        if let Some(page) = self.imp().search_people_empty_state.borrow().as_ref() {
+            page.set_visible(false);
         }
     }
 
@@ -7056,6 +7213,128 @@ mod tests {
                 .and_downcast::<gtk4::Label>()
                 .is_some_and(|l| l.text() == "following"),
             "a missing count leaves the word as the whole stat"
+        );
+
+        window.destroy();
+    }
+
+    /// Every list swaps to its empty state when a load turns out empty and
+    /// back when content arrives. Search only counts a completed search:
+    /// clearing for a fresh one hides the no-results page again.
+    #[test]
+    fn every_empty_list_swaps_to_its_status_page() {
+        crate::ui::with_gtk(every_empty_list_swaps_to_its_status_page_body);
+    }
+
+    fn every_empty_list_swaps_to_its_status_page_body() {
+        let window: HangarWindow = glib::Object::builder().build();
+        let imp = window.imp();
+
+        let check = |name: &str,
+                     overlay: &RefCell<Option<gtk4::Overlay>>,
+                     page: &RefCell<Option<adw::StatusPage>>,
+                     set_empty: &dyn Fn(),
+                     set_full: &dyn Fn()| {
+            let overlay = overlay
+                .borrow()
+                .clone()
+                .unwrap_or_else(|| panic!("{name} overlay"));
+            let page = page
+                .borrow()
+                .clone()
+                .unwrap_or_else(|| panic!("{name} empty state"));
+            set_empty();
+            assert!(page.get_visible(), "{name}: empty shows the status page");
+            assert!(!overlay.get_visible(), "{name}: empty hides the list");
+            set_full();
+            assert!(!page.get_visible(), "{name}: content hides the status page");
+            assert!(overlay.get_visible(), "{name}: content shows the list");
+        };
+
+        let w = &window;
+        check(
+            "timeline",
+            &imp.timeline_overlay,
+            &imp.timeline_empty_state,
+            &|| w.set_posts(vec![]),
+            &|| w.set_posts(vec![a_post("t1")]),
+        );
+        check(
+            "mentions",
+            &imp.mentions_overlay,
+            &imp.mentions_empty_state,
+            &|| w.set_mentions(vec![]),
+            &|| w.set_mentions(vec![notification(true)]),
+        );
+        check(
+            "activity",
+            &imp.activity_overlay,
+            &imp.activity_empty_state,
+            &|| w.set_activity(vec![]),
+            &|| w.set_activity(vec![notification(false)]),
+        );
+        check(
+            "likes",
+            &imp.likes_overlay,
+            &imp.likes_empty_state,
+            &|| w.set_likes(vec![]),
+            &|| w.set_likes(vec![a_post("l1")]),
+        );
+
+        // Search: the pages live inside the results stack, so only the
+        // status page toggles.
+        let posts_empty = imp.search_empty_state.borrow().clone().unwrap();
+        let people_empty = imp.search_people_empty_state.borrow().clone().unwrap();
+        assert!(!posts_empty.get_visible(), "no search yet, no verdict");
+
+        window.set_search_results(vec![]);
+        window.set_search_people_results(vec![]);
+        assert!(posts_empty.get_visible());
+        assert!(people_empty.get_visible());
+
+        window.clear_search_results();
+        assert!(
+            !posts_empty.get_visible(),
+            "a fresh search resets the verdict"
+        );
+        assert!(!people_empty.get_visible());
+
+        window.set_search_results(vec![a_post("s1")]);
+        window.set_search_people_results(vec![Profile::minimal(
+            "did:plc:found".into(),
+            "found.bsky.social".into(),
+            None,
+            None,
+        )]);
+        assert!(!posts_empty.get_visible());
+        assert!(!people_empty.get_visible());
+
+        window.destroy();
+    }
+
+    /// New posts arriving while the reader is at the top just appear;
+    /// the banner and the Home badge stay quiet. An unscrolled window is
+    /// always at the top, which was exactly the reported quirk: a banner
+    /// with nowhere to go after switching back to the feed tab.
+    #[test]
+    fn new_posts_at_the_top_skip_the_banner() {
+        crate::ui::with_gtk(new_posts_at_the_top_skip_the_banner_body);
+    }
+
+    fn new_posts_at_the_top_skip_the_banner_body() {
+        let window: HangarWindow = glib::Object::builder().build();
+
+        window.set_posts(vec![a_post("one")]);
+        window.insert_posts_at_top(vec![a_post("two"), a_post("three")]);
+        window.show_new_posts_banner(2);
+
+        let banner = window.imp().new_posts_banner.borrow().clone().unwrap();
+        assert!(!banner.is_visible(), "nothing to announce at the top");
+        let sidebar = window.imp().sidebar.borrow().clone().unwrap();
+        assert_eq!(
+            sidebar.badge_count(crate::ui::sidebar::NavItem::Home),
+            0,
+            "posts in view are not unseen"
         );
 
         window.destroy();

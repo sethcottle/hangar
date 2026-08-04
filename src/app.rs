@@ -90,6 +90,9 @@ mod imp {
         /// Pending new posts that arrived while user was scrolled away
         /// Whether we're currently checking for new posts
         pub checking_new_posts: RefCell<bool>,
+        /// A poll already said it is failing; stay quiet until it recovers.
+        pub new_posts_poll_failed: RefCell<bool>,
+        pub unread_poll_failed: RefCell<bool>,
         /// The currently selected feed
         pub current_feed: RefCell<Option<SavedFeed>>,
         /// Mentions state
@@ -552,7 +555,7 @@ impl HangarApplication {
         }
         self.imp().session_dead.replace(true);
         if let Some(window) = self.imp().window.borrow().as_ref() {
-            window.show_toast("Your session expired \u{2014} sign out and sign in again");
+            window.show_toast("Your session expired. Sign out and sign in again");
         }
     }
 
@@ -1708,6 +1711,7 @@ impl HangarApplication {
             match rx.try_recv() {
                 Ok(Ok((posts, _))) => {
                     app.imp().checking_new_posts.replace(false);
+                    app.imp().new_posts_poll_failed.replace(false);
 
                     // Find posts newer than our anchor
                     let new_posts: Vec<Post> = posts
@@ -1739,7 +1743,11 @@ impl HangarApplication {
                 }
                 Ok(Err(e)) => {
                     app.imp().checking_new_posts.replace(false);
-                    eprintln!("Failed to check for new posts: {}", e);
+                    // A flaky upstream fails poll after poll; say so once.
+                    if !*app.imp().new_posts_poll_failed.borrow() {
+                        app.imp().new_posts_poll_failed.replace(true);
+                        eprintln!("Failed to check for new posts: {}", e);
+                    }
                     // The poll is the only thing talking to the server on an
                     // idle window, so a session dying mid-use shows up here
                     // first.
@@ -1792,6 +1800,7 @@ impl HangarApplication {
             match rx.try_recv() {
                 Ok(Ok(counts)) => {
                     app.imp().checking_unread.replace(false);
+                    app.imp().unread_poll_failed.replace(false);
                     if let Some(sidebar) = app.sidebar() {
                         sidebar.set_badge(NavItem::Chat, counts.chat);
                         // Opening a section may have cleared these two while
@@ -1805,7 +1814,11 @@ impl HangarApplication {
                 }
                 Ok(Err(e)) => {
                     app.imp().checking_unread.replace(false);
-                    eprintln!("Failed to check unread counts: {}", e);
+                    // A flaky upstream fails poll after poll; say so once.
+                    if !*app.imp().unread_poll_failed.borrow() {
+                        app.imp().unread_poll_failed.replace(true);
+                        eprintln!("Failed to check unread counts: {}", e);
+                    }
                     // On expiry this parks the poll until the next sign-in.
                     app.report_session_expiry();
                     glib::ControlFlow::Break
