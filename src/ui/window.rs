@@ -225,6 +225,13 @@ mod imp {
         // Error states: shown when a first load fails with nothing listed;
         // the Try Again button re-runs the section's own fetch path.
         pub timeline_error_state: RefCell<Option<adw::StatusPage>>,
+        // Skeleton rows shown while a surface's first load is out.
+        pub timeline_skeleton: RefCell<Option<gtk4::Box>>,
+        pub mentions_skeleton: RefCell<Option<gtk4::Box>>,
+        pub activity_skeleton: RefCell<Option<gtk4::Box>>,
+        pub likes_skeleton: RefCell<Option<gtk4::Box>>,
+        pub bookmarks_skeleton: RefCell<Option<gtk4::Box>>,
+        pub chat_skeleton: RefCell<Option<gtk4::Box>>,
         pub mentions_error_state: RefCell<Option<adw::StatusPage>>,
         pub activity_error_state: RefCell<Option<adw::StatusPage>>,
         pub likes_error_state: RefCell<Option<adw::StatusPage>>,
@@ -241,8 +248,8 @@ mod imp {
         pub scrolled_window: RefCell<Option<gtk4::ScrolledWindow>>,
         pub saved_scroll_position: RefCell<f64>,
         pub feed_btn_label: RefCell<Option<gtk4::Label>>,
-        pub feed_popover: RefCell<Option<gtk4::Popover>>,
-        pub feed_list_box: RefCell<Option<gtk4::ListBox>>,
+        pub feed_menu: RefCell<Option<gio::Menu>>,
+        pub feed_action: RefCell<Option<gio::SimpleAction>>,
         pub feed_changed_callback: RefCell<Option<Box<dyn Fn(SavedFeed) + 'static>>>,
         pub saved_feeds: RefCell<Vec<SavedFeed>>,
         pub current_feed_uri: RefCell<String>,
@@ -547,6 +554,31 @@ impl HangarWindow {
         imp.bookmarks_nav_view.replace(Some(bookmarks_nav_view));
         imp.search_nav_view.replace(Some(search_nav_view));
 
+        // Narrow windows drop the rail's captions; icons, tooltips, and
+        // accessible names keep carrying the meaning.
+        let breakpoint = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
+            adw::BreakpointConditionLengthType::MaxWidth,
+            560.0,
+            adw::LengthUnit::Sp,
+        ));
+        let win = self.downgrade();
+        breakpoint.connect_apply(move |_| {
+            if let Some(win) = win.upgrade()
+                && let Some(sidebar) = win.imp().sidebar.borrow().as_ref()
+            {
+                sidebar.set_compact(true);
+            }
+        });
+        let win = self.downgrade();
+        breakpoint.connect_unapply(move |_| {
+            if let Some(win) = win.upgrade()
+                && let Some(sidebar) = win.imp().sidebar.borrow().as_ref()
+            {
+                sidebar.set_compact(false);
+            }
+        });
+        self.add_breakpoint(breakpoint);
+
         // Keyboard shortcuts live on the application as GActions; see
         // `HangarApplication::setup_gactions`.
 
@@ -673,60 +705,44 @@ impl HangarWindow {
         feed_menu_btn.set_child(Some(&feed_label_box));
         feed_menu_btn.add_css_class("flat");
 
-        // Create popover with feed list
-        let popover = gtk4::Popover::new();
-        popover.set_has_arrow(false);
-        popover.set_autohide(true);
-        popover.add_css_class("menu");
-        popover.set_position(gtk4::PositionType::Bottom);
-        popover.set_offset(0, 8); // Push it down a bit to avoid overlapping header
+        // The menu is a GMenu; the stateful action's string state marks
+        // the current feed with the radio indicator, no custom rows.
+        let feed_menu = gio::Menu::new();
+        feed_menu_btn.set_menu_model(Some(&feed_menu));
 
-        let popover_content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-
-        // Header
-        let header_label = gtk4::Label::new(Some("Select a Feed"));
-        header_label.add_css_class("title-4");
-        header_label.set_margin_top(12);
-        header_label.set_margin_bottom(8);
-        popover_content.append(&header_label);
-
-        let feed_list = gtk4::ListBox::new();
-        feed_list.set_selection_mode(gtk4::SelectionMode::None);
-
-        // Row activation closes the popover first, then fires the callback
-        let popover_weak = popover.downgrade();
-        feed_list.connect_row_activated(glib::clone!(
-            #[weak(rename_to = window)]
-            self,
-            move |_, row| {
-                // Close popover first to avoid widget state issues
-                if let Some(pop) = popover_weak.upgrade() {
-                    pop.popdown();
-                }
-
-                let index = row.index() as usize;
-                let feed = {
-                    let feeds = window.imp().saved_feeds.borrow();
-                    feeds.get(index).cloned()
-                };
-                if let Some(feed) = feed {
-                    if let Some(cb) = window.imp().feed_changed_callback.borrow().as_ref() {
-                        cb(feed);
-                    }
+        let feed_action = gio::SimpleAction::new_stateful(
+            "select",
+            Some(glib::VariantTy::STRING),
+            &"".to_variant(),
+        );
+        let win = self.downgrade();
+        feed_action.connect_activate(move |_, parameter| {
+            let Some(win) = win.upgrade() else {
+                return;
+            };
+            let Some(uri) = parameter.and_then(|v| v.get::<String>()) else {
+                return;
+            };
+            let feed = {
+                let feeds = win.imp().saved_feeds.borrow();
+                feeds.iter().find(|f| f.uri == uri).cloned()
+            };
+            if let Some(feed) = feed {
+                if let Some(cb) = win.imp().feed_changed_callback.borrow().as_ref() {
+                    cb(feed);
                 }
             }
-        ));
-
-        popover_content.append(&feed_list);
-        popover.set_child(Some(&popover_content));
-        feed_menu_btn.set_popover(Some(&popover));
+        });
+        let feed_group = gio::SimpleActionGroup::new();
+        feed_group.add_action(&feed_action);
+        self.insert_action_group("feeds", Some(&feed_group));
 
         header.set_title_widget(Some(&feed_menu_btn));
 
         // Store references
         self.imp().feed_btn_label.replace(Some(title_label));
-        self.imp().feed_popover.replace(Some(popover));
-        self.imp().feed_list_box.replace(Some(feed_list));
+        self.imp().feed_menu.replace(Some(feed_menu));
+        self.imp().feed_action.replace(Some(feed_action));
 
         let refresh_btn = gtk4::Button::from_icon_name("view-refresh-symbolic");
         refresh_btn.set_tooltip_text(Some("Refresh"));
@@ -958,6 +974,10 @@ impl HangarWindow {
         });
         timeline_box.append(&error_state);
         self.imp().timeline_error_state.replace(Some(error_state));
+
+        let skeleton = Self::skeleton_list();
+        timeline_box.append(&skeleton);
+        self.imp().timeline_skeleton.replace(Some(skeleton));
 
         self.imp().timeline_overlay.replace(Some(overlay.clone()));
         self.imp().timeline_empty_state.replace(Some(empty_state));
@@ -1268,6 +1288,43 @@ impl HangarWindow {
         }
     }
 
+    /// Six rows of shapes standing in for content while a first load is
+    /// out. Purely decorative; the accessibility layer sees nothing.
+    fn skeleton_list() -> gtk4::Box {
+        let column = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        column.set_visible(false);
+        for _ in 0..6 {
+            let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
+            row.set_margin_start(16);
+            row.set_margin_end(16);
+            row.set_margin_top(14);
+            row.set_margin_bottom(14);
+
+            let avatar = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+            avatar.set_size_request(40, 40);
+            avatar.set_valign(gtk4::Align::Start);
+            avatar.add_css_class("skeleton-shape");
+            avatar.add_css_class("skeleton-circle");
+            row.append(&avatar);
+
+            let lines = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+            lines.set_hexpand(true);
+            let wide = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+            wide.set_size_request(-1, 12);
+            wide.add_css_class("skeleton-shape");
+            lines.append(&wide);
+            let narrow = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+            narrow.set_size_request(-1, 12);
+            narrow.set_margin_end(120);
+            narrow.add_css_class("skeleton-shape");
+            lines.append(&narrow);
+            row.append(&lines);
+
+            column.append(&row);
+        }
+        column
+    }
+
     /// "Couldn't load" with a Try Again button running `retry`. Hidden
     /// until a first load fails.
     fn error_state_page(retry: impl Fn() + 'static) -> adw::StatusPage {
@@ -1294,7 +1351,11 @@ impl HangarWindow {
         overlay: &RefCell<Option<gtk4::Overlay>>,
         empty_state: &RefCell<Option<adw::StatusPage>>,
         error_state: &RefCell<Option<adw::StatusPage>>,
+        skeleton: &RefCell<Option<gtk4::Box>>,
     ) {
+        if let Some(skeleton) = skeleton.borrow().as_ref() {
+            skeleton.set_visible(false);
+        }
         if !model_empty {
             return;
         }
@@ -1351,6 +1412,25 @@ impl HangarWindow {
             .collect()
     }
 
+    /// First timeline load without a cache: skeleton rows instead of a
+    /// blank pane.
+    pub fn set_timeline_loading(&self, loading: bool) {
+        let imp = self.imp();
+        let empty = imp
+            .timeline_model
+            .borrow()
+            .as_ref()
+            .is_none_or(|m| m.n_items() == 0);
+        if let Some(skeleton) = imp.timeline_skeleton.borrow().as_ref() {
+            skeleton.set_visible(loading && empty);
+        }
+        if loading && empty {
+            if let Some(overlay) = imp.timeline_overlay.borrow().as_ref() {
+                overlay.set_visible(false);
+            }
+        }
+    }
+
     pub fn set_posts(&self, posts: Vec<Post>) {
         let posts = Self::filter_feed_posts(posts);
         let empty = posts.is_empty();
@@ -1364,6 +1444,9 @@ impl HangarWindow {
         }
         let imp = self.imp();
         Self::apply_empty_state(&imp.timeline_overlay, &imp.timeline_empty_state, empty);
+        if let Some(skeleton) = imp.timeline_skeleton.borrow().as_ref() {
+            skeleton.set_visible(false);
+        }
         if let Some(err) = imp.timeline_error_state.borrow().as_ref() {
             err.set_visible(false);
         }
@@ -1634,47 +1717,16 @@ impl HangarWindow {
         self.rebuild_feed_list();
     }
 
-    /// Rebuild the feed list UI (called when feeds change or selection changes)
+    /// Rebuild the feed menu; the action state picks out the current one.
     fn rebuild_feed_list(&self) {
-        let Some(list_box) = self.imp().feed_list_box.borrow().as_ref().cloned() else {
+        let Some(menu) = self.imp().feed_menu.borrow().clone() else {
             return;
         };
-
-        let feeds = self.imp().saved_feeds.borrow();
-        let current_uri = self.imp().current_feed_uri.borrow();
-
-        // Clear existing rows
-        while let Some(child) = list_box.first_child() {
-            list_box.remove(&child);
-        }
-
-        // Add rows for each feed
-        for feed in feeds.iter() {
-            let row = adw::ActionRow::new();
-            row.set_title(&feed.display_name);
-
-            // Show truncated description if available
-            if let Some(desc) = &feed.description {
-                // Truncate long descriptions
-                let truncated = if desc.len() > 60 {
-                    format!("{}...", &desc[..super::floor_char_boundary(desc, 57)])
-                } else {
-                    desc.clone()
-                };
-                row.set_subtitle(&truncated);
-                row.set_subtitle_lines(1);
-            }
-
-            // Add checkmark for selected feed
-            let is_selected = feed.uri == *current_uri;
-            if is_selected {
-                let check = gtk4::Image::from_icon_name("object-select-symbolic");
-                check.add_css_class("accent");
-                row.add_suffix(&check);
-            }
-
-            row.set_activatable(true);
-            list_box.append(&row);
+        menu.remove_all();
+        for feed in self.imp().saved_feeds.borrow().iter() {
+            let item = gio::MenuItem::new(Some(&feed.display_name), None);
+            item.set_action_and_target_value(Some("feeds.select"), Some(&feed.uri.to_variant()));
+            menu.append_item(&item);
         }
     }
 
@@ -1684,7 +1736,9 @@ impl HangarWindow {
             label.set_text(name);
         }
         self.imp().current_feed_uri.replace(uri.to_string());
-        self.rebuild_feed_list();
+        if let Some(action) = self.imp().feed_action.borrow().as_ref() {
+            action.set_state(&uri.to_variant());
+        }
     }
 
     /// Set callback for when a post is clicked (to open thread view)
@@ -2825,6 +2879,10 @@ impl HangarWindow {
         mentions_box.append(&error_state);
         self.imp().mentions_error_state.replace(Some(error_state));
 
+        let skeleton = Self::skeleton_list();
+        mentions_box.append(&skeleton);
+        self.imp().mentions_skeleton.replace(Some(skeleton));
+
         self.imp().mentions_overlay.replace(Some(overlay.clone()));
         self.imp().mentions_empty_state.replace(Some(empty_state));
 
@@ -2874,6 +2932,9 @@ impl HangarWindow {
         }
         let imp = self.imp();
         Self::apply_empty_state(&imp.mentions_overlay, &imp.mentions_empty_state, empty);
+        if let Some(skeleton) = imp.mentions_skeleton.borrow().as_ref() {
+            skeleton.set_visible(false);
+        }
         if let Some(err) = imp.mentions_error_state.borrow().as_ref() {
             err.set_visible(false);
         }
@@ -2890,9 +2951,25 @@ impl HangarWindow {
 
     /// Set loading state for mentions
     pub fn set_mentions_loading(&self, loading: bool) {
-        if let Some(spinner) = self.imp().mentions_spinner.borrow().as_ref() {
-            spinner.set_visible(loading);
-            spinner.set_spinning(loading);
+        let imp = self.imp();
+        let empty = imp
+            .mentions_model
+            .borrow()
+            .as_ref()
+            .is_none_or(|m| m.n_items() == 0);
+        // A first load gets skeleton rows; later pages keep the corner
+        // spinner under the content they extend.
+        if let Some(skeleton) = imp.mentions_skeleton.borrow().as_ref() {
+            skeleton.set_visible(loading && empty);
+        }
+        if loading && empty {
+            if let Some(overlay) = imp.mentions_overlay.borrow().as_ref() {
+                overlay.set_visible(false);
+            }
+        }
+        if let Some(spinner) = imp.mentions_spinner.borrow().as_ref() {
+            spinner.set_visible(loading && !empty);
+            spinner.set_spinning(loading && !empty);
         }
     }
 
@@ -3040,6 +3117,10 @@ impl HangarWindow {
         activity_box.append(&error_state);
         self.imp().activity_error_state.replace(Some(error_state));
 
+        let skeleton = Self::skeleton_list();
+        activity_box.append(&skeleton);
+        self.imp().activity_skeleton.replace(Some(skeleton));
+
         self.imp().activity_overlay.replace(Some(overlay.clone()));
         self.imp().activity_empty_state.replace(Some(empty_state));
 
@@ -3084,6 +3165,9 @@ impl HangarWindow {
         }
         let imp = self.imp();
         Self::apply_empty_state(&imp.activity_overlay, &imp.activity_empty_state, empty);
+        if let Some(skeleton) = imp.activity_skeleton.borrow().as_ref() {
+            skeleton.set_visible(false);
+        }
         if let Some(err) = imp.activity_error_state.borrow().as_ref() {
             err.set_visible(false);
         }
@@ -3100,9 +3184,25 @@ impl HangarWindow {
 
     /// Set loading state for activity
     pub fn set_activity_loading(&self, loading: bool) {
-        if let Some(spinner) = self.imp().activity_spinner.borrow().as_ref() {
-            spinner.set_visible(loading);
-            spinner.set_spinning(loading);
+        let imp = self.imp();
+        let empty = imp
+            .activity_model
+            .borrow()
+            .as_ref()
+            .is_none_or(|m| m.n_items() == 0);
+        // A first load gets skeleton rows; later pages keep the corner
+        // spinner under the content they extend.
+        if let Some(skeleton) = imp.activity_skeleton.borrow().as_ref() {
+            skeleton.set_visible(loading && empty);
+        }
+        if loading && empty {
+            if let Some(overlay) = imp.activity_overlay.borrow().as_ref() {
+                overlay.set_visible(false);
+            }
+        }
+        if let Some(spinner) = imp.activity_spinner.borrow().as_ref() {
+            spinner.set_visible(loading && !empty);
+            spinner.set_spinning(loading && !empty);
         }
     }
 
@@ -3247,6 +3347,10 @@ impl HangarWindow {
         chat_box.append(&error_state);
         self.imp().chat_error_state.replace(Some(error_state));
 
+        let skeleton = Self::skeleton_list();
+        chat_box.append(&skeleton);
+        self.imp().chat_skeleton.replace(Some(skeleton));
+
         let imp = self.imp();
         imp.chat_model.replace(Some(model));
         imp.chat_scrolled_window.replace(Some(scrolled.clone()));
@@ -3297,6 +3401,9 @@ impl HangarWindow {
         if let Some(err) = self.imp().chat_error_state.borrow().as_ref() {
             err.set_visible(false);
         }
+        if let Some(skeleton) = self.imp().chat_skeleton.borrow().as_ref() {
+            skeleton.set_visible(false);
+        }
     }
 
     /// Append more conversations to the chat list
@@ -3310,9 +3417,25 @@ impl HangarWindow {
 
     /// Set loading state for chat
     pub fn set_chat_loading(&self, loading: bool) {
-        if let Some(spinner) = self.imp().chat_spinner.borrow().as_ref() {
-            spinner.set_visible(loading);
-            spinner.set_spinning(loading);
+        let imp = self.imp();
+        let empty = imp
+            .chat_model
+            .borrow()
+            .as_ref()
+            .is_none_or(|m| m.n_items() == 0);
+        // A first load gets skeleton rows; later pages keep the corner
+        // spinner under the content they extend.
+        if let Some(skeleton) = imp.chat_skeleton.borrow().as_ref() {
+            skeleton.set_visible(loading && empty);
+        }
+        if loading && empty {
+            if let Some(overlay) = imp.chat_overlay.borrow().as_ref() {
+                overlay.set_visible(false);
+            }
+        }
+        if let Some(spinner) = imp.chat_spinner.borrow().as_ref() {
+            spinner.set_visible(loading && !empty);
+            spinner.set_spinning(loading && !empty);
         }
     }
 
@@ -4324,6 +4447,10 @@ impl HangarWindow {
         likes_box.append(&error_state);
         self.imp().likes_error_state.replace(Some(error_state));
 
+        let skeleton = Self::skeleton_list();
+        likes_box.append(&skeleton);
+        self.imp().likes_skeleton.replace(Some(skeleton));
+
         self.imp().likes_overlay.replace(Some(overlay.clone()));
         self.imp().likes_empty_state.replace(Some(empty_state));
 
@@ -4369,6 +4496,9 @@ impl HangarWindow {
         }
         let imp = self.imp();
         Self::apply_empty_state(&imp.likes_overlay, &imp.likes_empty_state, empty);
+        if let Some(skeleton) = imp.likes_skeleton.borrow().as_ref() {
+            skeleton.set_visible(false);
+        }
         if let Some(err) = imp.likes_error_state.borrow().as_ref() {
             err.set_visible(false);
         }
@@ -4385,9 +4515,25 @@ impl HangarWindow {
 
     /// Set loading state for likes page
     pub fn set_likes_loading(&self, loading: bool) {
-        if let Some(spinner) = self.imp().likes_spinner.borrow().as_ref() {
-            spinner.set_visible(loading);
-            spinner.set_spinning(loading);
+        let imp = self.imp();
+        let empty = imp
+            .likes_model
+            .borrow()
+            .as_ref()
+            .is_none_or(|m| m.n_items() == 0);
+        // A first load gets skeleton rows; later pages keep the corner
+        // spinner under the content they extend.
+        if let Some(skeleton) = imp.likes_skeleton.borrow().as_ref() {
+            skeleton.set_visible(loading && empty);
+        }
+        if loading && empty {
+            if let Some(overlay) = imp.likes_overlay.borrow().as_ref() {
+                overlay.set_visible(false);
+            }
+        }
+        if let Some(spinner) = imp.likes_spinner.borrow().as_ref() {
+            spinner.set_visible(loading && !empty);
+            spinner.set_spinning(loading && !empty);
         }
     }
 
@@ -4575,6 +4721,10 @@ impl HangarWindow {
         bookmarks_box.append(&error_state);
         self.imp().bookmarks_error_state.replace(Some(error_state));
 
+        let skeleton = Self::skeleton_list();
+        bookmarks_box.append(&skeleton);
+        self.imp().bookmarks_skeleton.replace(Some(skeleton));
+
         // Store references
         let imp = self.imp();
         imp.bookmarks_model.replace(Some(model));
@@ -4628,6 +4778,9 @@ impl HangarWindow {
         if let Some(err) = self.imp().bookmarks_error_state.borrow().as_ref() {
             err.set_visible(false);
         }
+        if let Some(skeleton) = self.imp().bookmarks_skeleton.borrow().as_ref() {
+            skeleton.set_visible(false);
+        }
     }
 
     /// Append more saved posts to the list
@@ -4658,9 +4811,25 @@ impl HangarWindow {
 
     /// Set loading state for the saved posts page
     pub fn set_bookmarks_loading(&self, loading: bool) {
-        if let Some(spinner) = self.imp().bookmarks_spinner.borrow().as_ref() {
-            spinner.set_visible(loading);
-            spinner.set_spinning(loading);
+        let imp = self.imp();
+        let empty = imp
+            .bookmarks_model
+            .borrow()
+            .as_ref()
+            .is_none_or(|m| m.n_items() == 0);
+        // A first load gets skeleton rows; later pages keep the corner
+        // spinner under the content they extend.
+        if let Some(skeleton) = imp.bookmarks_skeleton.borrow().as_ref() {
+            skeleton.set_visible(loading && empty);
+        }
+        if loading && empty {
+            if let Some(overlay) = imp.bookmarks_overlay.borrow().as_ref() {
+                overlay.set_visible(false);
+            }
+        }
+        if let Some(spinner) = imp.bookmarks_spinner.borrow().as_ref() {
+            spinner.set_visible(loading && !empty);
+            spinner.set_spinning(loading && !empty);
         }
     }
 
@@ -5282,6 +5451,7 @@ impl HangarWindow {
             &imp.timeline_overlay,
             &imp.timeline_empty_state,
             &imp.timeline_error_state,
+            &imp.timeline_skeleton,
         );
     }
 
@@ -5297,6 +5467,7 @@ impl HangarWindow {
             &imp.mentions_overlay,
             &imp.mentions_empty_state,
             &imp.mentions_error_state,
+            &imp.mentions_skeleton,
         );
     }
 
@@ -5312,6 +5483,7 @@ impl HangarWindow {
             &imp.activity_overlay,
             &imp.activity_empty_state,
             &imp.activity_error_state,
+            &imp.activity_skeleton,
         );
     }
 
@@ -5327,6 +5499,7 @@ impl HangarWindow {
             &imp.likes_overlay,
             &imp.likes_empty_state,
             &imp.likes_error_state,
+            &imp.likes_skeleton,
         );
     }
 
@@ -5342,6 +5515,7 @@ impl HangarWindow {
             &imp.bookmarks_overlay,
             &imp.bookmarks_empty_state,
             &imp.bookmarks_error_state,
+            &imp.bookmarks_skeleton,
         );
     }
 
@@ -5357,6 +5531,7 @@ impl HangarWindow {
             &imp.chat_overlay,
             &imp.chat_empty_state,
             &imp.chat_error_state,
+            &imp.chat_skeleton,
         );
     }
 
@@ -8245,6 +8420,110 @@ mod tests {
         );
         window.set_conversations_load_failed();
         assert!(imp.chat_error_state.borrow().clone().unwrap().get_visible());
+
+        window.destroy();
+    }
+
+    /// The feed selector is a GMenu over a stateful action: items carry
+    /// the feed URI as target, the state marks the current one, and
+    /// activating routes the chosen feed to the app.
+    #[test]
+    fn the_feed_menu_selects_by_action() {
+        crate::ui::with_gtk(the_feed_menu_selects_by_action_body);
+    }
+
+    fn the_feed_menu_selects_by_action_body() {
+        let window: HangarWindow = glib::Object::builder().build();
+
+        let chosen: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(vec![]));
+        let sink = chosen.clone();
+        window.set_feed_changed_callback(move |feed| {
+            sink.borrow_mut().push(feed.uri);
+        });
+
+        let feed = |uri: &str, name: &str| SavedFeed {
+            feed_type: "feed".into(),
+            uri: uri.into(),
+            display_name: name.into(),
+            description: None,
+            pinned: true,
+        };
+        window.set_saved_feeds(vec![
+            feed("", "Following"),
+            feed("at://did:plc:x/app.bsky.feed.generator/hot", "Hot"),
+        ]);
+
+        let menu = window.imp().feed_menu.borrow().clone().unwrap();
+        assert_eq!(menu.n_items(), 2, "one menu item per saved feed");
+
+        window.set_current_feed_name("Hot", "at://did:plc:x/app.bsky.feed.generator/hot");
+        let action = window.imp().feed_action.borrow().clone().unwrap();
+        assert_eq!(
+            action.state().and_then(|s| s.get::<String>()).as_deref(),
+            Some("at://did:plc:x/app.bsky.feed.generator/hot"),
+            "the state is what paints the radio dot"
+        );
+
+        gtk4::prelude::WidgetExt::activate_action(&window, "feeds.select", Some(&"".to_variant()))
+            .expect("the action group is on the window");
+        assert_eq!(
+            chosen.borrow().as_slice(),
+            [""],
+            "activation hands the chosen feed to the app"
+        );
+
+        window.destroy();
+    }
+
+    /// A first load shows skeleton rows; a later page keeps the corner
+    /// spinner; content, emptiness, or failure all clear the skeletons.
+    #[test]
+    fn first_loads_show_skeletons_until_the_verdict() {
+        crate::ui::with_gtk(first_loads_show_skeletons_until_the_verdict_body);
+    }
+
+    fn first_loads_show_skeletons_until_the_verdict_body() {
+        let window: HangarWindow = glib::Object::builder().build();
+        let imp = window.imp();
+
+        let skeleton = imp.mentions_skeleton.borrow().clone().unwrap();
+        let overlay = imp.mentions_overlay.borrow().clone().unwrap();
+        let spinner = imp.mentions_spinner.borrow().clone().unwrap();
+
+        window.set_mentions_loading(true);
+        assert!(skeleton.get_visible(), "an empty first load shows shapes");
+        assert!(!overlay.get_visible());
+        assert!(!spinner.get_visible(), "no spinner on top of the shapes");
+
+        window.set_mentions(vec![notification(true)]);
+        assert!(!skeleton.get_visible(), "content clears the shapes");
+        assert!(overlay.get_visible());
+
+        window.set_mentions_loading(true);
+        assert!(
+            !skeleton.get_visible(),
+            "a later page keeps the content on screen"
+        );
+        assert!(spinner.get_visible(), "and marks it with the spinner");
+        window.set_mentions_loading(false);
+        assert!(!spinner.get_visible());
+
+        // A failed first load hands over to the error page.
+        window.set_mentions(vec![]);
+        window.set_mentions_loading(true);
+        assert!(skeleton.get_visible());
+        window.set_mentions_load_failed();
+        assert!(
+            !skeleton.get_visible(),
+            "the error page replaces the shapes"
+        );
+        assert!(
+            imp.mentions_error_state
+                .borrow()
+                .clone()
+                .unwrap()
+                .get_visible()
+        );
 
         window.destroy();
     }

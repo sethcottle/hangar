@@ -1054,6 +1054,11 @@ impl HangarApplication {
             }
         }
 
+        // With no cached page shown, the wait gets skeleton rows.
+        if let Some(window) = self.imp().window.borrow().as_ref() {
+            window.set_timeline_loading(true);
+        }
+
         let (tx, rx) = std::sync::mpsc::channel::<Result<(Vec<Post>, Option<String>), String>>();
 
         let client = self.client();

@@ -78,6 +78,8 @@ mod imp {
         pub sign_out_callback: RefCell<Option<Box<dyn Fn() + 'static>>>,
         /// Unread badge per nav row, in `NavItem::all()` order.
         pub badge_labels: RefCell<Vec<gtk4::Label>>,
+        /// The caption under each nav icon, hidden in compact mode.
+        pub nav_text_labels: RefCell<Vec<gtk4::Label>>,
         /// The uncapped counts behind the badges.
         pub badge_counts: RefCell<Vec<u32>>,
     }
@@ -345,6 +347,7 @@ impl Sidebar {
         label.add_css_class("caption");
         label.set_halign(gtk4::Align::Center);
         content.append(&label);
+        self.imp().nav_text_labels.borrow_mut().push(label);
 
         row.set_child(Some(&content));
         row
@@ -445,6 +448,15 @@ impl Sidebar {
             .position(|i| *i == item)
             .and_then(|index| self.imp().badge_counts.borrow().get(index).copied())
             .unwrap_or(0)
+    }
+
+    /// Icons-only below the window breakpoint; the captions come back
+    /// with the room for them. Tooltips and accessible labels already
+    /// carry the names either way.
+    pub fn set_compact(&self, compact: bool) {
+        for label in self.imp().nav_text_labels.borrow().iter() {
+            label.set_visible(!compact);
+        }
     }
 
     pub fn select_nav_item(&self, item: NavItem) {

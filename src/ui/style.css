@@ -429,6 +429,24 @@ popover.menu > contents {
     text-decoration: underline;
 }
 
+/* Skeleton rows while a first load is out. The pulse dies with the
+   reduce-motion override, which zeroes every animation duration. */
+@keyframes skeleton-pulse {
+    0% { opacity: 0.4; }
+    50% { opacity: 0.75; }
+    100% { opacity: 0.4; }
+}
+
+.skeleton-shape {
+    background-color: alpha(@borders, 0.7);
+    border-radius: 8px;
+    animation: skeleton-pulse 1.4s ease-in-out infinite;
+}
+
+.skeleton-circle {
+    border-radius: 50%;
+}
+
 /* A focused post row shows where the post shortcuts will land */
 .post-row:focus-visible {
     outline: 2px solid @accent_color;
