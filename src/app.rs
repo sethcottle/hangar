@@ -558,7 +558,7 @@ impl HangarApplication {
             .application_name("Hangar")
             .application_icon(config::APP_ID)
             .developer_name("Seth Cottle")
-            .version(env!("CARGO_PKG_VERSION"))
+            .version(env!("HANGAR_VERSION"))
             .license_type(gtk4::License::Mpl20)
             .website("https://hangar.blue")
             .issue_url("https://github.com/sethcottle/hangar/issues")
@@ -4818,8 +4818,9 @@ mod tests {
         assert_eq!(media.len(), 2);
     }
 
-    /// The About dialog states the crate version, so a release bump cannot
-    /// leave a stale number behind.
+    /// The About dialog states the build's version: what CI exported
+    /// through HANGAR_VERSION, or the crate version when nothing did. A
+    /// release cannot leave a stale number behind.
     #[test]
     fn the_about_dialog_reads_from_the_crate() {
         crate::ui::with_gtk(the_about_dialog_reads_from_the_crate_body);
@@ -4827,7 +4828,7 @@ mod tests {
 
     fn the_about_dialog_reads_from_the_crate_body() {
         let about = super::HangarApplication::build_about_dialog();
-        assert_eq!(about.version(), env!("CARGO_PKG_VERSION"));
+        assert_eq!(about.version(), env!("HANGAR_VERSION"));
         assert_eq!(about.license_type(), gtk4::License::Mpl20);
         assert_eq!(about.application_icon(), crate::config::APP_ID);
     }

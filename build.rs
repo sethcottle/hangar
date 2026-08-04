@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: MPL-2.0
 
+// The version the app displays. CI exports HANGAR_VERSION (the release
+// input for tagged builds, a dated sha for nightlies); without it the
+// crate version stands in, so local builds need no setup.
 fn main() {
-    // Blueprint compilation can be added later when build tooling is set up
-    // For now, UI is built programmatically in Rust
+    println!("cargo:rerun-if-env-changed=HANGAR_VERSION");
+    let version =
+        std::env::var("HANGAR_VERSION").unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_string());
+    println!("cargo:rustc-env=HANGAR_VERSION={version}");
 }

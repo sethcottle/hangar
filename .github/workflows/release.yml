@@ -73,10 +73,11 @@ jobs:
 
       - name: Build release binary
         run: |
+          # HANGAR_VERSION lands in the About dialog via build.rs.
           if [ -n "${{ inputs.version }}" ]; then
-            cargo build --release
+            HANGAR_VERSION="${{ inputs.version }}" cargo build --release
           else
-            cargo build --release --features devel
+            HANGAR_VERSION="nightly-$(date +%Y%m%d)-${GITHUB_SHA::7}"               cargo build --release --features devel
           fi
 
       - name: Download appimagetool

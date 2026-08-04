@@ -30,7 +30,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build release binary
-        run: cargo build --release
+        run: HANGAR_VERSION="git-${GITHUB_SHA::7}" cargo build --release
 
       - name: Download appimagetool
         run: |
