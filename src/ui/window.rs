@@ -2312,6 +2312,7 @@ impl HangarWindow {
             ("Posts", "posts_and_author_threads"),
             ("Replies", "posts_with_replies"),
             ("Media", "posts_with_media"),
+            ("Videos", "posts_with_video"),
         ] {
             let tab = gtk4::ToggleButton::with_label(label);
             match &first_tab {
@@ -8385,6 +8386,33 @@ mod tests {
             "each switch bumps the generation"
         );
         assert_eq!(ctx.listed(), 0, "the replies page left with its tab");
+
+        tab("Videos").set_active(true);
+        assert_eq!(
+            asked.borrow()[2],
+            ("posts_with_video".to_string(), true, 3),
+            "the Videos tab rides the lexicon's video filter"
+        );
+
+        // The Hide Replies feed setting must never reach profile tabs:
+        // this path filters nothing, so a reply lands regardless of it.
+        let mut reply = a_post("a-reply");
+        let someone = Profile::minimal(
+            "did:plc:someone".into(),
+            "someone.bsky.social".into(),
+            None,
+            None,
+        );
+        reply.reply_context = Some(crate::atproto::ReplyContext {
+            parent_author: someone.clone(),
+            root_author: someone,
+        });
+        ctx.append_posts(vec![reply]);
+        assert_eq!(
+            ctx.listed(),
+            1,
+            "profile tabs bypass the timeline's reply filter"
+        );
 
         window.destroy();
     }

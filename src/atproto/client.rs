@@ -1931,8 +1931,8 @@ impl HangarClient {
     /// Get an author's feed (posts by a specific user)
     #[allow(clippy::await_holding_lock)]
     /// `filter` is a lexicon value: posts_and_author_threads,
-    /// posts_with_replies, posts_with_media. None leaves the server's
-    /// default, which includes replies.
+    /// posts_with_replies, posts_with_media, posts_with_video. None leaves
+    /// the server's default, which includes replies.
     pub async fn get_author_feed(
         &self,
         actor: &str,
