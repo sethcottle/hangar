@@ -338,12 +338,14 @@ impl HangarWindow {
         } else {
             "Hangar"
         };
-        glib::Object::builder()
+        let window: Self = glib::Object::builder()
             .property("application", app)
             .property("default-width", 620)
             .property("default-height", 780)
             .property("title", title)
-            .build()
+            .build();
+        window.restore_window_state();
+        window
     }
 
     fn setup_ui(&self) {
@@ -475,41 +477,98 @@ impl HangarWindow {
         imp.bookmarks_nav_view.replace(Some(bookmarks_nav_view));
         imp.search_nav_view.replace(Some(search_nav_view));
 
-        // Add keyboard shortcuts
-        self.setup_shortcuts();
+        // Keyboard shortcuts live on the application as GActions; see
+        // `HangarApplication::setup_gactions`.
+
+        // Window state is saved on the way out, restored in `new`.
+        self.connect_close_request(|window| {
+            window.save_window_state();
+            glib::Propagation::Proceed
+        });
     }
 
-    fn setup_shortcuts(&self) {
-        let controller = gtk4::ShortcutController::new();
-        controller.set_scope(gtk4::ShortcutScope::Managed);
+    /// The installed gschema, when there is one. A plain `Settings::new`
+    /// aborts without the schema, which is exactly what a `cargo run`
+    /// outside the flatpak looks like, so the lookup guards it. Stable and
+    /// nightly share the schema id and therefore the remembered geometry.
+    fn state_settings() -> Option<gio::Settings> {
+        gio::SettingsSchemaSource::default()?.lookup("io.github.sethcottle.Hangar", true)?;
+        Some(gio::Settings::new("io.github.sethcottle.Hangar"))
+    }
 
-        // F5 to refresh
-        let refresh_action = gtk4::CallbackAction::new(glib::clone!(
-            #[weak(rename_to = window)]
-            self,
-            #[upgrade_or]
-            glib::Propagation::Proceed,
-            move |_, _| {
-                if let Some(cb) = window.imp().refresh_callback.borrow().as_ref() {
-                    cb();
-                }
-                glib::Propagation::Stop
+    /// Open at the size the window closed at. Without the schema this is
+    /// a no-op and the builder defaults stand.
+    fn restore_window_state(&self) {
+        let Some(settings) = Self::state_settings() else {
+            return;
+        };
+        self.set_default_size(settings.int("window-width"), settings.int("window-height"));
+        if settings.boolean("window-maximized") {
+            self.maximize();
+        }
+    }
+
+    fn save_window_state(&self) {
+        let Some(settings) = Self::state_settings() else {
+            return;
+        };
+        let (width, height) = self.default_size();
+        let _ = settings.set_int("window-width", width);
+        let _ = settings.set_int("window-height", height);
+        let _ = settings.set_boolean("window-maximized", self.is_maximized());
+    }
+
+    /// Pop the visible section's stack one page. At the root this does
+    /// nothing, matching what a headerbar back button would do.
+    pub fn go_back(&self) {
+        if let Some(nav_view) = self.current_nav_view() {
+            nav_view.pop();
+        }
+    }
+
+    /// The shortcuts reference, built fresh per showing.
+    fn build_help_overlay() -> gtk4::ShortcutsWindow {
+        let shortcut = |title: &str, accelerator: &str| -> gtk4::ShortcutsShortcut {
+            glib::Object::builder()
+                .property("title", title)
+                .property("accelerator", accelerator)
+                .build()
+        };
+
+        let general: gtk4::ShortcutsGroup =
+            glib::Object::builder().property("title", "General").build();
+        general.add_shortcut(&shortcut("Refresh", "F5 <Control>R"));
+        general.add_shortcut(&shortcut("New Post", "<Control>N"));
+        // Ctrl+K also focuses the entry; both land on the same page.
+        general.add_shortcut(&shortcut("Search", "<Control>K <Alt>8"));
+        general.add_shortcut(&shortcut("Keyboard Shortcuts", "<Control>question"));
+
+        let navigation: gtk4::ShortcutsGroup = glib::Object::builder()
+            .property("title", "Navigation")
+            .build();
+        navigation.add_shortcut(&shortcut("Back", "<Alt>Left"));
+        for (i, item) in crate::ui::sidebar::NavItem::all().iter().enumerate() {
+            // Search is already listed under General with both of its keys.
+            if *item != crate::ui::sidebar::NavItem::Search {
+                navigation.add_shortcut(&shortcut(item.label(), &format!("<Alt>{}", i + 1)));
             }
-        ));
-        let f5_shortcut = gtk4::Shortcut::new(
-            gtk4::ShortcutTrigger::parse_string("F5"),
-            Some(refresh_action.clone()),
-        );
-        controller.add_shortcut(f5_shortcut);
+        }
 
-        // Ctrl+R to refresh
-        let ctrl_r_shortcut = gtk4::Shortcut::new(
-            gtk4::ShortcutTrigger::parse_string("<Control>r"),
-            Some(refresh_action),
-        );
-        controller.add_shortcut(ctrl_r_shortcut);
+        let section: gtk4::ShortcutsSection = glib::Object::builder()
+            .property("section-name", "shortcuts")
+            .build();
+        section.add_group(&general);
+        section.add_group(&navigation);
 
-        self.add_controller(controller);
+        let window: gtk4::ShortcutsWindow = glib::Object::builder().property("modal", true).build();
+        window.add_section(&section);
+        window
+    }
+
+    pub fn present_shortcuts_window(&self) {
+        let overlay = Self::build_help_overlay();
+        overlay.set_transient_for(Some(self));
+        overlay.present();
     }
 
     fn build_timeline_page(&self) -> adw::NavigationPage {
@@ -2876,6 +2935,13 @@ impl HangarWindow {
     pub fn set_settings_clicked_callback<F: Fn() + 'static>(&self, f: F) {
         if let Some(sidebar) = self.imp().sidebar.borrow().as_ref() {
             sidebar.connect_settings_clicked(f);
+        }
+    }
+
+    /// Set callback for when About is clicked in the avatar popover
+    pub fn set_about_clicked_callback<F: Fn() + 'static>(&self, f: F) {
+        if let Some(sidebar) = self.imp().sidebar.borrow().as_ref() {
+            sidebar.connect_about_clicked(f);
         }
     }
 
@@ -7216,6 +7282,62 @@ mod tests {
         );
 
         window.destroy();
+    }
+
+    /// Back pops the visible stack one page and idles at the root. The
+    /// window state save and restore run without the schema installed,
+    /// which is what every bare cargo run looks like.
+    #[test]
+    fn back_pops_one_page_and_state_saving_survives_no_schema() {
+        crate::ui::with_gtk(back_pops_one_page_and_state_saving_survives_no_schema_body);
+    }
+
+    fn back_pops_one_page_and_state_saving_survives_no_schema_body() {
+        let window: HangarWindow = glib::Object::builder().build();
+
+        let profile =
+            Profile::minimal("did:plc:back".into(), "back.bsky.social".into(), None, None);
+        window.push_profile_page(&profile, vec![]);
+        let nav_view = window.imp().home_nav_view.borrow().clone().unwrap();
+        assert!(nav_view.find_page("profile:did:plc:back").is_some());
+
+        window.go_back();
+        assert!(
+            nav_view.find_page("profile:did:plc:back").is_none(),
+            "back pops the pushed page"
+        );
+        window.go_back();
+
+        // No gschema in the test environment; both must no-op cleanly.
+        window.restore_window_state();
+        window.save_window_state();
+
+        window.destroy();
+    }
+
+    /// The shortcuts reference lists every accelerator the application
+    /// registers: the general four plus back and the eight sections.
+    #[test]
+    fn the_shortcuts_window_lists_the_registered_accelerators() {
+        crate::ui::with_gtk(the_shortcuts_window_lists_the_registered_accelerators_body);
+    }
+
+    fn the_shortcuts_window_lists_the_registered_accelerators_body() {
+        let overlay = HangarWindow::build_help_overlay();
+        let mut widgets = Vec::new();
+        walk(&overlay.clone().upcast::<gtk4::Widget>(), 0, &mut widgets);
+        // The window mirrors every entry into its search view, so count
+        // distinct titles rather than widgets.
+        let titles: std::collections::HashSet<String> = widgets
+            .iter()
+            .filter(|(_, w)| w.is::<gtk4::ShortcutsShortcut>())
+            .map(|(_, w)| w.property::<String>("title"))
+            .collect();
+        assert_eq!(titles.len(), 12, "4 general + back + 7 sections");
+        assert!(titles.contains("Refresh"));
+        assert!(titles.contains("Saved"));
+        assert!(titles.contains("Search"), "one entry carries both keys");
+        overlay.destroy();
     }
 
     /// Every list swaps to its empty state when a load turns out empty and

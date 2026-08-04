@@ -74,6 +74,7 @@ mod imp {
         pub compose_btn: RefCell<Option<gtk4::Button>>,
         pub my_profile_callback: RefCell<Option<Box<dyn Fn() + 'static>>>,
         pub settings_callback: RefCell<Option<Box<dyn Fn() + 'static>>>,
+        pub about_callback: RefCell<Option<Box<dyn Fn() + 'static>>>,
         pub sign_out_callback: RefCell<Option<Box<dyn Fn() + 'static>>>,
         /// Unread badge per nav row, in `NavItem::all()` order.
         pub badge_labels: RefCell<Vec<gtk4::Label>>,
@@ -159,6 +160,15 @@ impl Sidebar {
         settings_item.add_css_class("flat");
         popover_box.append(&settings_item);
 
+        // About item
+        let about_item = gtk4::Button::new();
+        let about_content = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        about_content.append(&gtk4::Image::from_icon_name("help-about-symbolic"));
+        about_content.append(&gtk4::Label::new(Some("About Hangar")));
+        about_item.set_child(Some(&about_content));
+        about_item.add_css_class("flat");
+        popover_box.append(&about_item);
+
         // Separator
         let sep = gtk4::Separator::new(gtk4::Orientation::Horizontal);
         sep.set_margin_top(4);
@@ -207,6 +217,18 @@ impl Sidebar {
             popover_ref.popdown();
             if let Some(sidebar) = sidebar_weak.upgrade() {
                 if let Some(cb) = sidebar.imp().settings_callback.borrow().as_ref() {
+                    cb();
+                }
+            }
+        });
+
+        // Wire up about click
+        let sidebar_weak = self.downgrade();
+        let popover_ref = popover.clone();
+        about_item.connect_clicked(move |_| {
+            popover_ref.popdown();
+            if let Some(sidebar) = sidebar_weak.upgrade() {
+                if let Some(cb) = sidebar.imp().about_callback.borrow().as_ref() {
                     cb();
                 }
             }
@@ -379,6 +401,10 @@ impl Sidebar {
         self.imp()
             .settings_callback
             .replace(Some(Box::new(callback)));
+    }
+
+    pub fn connect_about_clicked<F: Fn() + 'static>(&self, callback: F) {
+        self.imp().about_callback.replace(Some(Box::new(callback)));
     }
 
     pub fn connect_sign_out_clicked<F: Fn() + 'static>(&self, callback: F) {

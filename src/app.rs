@@ -160,6 +160,8 @@ mod imp {
         fn startup(&self) {
             self.parent_startup();
 
+            self.obj().setup_gactions();
+
             // Register custom icons
             let display = gtk4::gdk::Display::default().expect("Could not get default display");
             let icon_theme = gtk4::IconTheme::for_display(&display);
@@ -366,6 +368,11 @@ mod imp {
             });
 
             let app_clone = app.clone();
+            window.set_about_clicked_callback(move || {
+                app_clone.show_about();
+            });
+
+            let app_clone = app.clone();
             window.set_sign_out_clicked_callback(move || {
                 app_clone.sign_out();
             });
@@ -408,6 +415,101 @@ impl HangarApplication {
             .borrow()
             .clone()
             .expect("client not initialized")
+    }
+
+    /// Application actions and their accelerators. Everything the keyboard
+    /// can do routes through here, so the shortcuts window and any future
+    /// menus read from one place.
+    fn setup_gactions(&self) {
+        let refresh = gio::ActionEntry::builder("refresh")
+            .activate(|app: &Self, _, _| app.fetch_timeline())
+            .build();
+
+        let compose = gio::ActionEntry::builder("compose")
+            .activate(|app: &Self, _, _| {
+                if app.imp().user_did.borrow().is_some() {
+                    app.open_compose_dialog();
+                }
+            })
+            .build();
+
+        let search = gio::ActionEntry::builder("search")
+            .activate(|app: &Self, _, _| {
+                if let Some(window) = app.imp().window.borrow().as_ref() {
+                    window.select_nav(NavItem::Search);
+                }
+                app.open_search_view();
+            })
+            .build();
+
+        let back = gio::ActionEntry::builder("back")
+            .activate(|app: &Self, _, _| {
+                if let Some(window) = app.imp().window.borrow().as_ref() {
+                    window.go_back();
+                }
+            })
+            .build();
+
+        // One action, the section index as its target, so each rail row is
+        // addressable as app.nav(n).
+        let nav = gio::ActionEntry::builder("nav")
+            .parameter_type(Some(&i32::static_variant_type()))
+            .activate(|app: &Self, _, parameter| {
+                let index = parameter.and_then(|v| v.get::<i32>()).unwrap_or(0);
+                let Some(item) = NavItem::all().get(index as usize).copied() else {
+                    return;
+                };
+                if let Some(window) = app.imp().window.borrow().as_ref() {
+                    window.select_nav(item);
+                }
+                app.handle_nav_change(item);
+            })
+            .build();
+
+        let shortcuts = gio::ActionEntry::builder("shortcuts")
+            .activate(|app: &Self, _, _| {
+                if let Some(window) = app.imp().window.borrow().as_ref() {
+                    window.present_shortcuts_window();
+                }
+            })
+            .build();
+
+        let about = gio::ActionEntry::builder("about")
+            .activate(|app: &Self, _, _| app.show_about())
+            .build();
+
+        self.add_action_entries([refresh, compose, search, back, nav, shortcuts, about]);
+
+        self.set_accels_for_action("app.refresh", &["F5", "<primary>r"]);
+        self.set_accels_for_action("app.compose", &["<primary>n"]);
+        self.set_accels_for_action("app.search", &["<primary>k"]);
+        self.set_accels_for_action("app.back", &["<alt>Left"]);
+        for index in 0..NavItem::all().len() {
+            self.set_accels_for_action(
+                &format!("app.nav({index})"),
+                &[&format!("<alt>{}", index + 1)],
+            );
+        }
+        self.set_accels_for_action("app.shortcuts", &["<primary>question"]);
+    }
+
+    /// The About dialog, separate from presenting so tests can read it.
+    fn build_about_dialog() -> adw::AboutDialog {
+        adw::AboutDialog::builder()
+            .application_name("Hangar")
+            .application_icon(config::APP_ID)
+            .developer_name("Seth Cottle")
+            .version(env!("CARGO_PKG_VERSION"))
+            .license_type(gtk4::License::Mpl20)
+            .website("https://hangar.blue")
+            .issue_url("https://github.com/sethcottle/hangar/issues")
+            .build()
+    }
+
+    fn show_about(&self) {
+        if let Some(window) = self.imp().window.borrow().as_ref() {
+            Self::build_about_dialog().present(Some(window));
+        }
     }
 
     fn try_restore_session(&self) {
@@ -4075,5 +4177,19 @@ mod tests {
             !generation.is_current(new),
             "every bump strands earlier fetches"
         );
+    }
+
+    /// The About dialog states the crate version, so a release bump cannot
+    /// leave a stale number behind.
+    #[test]
+    fn the_about_dialog_reads_from_the_crate() {
+        crate::ui::with_gtk(the_about_dialog_reads_from_the_crate_body);
+    }
+
+    fn the_about_dialog_reads_from_the_crate_body() {
+        let about = super::HangarApplication::build_about_dialog();
+        assert_eq!(about.version(), env!("CARGO_PKG_VERSION"));
+        assert_eq!(about.license_type(), gtk4::License::Mpl20);
+        assert_eq!(about.application_icon(), crate::config::APP_ID);
     }
 }
