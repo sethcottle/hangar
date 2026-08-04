@@ -118,6 +118,10 @@ impl<'a> ProfileCache<'a> {
                     posts_count: row.get(8)?,
                     viewer_following: row.get(9)?,
                     viewer_followed_by: row.get(10)?,
+                    // Not cached columns; moderation state loads with the live profile.
+                    viewer_muted: false,
+                    viewer_blocking: None,
+                    viewer_blocked_by: false,
                 })
             })
             .map_err(|e| match e {

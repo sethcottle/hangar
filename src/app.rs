@@ -293,6 +293,26 @@ mod imp {
             });
 
             let app_clone = app.clone();
+            window.set_mute_callback(move |did, cell| {
+                app_clone.toggle_mute(did, cell);
+            });
+
+            let app_clone = app.clone();
+            window.set_block_callback(move |profile, cell| {
+                app_clone.toggle_block(profile, cell);
+            });
+
+            let app_clone = app.clone();
+            window.set_report_account_callback(move |profile| {
+                app_clone.open_report_for_account(profile);
+            });
+
+            let app_clone = app.clone();
+            crate::ui::post_row::set_report_post_handler(move |post| {
+                app_clone.open_report_for_post(post);
+            });
+
+            let app_clone = app.clone();
             window.set_compose_callback(move || {
                 app_clone.open_compose_dialog();
             });
@@ -3953,6 +3973,212 @@ impl HangarApplication {
                     ctx.fetching.set(false);
                     glib::ControlFlow::Break
                 }
+            }
+        });
+    }
+
+    /// Mute or unmute, decided by the page's cell; the cell only flips
+    /// once the server agrees.
+    fn toggle_mute(&self, did: String, cell: std::rc::Rc<std::cell::Cell<bool>>) {
+        let muted = cell.get();
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let client = self.client();
+        let did_for_call = did.clone();
+
+        thread::spawn(move || {
+            let result = runtime::block_on(async {
+                if muted {
+                    client.unmute_actor(&did_for_call).await
+                } else {
+                    client.mute_actor(&did_for_call).await
+                }
+            });
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+
+        let app = self.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            match rx.try_recv() {
+                Ok(Ok(())) => {
+                    cell.set(!muted);
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.show_toast(if muted {
+                            "Account unmuted"
+                        } else {
+                            "Account muted. Their posts drop from your feeds."
+                        });
+                    }
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(e)) => {
+                    eprintln!("Failed to update mute: {}", e);
+                    app.report_session_expiry();
+                    app.toast_unless_offline("Couldn't update the mute");
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+            }
+        });
+    }
+
+    /// Block after a confirmation; unblock straight away. The cell holds
+    /// the block record URI and only changes once the server agrees.
+    fn toggle_block(&self, profile: Profile, cell: std::rc::Rc<RefCell<Option<String>>>) {
+        let existing = cell.borrow().clone();
+        if let Some(uri) = existing {
+            self.run_unblock(uri, cell);
+            return;
+        }
+
+        let window = match self.imp().window.borrow().as_ref() {
+            Some(w) => w.clone(),
+            None => return,
+        };
+        let dialog = adw::AlertDialog::new(
+            Some(&format!("Block @{}?", profile.handle)),
+            Some(
+                "They won't be able to see your posts, follow you, or message you, and their content disappears from your view.",
+            ),
+        );
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("block", "Block");
+        dialog.set_response_appearance("block", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+
+        let app = self.clone();
+        dialog.connect_response(Some("block"), move |_, _| {
+            app.run_block(profile.did.clone(), cell.clone());
+        });
+        dialog.present(Some(&window));
+    }
+
+    fn run_block(&self, did: String, cell: std::rc::Rc<RefCell<Option<String>>>) {
+        let (tx, rx) = std::sync::mpsc::channel::<Result<String, String>>();
+        let client = self.client();
+        thread::spawn(move || {
+            let result = runtime::block_on(async { client.block(&did).await });
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+
+        let app = self.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            match rx.try_recv() {
+                Ok(Ok(uri)) => {
+                    cell.replace(Some(uri));
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.show_toast("Account blocked");
+                    }
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(e)) => {
+                    eprintln!("Failed to block: {}", e);
+                    app.report_session_expiry();
+                    app.toast_unless_offline("Couldn't block the account");
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+            }
+        });
+    }
+
+    fn run_unblock(&self, uri: String, cell: std::rc::Rc<RefCell<Option<String>>>) {
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let client = self.client();
+        let uri_for_call = uri.clone();
+        thread::spawn(move || {
+            let result = runtime::block_on(async { client.unblock(&uri_for_call).await });
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+
+        let app = self.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            match rx.try_recv() {
+                Ok(Ok(())) => {
+                    cell.replace(None);
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.show_toast("Account unblocked");
+                    }
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(e)) => {
+                    eprintln!("Failed to unblock: {}", e);
+                    app.report_session_expiry();
+                    app.toast_unless_offline("Couldn't unblock the account");
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+            }
+        });
+    }
+
+    fn open_report_for_account(&self, profile: Profile) {
+        let Some(window) = self.imp().window.borrow().clone() else {
+            return;
+        };
+        let app = self.clone();
+        let subject = format!("Reporting @{}", profile.handle);
+        crate::ui::report_dialog::present(&window, &subject, move |reason, details| {
+            app.submit_report(
+                reason,
+                details,
+                crate::atproto::client::ReportSubject::Account(profile.did.clone()),
+            );
+        });
+    }
+
+    fn open_report_for_post(&self, post: Post) {
+        let Some(window) = self.imp().window.borrow().clone() else {
+            return;
+        };
+        let app = self.clone();
+        let subject = format!("Reporting a post by @{}", post.author.handle);
+        crate::ui::report_dialog::present(&window, &subject, move |reason, details| {
+            app.submit_report(
+                reason,
+                details,
+                crate::atproto::client::ReportSubject::Post {
+                    uri: post.uri.clone(),
+                    cid: post.cid.clone(),
+                },
+            );
+        });
+    }
+
+    fn submit_report(
+        &self,
+        reason: &'static str,
+        details: String,
+        subject: crate::atproto::client::ReportSubject,
+    ) {
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let client = self.client();
+        thread::spawn(move || {
+            let result =
+                runtime::block_on(async { client.create_report(reason, &details, subject).await });
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+
+        let app = self.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            match rx.try_recv() {
+                Ok(Ok(())) => {
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.show_toast("Report submitted. Thank you.");
+                    }
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(e)) => {
+                    eprintln!("Failed to submit report: {}", e);
+                    app.report_session_expiry();
+                    app.toast_unless_offline("Couldn't submit the report");
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
             }
         });
     }

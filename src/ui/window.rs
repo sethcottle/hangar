@@ -272,6 +272,12 @@ mod imp {
         /// Args: the page's feed context and whether this is a first page.
         pub profile_tab_callback: RefCell<Option<Box<dyn Fn(Rc<ProfileFeedCtx>, bool) + 'static>>>,
         pub edit_profile_callback: RefCell<Option<Box<dyn Fn() + 'static>>>,
+        /// Args: DID and the page's muted cell.
+        pub mute_callback: RefCell<Option<Box<dyn Fn(String, Rc<Cell<bool>>) + 'static>>>,
+        /// Args: the profile and the page's block-record cell.
+        pub block_callback:
+            RefCell<Option<Box<dyn Fn(Profile, Rc<RefCell<Option<String>>>) + 'static>>>,
+        pub report_account_callback: RefCell<Option<Box<dyn Fn(Profile) + 'static>>>,
         pub nav_changed_callback:
             RefCell<Option<Box<dyn Fn(crate::ui::sidebar::NavItem) + 'static>>>,
         // Mentions page state
@@ -1154,6 +1160,25 @@ impl HangarWindow {
     pub fn set_edit_profile_callback<F: Fn() + 'static>(&self, callback: F) {
         self.imp()
             .edit_profile_callback
+            .replace(Some(Box::new(callback)));
+    }
+
+    /// Args: DID and the page's muted cell.
+    pub fn set_mute_callback<F: Fn(String, Rc<Cell<bool>>) + 'static>(&self, callback: F) {
+        self.imp().mute_callback.replace(Some(Box::new(callback)));
+    }
+
+    /// Args: the profile and the page's block-record cell.
+    pub fn set_block_callback<F>(&self, callback: F)
+    where
+        F: Fn(Profile, Rc<RefCell<Option<String>>>) + 'static,
+    {
+        self.imp().block_callback.replace(Some(Box::new(callback)));
+    }
+
+    pub fn set_report_account_callback<F: Fn(Profile) + 'static>(&self, callback: F) {
+        self.imp()
+            .report_account_callback
             .replace(Some(Box::new(callback)));
     }
 
@@ -2396,6 +2421,101 @@ impl HangarWindow {
                 }
             });
             buttons_row.append(&message_btn);
+
+            // Mute, block, report, behind one quiet menu. The labels read
+            // the cells fresh every time the menu opens, so a toggle that
+            // settled while it was closed still shows the truth.
+            let muted = Rc::new(Cell::new(profile.viewer_muted));
+            let blocking = Rc::new(RefCell::new(profile.viewer_blocking.clone()));
+
+            let mod_popover_box = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+            mod_popover_box.set_margin_top(6);
+            mod_popover_box.set_margin_bottom(6);
+            mod_popover_box.set_margin_start(6);
+            mod_popover_box.set_margin_end(6);
+
+            let mute_item = gtk4::Button::new();
+            mute_item.add_css_class("flat");
+            mod_popover_box.append(&mute_item);
+            let block_item = gtk4::Button::new();
+            block_item.add_css_class("flat");
+            block_item.add_css_class("destructive-action");
+            mod_popover_box.append(&block_item);
+            let report_item = gtk4::Button::with_label("Report Account...");
+            report_item.add_css_class("flat");
+            mod_popover_box.append(&report_item);
+
+            let mod_popover = gtk4::Popover::new();
+            mod_popover.set_child(Some(&mod_popover_box));
+            mod_popover.add_css_class("menu");
+            mod_popover.set_has_arrow(false);
+
+            let mute_ref = mute_item.clone();
+            let block_ref = block_item.clone();
+            let muted_ref = muted.clone();
+            let blocking_ref = blocking.clone();
+            let sync_labels = move || {
+                mute_ref.set_label(if muted_ref.get() {
+                    "Unmute Account"
+                } else {
+                    "Mute Account"
+                });
+                block_ref.set_label(if blocking_ref.borrow().is_some() {
+                    "Unblock Account"
+                } else {
+                    "Block Account..."
+                });
+            };
+            sync_labels();
+            let sync = sync_labels.clone();
+            mod_popover.connect_show(move |_| sync());
+
+            let win = self.downgrade();
+            let did = profile.did.clone();
+            let muted_cell = muted.clone();
+            let mod_pop = mod_popover.clone();
+            mute_item.connect_clicked(move |_| {
+                mod_pop.popdown();
+                if let Some(win) = win.upgrade()
+                    && let Some(cb) = win.imp().mute_callback.borrow().as_ref()
+                {
+                    cb(did.clone(), muted_cell.clone());
+                }
+            });
+
+            let win = self.downgrade();
+            let profile_for_block = profile.clone();
+            let blocking_cell = blocking.clone();
+            let mod_pop = mod_popover.clone();
+            block_item.connect_clicked(move |_| {
+                mod_pop.popdown();
+                if let Some(win) = win.upgrade()
+                    && let Some(cb) = win.imp().block_callback.borrow().as_ref()
+                {
+                    cb(profile_for_block.clone(), blocking_cell.clone());
+                }
+            });
+
+            let win = self.downgrade();
+            let profile_for_report = profile.clone();
+            let mod_pop = mod_popover.clone();
+            report_item.connect_clicked(move |_| {
+                mod_pop.popdown();
+                if let Some(win) = win.upgrade()
+                    && let Some(cb) = win.imp().report_account_callback.borrow().as_ref()
+                {
+                    cb(profile_for_report.clone());
+                }
+            });
+
+            let mod_btn = gtk4::MenuButton::new();
+            mod_btn.set_icon_name("view-more-symbolic");
+            mod_btn.add_css_class("flat");
+            mod_btn.add_css_class("circular");
+            mod_btn.set_tooltip_text(Some("More options"));
+            mod_btn.update_property(&[gtk4::accessible::Property::Label("More options")]);
+            mod_btn.set_popover(Some(&mod_popover));
+            buttons_row.append(&mod_btn);
 
             profile_header.append(&buttons_row);
         }
@@ -9199,6 +9319,95 @@ mod tests {
                 .is_some_and(|b| matches!(b.label().as_deref(), Some("Follow" | "Following")))),
             "no follow button on your own page"
         );
+
+        window.destroy();
+    }
+
+    /// The moderation menu reads its labels from viewer state and routes
+    /// each item to its callback with the page's cells.
+    #[test]
+    fn the_moderation_menu_reads_state_and_reports() {
+        crate::ui::with_gtk(the_moderation_menu_reads_state_and_reports_body);
+    }
+
+    fn the_moderation_menu_reads_state_and_reports_body() {
+        let window: HangarWindow = glib::Object::builder().build();
+
+        let muted_args: Rc<RefCell<Vec<(String, bool)>>> = Rc::new(RefCell::new(vec![]));
+        let sink = muted_args.clone();
+        window.set_mute_callback(move |did, cell| {
+            sink.borrow_mut().push((did, cell.get()));
+        });
+        let blocked_args: Rc<RefCell<Vec<(String, Option<String>)>>> =
+            Rc::new(RefCell::new(vec![]));
+        let sink = blocked_args.clone();
+        window.set_block_callback(move |profile, cell| {
+            sink.borrow_mut().push((profile.did, cell.borrow().clone()));
+        });
+        let reported: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(vec![]));
+        let sink = reported.clone();
+        window.set_report_account_callback(move |profile| {
+            sink.borrow_mut().push(profile.handle);
+        });
+
+        let mut profile = Profile::minimal(
+            "did:plc:modme".into(),
+            "modme.bsky.social".into(),
+            None,
+            None,
+        );
+        profile.viewer_muted = true;
+        profile.viewer_blocking = Some("at://did:plc:me/app.bsky.graph.block/1".into());
+        window.push_profile_page(&profile, vec![], None);
+
+        let nav_view = window.imp().home_nav_view.borrow().clone().unwrap();
+        let page = nav_view.find_page("profile:did:plc:modme").unwrap();
+        let mut widgets = Vec::new();
+        walk(&page.upcast::<gtk4::Widget>(), 0, &mut widgets);
+        // The popover parents to the menu button, off the walked tree; the
+        // items are found through the MenuButton's popover.
+        let menu_btn = widgets
+            .iter()
+            .find_map(|(_, w)| {
+                let b = w.downcast_ref::<gtk4::MenuButton>()?;
+                (b.tooltip_text().as_deref() == Some("More options")).then(|| b.clone())
+            })
+            .expect("the page offers the moderation menu");
+        let popover = menu_btn.popover().expect("the menu has a popover");
+        let mut items = Vec::new();
+        walk(&popover.upcast::<gtk4::Widget>(), 0, &mut items);
+        let item = |label: &str| -> gtk4::Button {
+            items
+                .iter()
+                .find_map(|(_, w)| {
+                    let b = w.downcast_ref::<gtk4::Button>()?;
+                    (b.label().as_deref() == Some(label)).then(|| b.clone())
+                })
+                .unwrap_or_else(|| panic!("no {label} item"))
+        };
+
+        // Labels read the state the page opened with.
+        let mute_item = item("Unmute Account");
+        let block_item = item("Unblock Account");
+        let report_item = item("Report Account...");
+
+        mute_item.emit_clicked();
+        assert_eq!(
+            muted_args.borrow().as_slice(),
+            [("did:plc:modme".to_string(), true)],
+            "mute hands over the DID and the current state"
+        );
+        block_item.emit_clicked();
+        assert_eq!(
+            blocked_args.borrow().as_slice(),
+            [(
+                "did:plc:modme".to_string(),
+                Some("at://did:plc:me/app.bsky.graph.block/1".to_string())
+            )],
+            "block hands over the profile and the record cell"
+        );
+        report_item.emit_clicked();
+        assert_eq!(reported.borrow().as_slice(), ["modme.bsky.social"]);
 
         window.destroy();
     }

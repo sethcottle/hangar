@@ -56,6 +56,9 @@ thread_local! {
     static BOOKMARK_POST_HANDLER: std::cell::RefCell<
         Option<Box<dyn Fn(Post, glib::WeakRef<PostRow>)>>,
     > = const { std::cell::RefCell::new(None) };
+    /// What Report Post does. The item existed unwired before this.
+    static REPORT_POST_HANDLER: std::cell::RefCell<Option<Box<dyn Fn(Post)>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Record whose posts are deletable. `None` on sign-out.
@@ -77,6 +80,13 @@ pub fn set_delete_post_handler<F: Fn(Post) + 'static>(handler: F) {
 /// Install the app-level save/unsave flow. See [`set_delete_post_handler`].
 pub fn set_bookmark_post_handler<F: Fn(Post, glib::WeakRef<PostRow>) + 'static>(handler: F) {
     BOOKMARK_POST_HANDLER.with(|cell| {
+        cell.replace(Some(Box::new(handler)));
+    });
+}
+
+/// Install the app-level report flow. See [`set_delete_post_handler`].
+pub fn set_report_post_handler<F: Fn(Post) + 'static>(handler: F) {
+    REPORT_POST_HANDLER.with(|cell| {
         cell.replace(Some(Box::new(handler)));
     });
 }
@@ -474,12 +484,33 @@ impl PostRow {
             open_link_item,
             bookmark_item,
             bookmark_item_label,
+            report_item,
             delete_item,
             delete_section,
         ) = Self::create_post_menu_button();
         menu_btn.set_tooltip_text(Some("More options"));
         menu_btn.update_property(&[gtk4::accessible::Property::Label("More options")]);
         actions.append(&menu_btn);
+
+        // Report, wired once for the same reason as Delete below.
+        let row_weak = self.downgrade();
+        let report_popover = menu_btn.popover();
+        report_item.connect_clicked(move |_| {
+            if let Some(p) = &report_popover {
+                p.popdown();
+            }
+            let Some(row) = row_weak.upgrade() else {
+                return;
+            };
+            let post = row.imp().post.borrow().clone();
+            if let Some(post) = post {
+                REPORT_POST_HANDLER.with(|cell| {
+                    if let Some(handler) = cell.borrow().as_ref() {
+                        handler(post);
+                    }
+                });
+            }
+        });
 
         // Wired once, here. The handler reads the row's current post when
         // clicked, so rebinding has nothing to disarm. Weak for the usual
@@ -767,6 +798,7 @@ impl PostRow {
         gtk4::Button,
         gtk4::Label,
         gtk4::Button,
+        gtk4::Button,
         gtk4::Box,
     ) {
         let popover_box = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
@@ -871,6 +903,7 @@ impl PostRow {
             open_link_item,
             bookmark_item,
             bookmark_item_label,
+            report_item,
             delete_item,
             delete_section,
         )
@@ -2385,6 +2418,9 @@ mod tests {
             posts_count: None,
             viewer_following: None,
             viewer_followed_by: None,
+            viewer_muted: false,
+            viewer_blocking: None,
+            viewer_blocked_by: false,
         }
     }
 

@@ -204,6 +204,16 @@ pub struct Profile {
     pub viewer_following: Option<String>,
     /// Whether this user follows the viewer (URI of their follow record)
     pub viewer_followed_by: Option<String>,
+    /// Whether the viewer muted this account. Defaulted so cached rows
+    /// written before the field existed still deserialize.
+    #[serde(default)]
+    pub viewer_muted: bool,
+    /// URI of the viewer's block record on this account, if any
+    #[serde(default)]
+    pub viewer_blocking: Option<String>,
+    /// Whether this account blocks the viewer
+    #[serde(default)]
+    pub viewer_blocked_by: bool,
 }
 
 impl Profile {
@@ -226,6 +236,9 @@ impl Profile {
             posts_count: None,
             viewer_following: None,
             viewer_followed_by: None,
+            viewer_muted: false,
+            viewer_blocking: None,
+            viewer_blocked_by: false,
         }
     }
 }

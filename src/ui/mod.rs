@@ -13,6 +13,7 @@ mod message_page;
 pub mod post_row;
 #[cfg(test)]
 mod rebind_audit;
+pub mod report_dialog;
 pub(crate) mod rich_text;
 pub mod sidebar;
 pub mod video_player;

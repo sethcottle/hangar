@@ -286,6 +286,10 @@ impl<'a> PostCache<'a> {
                 posts_count: None,
                 viewer_following: None,
                 viewer_followed_by: None,
+                // Not cached columns; moderation state loads with the live profile.
+                viewer_muted: false,
+                viewer_blocking: None,
+                viewer_blocked_by: false,
             },
             text: row.get(3)?,
             created_at: row.get(4)?,

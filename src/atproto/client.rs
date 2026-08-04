@@ -42,6 +42,14 @@ use atrium_api::agent::Agent as OAuthAgent;
 type CredentialAgent = AtpAgent<MemorySessionStore, ReqwestClient>;
 type OAuthAgentType = OAuthAgent<HangarOAuthSession>;
 
+/// What a moderation report points at.
+pub enum ReportSubject {
+    /// An account, by DID
+    Account(String),
+    /// A post, by strong ref
+    Post { uri: String, cid: String },
+}
+
 /// Reply reference for post creation (root + parent URIs).
 #[derive(Clone)]
 pub struct ReplyRef {
@@ -924,6 +932,24 @@ impl HangarClient {
             .as_ref()
             .and_then(|v| v.data.followed_by.clone());
 
+        let viewer_muted = output
+            .data
+            .viewer
+            .as_ref()
+            .and_then(|v| v.data.muted)
+            .unwrap_or(false);
+        let viewer_blocking = output
+            .data
+            .viewer
+            .as_ref()
+            .and_then(|v| v.data.blocking.clone());
+        let viewer_blocked_by = output
+            .data
+            .viewer
+            .as_ref()
+            .and_then(|v| v.data.blocked_by)
+            .unwrap_or(false);
+
         Ok(Profile {
             did: output.data.did.to_string(),
             handle: output.data.handle.to_string(),
@@ -936,6 +962,9 @@ impl HangarClient {
             posts_count: output.data.posts_count.map(|c| c as u32),
             viewer_following,
             viewer_followed_by,
+            viewer_muted,
+            viewer_blocking,
+            viewer_blocked_by,
         })
         })
     }
@@ -988,6 +1017,17 @@ impl HangarClient {
                     followers_count: p.followers_count.map(|c| c as u32),
                     following_count: p.follows_count.map(|c| c as u32),
                     posts_count: p.posts_count.map(|c| c as u32),
+                    viewer_muted: p
+                        .viewer
+                        .as_ref()
+                        .and_then(|v| v.data.muted)
+                        .unwrap_or(false),
+                    viewer_blocking: p.viewer.as_ref().and_then(|v| v.data.blocking.clone()),
+                    viewer_blocked_by: p
+                        .viewer
+                        .as_ref()
+                        .and_then(|v| v.data.blocked_by)
+                        .unwrap_or(false),
                     viewer_following,
                     viewer_followed_by,
                 }
@@ -2718,6 +2758,9 @@ impl HangarClient {
                     .viewer
                     .as_ref()
                     .and_then(|v| v.data.followed_by.clone()),
+                viewer_muted: false,
+                viewer_blocking: None,
+                viewer_blocked_by: false,
             })
             .collect();
 
@@ -2764,6 +2807,7 @@ impl HangarClient {
     /// Convert a wire ProfileView into our Profile. The view carries no
     /// counts; pages that need them fetch the full profile.
     fn profile_from_view(view: &atrium_api::app::bsky::actor::defs::ProfileView) -> Profile {
+        let viewer = view.data.viewer.as_ref();
         Profile {
             did: view.data.did.to_string(),
             handle: view.data.handle.to_string(),
@@ -2774,16 +2818,11 @@ impl HangarClient {
             followers_count: None,
             following_count: None,
             posts_count: None,
-            viewer_following: view
-                .data
-                .viewer
-                .as_ref()
-                .and_then(|v| v.data.following.clone()),
-            viewer_followed_by: view
-                .data
-                .viewer
-                .as_ref()
-                .and_then(|v| v.data.followed_by.clone()),
+            viewer_following: viewer.and_then(|v| v.data.following.clone()),
+            viewer_followed_by: viewer.and_then(|v| v.data.followed_by.clone()),
+            viewer_muted: viewer.and_then(|v| v.data.muted).unwrap_or(false),
+            viewer_blocking: viewer.and_then(|v| v.data.blocking.clone()),
+            viewer_blocked_by: viewer.and_then(|v| v.data.blocked_by).unwrap_or(false),
         }
     }
 
@@ -3058,6 +3097,155 @@ impl HangarClient {
     pub async fn unfollow(&self, follow_uri: &str) -> Result<(), ClientError> {
         self.delete_record(follow_uri, "app.bsky.graph.follow")
             .await
+    }
+
+    /// Block an account. A record like follow; the URI comes back for
+    /// unblocking later.
+    #[allow(clippy::await_holding_lock)]
+    pub async fn block(&self, subject_did: &str) -> Result<String, ClientError> {
+        with_agent_and_did!(self, agent, did => {
+
+        let record_json = serde_json::json!({
+            "$type": "app.bsky.graph.block",
+            "subject": subject_did,
+            "createdAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        });
+        let record: Unknown = serde_json::from_value(record_json)
+            .map_err(|e| ClientError::InvalidResponse(e.to_string()))?;
+
+        let collection = atrium_api::types::string::Nsid::new("app.bsky.graph.block".to_string())
+            .map_err(|_| ClientError::InvalidResponse("invalid collection".into()))?;
+
+        let input = create_record::InputData {
+            collection,
+            record,
+            repo: did.clone().into(),
+            rkey: None,
+            swap_commit: None,
+            validate: None,
+        };
+
+        let output = agent
+            .api
+            .com
+            .atproto
+            .repo
+            .create_record(input.into())
+            .await
+            .map_err(|e| self.xrpc_error(e))?;
+
+        Ok(output.data.uri.to_string())
+        })
+    }
+
+    /// Unblock by deleting the block record
+    #[allow(clippy::await_holding_lock)]
+    pub async fn unblock(&self, block_uri: &str) -> Result<(), ClientError> {
+        self.delete_record(block_uri, "app.bsky.graph.block").await
+    }
+
+    /// Mute an account. Server-side state, no record; feeds stop carrying
+    /// the account on their next fetch.
+    #[allow(clippy::await_holding_lock)]
+    pub async fn mute_actor(&self, did: &str) -> Result<(), ClientError> {
+        with_agent!(self, agent => {
+
+        let input = atrium_api::app::bsky::graph::mute_actor::InputData {
+            actor: did
+                .parse()
+                .map_err(|e| ClientError::InvalidResponse(format!("invalid actor: {e}")))?,
+        };
+        agent
+            .api
+            .app
+            .bsky
+            .graph
+            .mute_actor(input.into())
+            .await
+            .map_err(|e| self.xrpc_error(e))?;
+        Ok(())
+        })
+    }
+
+    /// Take a mute back off an account
+    #[allow(clippy::await_holding_lock)]
+    pub async fn unmute_actor(&self, did: &str) -> Result<(), ClientError> {
+        with_agent!(self, agent => {
+
+        let input = atrium_api::app::bsky::graph::unmute_actor::InputData {
+            actor: did
+                .parse()
+                .map_err(|e| ClientError::InvalidResponse(format!("invalid actor: {e}")))?,
+        };
+        agent
+            .api
+            .app
+            .bsky
+            .graph
+            .unmute_actor(input.into())
+            .await
+            .map_err(|e| self.xrpc_error(e))?;
+        Ok(())
+        })
+    }
+
+    /// File a moderation report on an account or a post.
+    #[allow(clippy::await_holding_lock)]
+    pub async fn create_report(
+        &self,
+        reason_type: &str,
+        details: &str,
+        subject: ReportSubject,
+    ) -> Result<(), ClientError> {
+        use atrium_api::com::atproto::moderation::create_report::InputSubjectRefs;
+
+        with_agent!(self, agent => {
+
+        let subject = match &subject {
+            ReportSubject::Account(did) => atrium_api::types::Union::Refs(
+                InputSubjectRefs::ComAtprotoAdminDefsRepoRef(Box::new(
+                    atrium_api::com::atproto::admin::defs::RepoRefData {
+                        did: did
+                            .parse()
+                            .map_err(|e| {
+                                ClientError::InvalidResponse(format!("invalid did: {e}"))
+                            })?,
+                    }
+                    .into(),
+                )),
+            ),
+            ReportSubject::Post { uri, cid } => atrium_api::types::Union::Refs(
+                InputSubjectRefs::ComAtprotoRepoStrongRefMain(Box::new(
+                    atrium_api::com::atproto::repo::strong_ref::MainData {
+                        uri: uri.clone(),
+                        cid: cid
+                            .parse()
+                            .map_err(|e| {
+                                ClientError::InvalidResponse(format!("invalid cid: {e}"))
+                            })?,
+                    }
+                    .into(),
+                )),
+            ),
+        };
+
+        let input = atrium_api::com::atproto::moderation::create_report::InputData {
+            mod_tool: None,
+            reason: (!details.trim().is_empty()).then(|| details.trim().to_string()),
+            reason_type: reason_type.to_string(),
+            subject,
+        };
+
+        agent
+            .api
+            .com
+            .atproto
+            .moderation
+            .create_report(input.into())
+            .await
+            .map_err(|e| self.xrpc_error(e))?;
+        Ok(())
+        })
     }
 
     /// Save a post to the signed-in user's bookmarks. Bookmarks are private
