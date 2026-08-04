@@ -186,6 +186,14 @@ mod imp {
         pub likes_empty_state: RefCell<Option<adw::StatusPage>>,
         pub search_empty_state: RefCell<Option<adw::StatusPage>>,
         pub search_people_empty_state: RefCell<Option<adw::StatusPage>>,
+        // Error states: shown when a first load fails with nothing listed;
+        // the Try Again button re-runs the section's own fetch path.
+        pub timeline_error_state: RefCell<Option<adw::StatusPage>>,
+        pub mentions_error_state: RefCell<Option<adw::StatusPage>>,
+        pub activity_error_state: RefCell<Option<adw::StatusPage>>,
+        pub likes_error_state: RefCell<Option<adw::StatusPage>>,
+        pub bookmarks_error_state: RefCell<Option<adw::StatusPage>>,
+        pub chat_error_state: RefCell<Option<adw::StatusPage>>,
         pub search_suggestions_box: RefCell<Option<gtk4::Box>>,
         // New Message picker
         pub new_message_dialog: RefCell<Option<adw::Dialog>>,
@@ -903,6 +911,15 @@ impl HangarWindow {
             "Posts from accounts you follow will appear here.",
         );
         timeline_box.append(&empty_state);
+        let win = self.downgrade();
+        let error_state = Self::error_state_page(move || {
+            if let Some(win) = win.upgrade() {
+                win.refresh_feed();
+            }
+        });
+        timeline_box.append(&error_state);
+        self.imp().timeline_error_state.replace(Some(error_state));
+
         self.imp().timeline_overlay.replace(Some(overlay.clone()));
         self.imp().timeline_empty_state.replace(Some(empty_state));
 
@@ -1108,6 +1125,47 @@ impl HangarWindow {
         }
     }
 
+    /// "Couldn't load" with a Try Again button running `retry`. Hidden
+    /// until a first load fails.
+    fn error_state_page(retry: impl Fn() + 'static) -> adw::StatusPage {
+        let page = adw::StatusPage::new();
+        page.set_icon_name(Some("dialog-warning-symbolic"));
+        page.set_title("Couldn't Load");
+        page.set_description(Some("Check your connection and try again."));
+        page.set_vexpand(true);
+        page.set_visible(false);
+
+        let retry_button = gtk4::Button::with_label("Try Again");
+        retry_button.add_css_class("pill");
+        retry_button.add_css_class("suggested-action");
+        retry_button.set_halign(gtk4::Align::Center);
+        retry_button.connect_clicked(move |_| retry());
+        page.set_child(Some(&retry_button));
+        page
+    }
+
+    /// A first load failed. With content on screen the toast said enough;
+    /// with nothing listed the error page and its Try Again take over.
+    fn apply_load_failed(
+        model_empty: bool,
+        overlay: &RefCell<Option<gtk4::Overlay>>,
+        empty_state: &RefCell<Option<adw::StatusPage>>,
+        error_state: &RefCell<Option<adw::StatusPage>>,
+    ) {
+        if !model_empty {
+            return;
+        }
+        if let Some(overlay) = overlay.borrow().as_ref() {
+            overlay.set_visible(false);
+        }
+        if let Some(page) = empty_state.borrow().as_ref() {
+            page.set_visible(false);
+        }
+        if let Some(page) = error_state.borrow().as_ref() {
+            page.set_visible(true);
+        }
+    }
+
     /// Point a Follow button at the given state: label, style, and back on.
     pub fn sync_follow_button(button: &gtk4::Button, following: bool) {
         button.set_label(if following { "Following" } else { "Follow" });
@@ -1163,6 +1221,9 @@ impl HangarWindow {
         }
         let imp = self.imp();
         Self::apply_empty_state(&imp.timeline_overlay, &imp.timeline_empty_state, empty);
+        if let Some(err) = imp.timeline_error_state.borrow().as_ref() {
+            err.set_visible(false);
+        }
     }
 
     pub fn append_posts(&self, posts: Vec<Post>) {
@@ -2603,6 +2664,18 @@ impl HangarWindow {
             "Replies, mentions, and quotes of you will appear here.",
         );
         mentions_box.append(&empty_state);
+        let win = self.downgrade();
+        let error_state = Self::error_state_page(move || {
+            let Some(win) = win.upgrade() else {
+                return;
+            };
+            if let Some(cb) = win.imp().nav_changed_callback.borrow().as_ref() {
+                cb(crate::ui::sidebar::NavItem::Mentions);
+            }
+        });
+        mentions_box.append(&error_state);
+        self.imp().mentions_error_state.replace(Some(error_state));
+
         self.imp().mentions_overlay.replace(Some(overlay.clone()));
         self.imp().mentions_empty_state.replace(Some(empty_state));
 
@@ -2652,6 +2725,9 @@ impl HangarWindow {
         }
         let imp = self.imp();
         Self::apply_empty_state(&imp.mentions_overlay, &imp.mentions_empty_state, empty);
+        if let Some(err) = imp.mentions_error_state.borrow().as_ref() {
+            err.set_visible(false);
+        }
     }
 
     /// Append more notifications to the mentions list
@@ -2803,6 +2879,18 @@ impl HangarWindow {
             "Likes, reposts, and new followers will appear here.",
         );
         activity_box.append(&empty_state);
+        let win = self.downgrade();
+        let error_state = Self::error_state_page(move || {
+            let Some(win) = win.upgrade() else {
+                return;
+            };
+            if let Some(cb) = win.imp().nav_changed_callback.borrow().as_ref() {
+                cb(crate::ui::sidebar::NavItem::Activity);
+            }
+        });
+        activity_box.append(&error_state);
+        self.imp().activity_error_state.replace(Some(error_state));
+
         self.imp().activity_overlay.replace(Some(overlay.clone()));
         self.imp().activity_empty_state.replace(Some(empty_state));
 
@@ -2847,6 +2935,9 @@ impl HangarWindow {
         }
         let imp = self.imp();
         Self::apply_empty_state(&imp.activity_overlay, &imp.activity_empty_state, empty);
+        if let Some(err) = imp.activity_error_state.borrow().as_ref() {
+            err.set_visible(false);
+        }
     }
 
     /// Append more notifications to the activity list
@@ -2995,6 +3086,17 @@ impl HangarWindow {
 
         chat_box.append(&overlay);
         chat_box.append(&empty_state);
+        let win = self.downgrade();
+        let error_state = Self::error_state_page(move || {
+            let Some(win) = win.upgrade() else {
+                return;
+            };
+            if let Some(cb) = win.imp().nav_changed_callback.borrow().as_ref() {
+                cb(crate::ui::sidebar::NavItem::Chat);
+            }
+        });
+        chat_box.append(&error_state);
+        self.imp().chat_error_state.replace(Some(error_state));
 
         let imp = self.imp();
         imp.chat_model.replace(Some(model));
@@ -3042,6 +3144,9 @@ impl HangarWindow {
         }
         if let Some(empty_state) = self.imp().chat_empty_state.borrow().as_ref() {
             empty_state.set_visible(empty);
+        }
+        if let Some(err) = self.imp().chat_error_state.borrow().as_ref() {
+            err.set_visible(false);
         }
     }
 
@@ -4064,6 +4169,18 @@ impl HangarWindow {
             "Posts you like will appear here.",
         );
         likes_box.append(&empty_state);
+        let win = self.downgrade();
+        let error_state = Self::error_state_page(move || {
+            let Some(win) = win.upgrade() else {
+                return;
+            };
+            if let Some(cb) = win.imp().nav_changed_callback.borrow().as_ref() {
+                cb(crate::ui::sidebar::NavItem::Likes);
+            }
+        });
+        likes_box.append(&error_state);
+        self.imp().likes_error_state.replace(Some(error_state));
+
         self.imp().likes_overlay.replace(Some(overlay.clone()));
         self.imp().likes_empty_state.replace(Some(empty_state));
 
@@ -4109,6 +4226,9 @@ impl HangarWindow {
         }
         let imp = self.imp();
         Self::apply_empty_state(&imp.likes_overlay, &imp.likes_empty_state, empty);
+        if let Some(err) = imp.likes_error_state.borrow().as_ref() {
+            err.set_visible(false);
+        }
     }
 
     /// Append more liked posts to the likes list
@@ -4300,6 +4420,17 @@ impl HangarWindow {
 
         bookmarks_box.append(&overlay);
         bookmarks_box.append(&empty_state);
+        let win = self.downgrade();
+        let error_state = Self::error_state_page(move || {
+            let Some(win) = win.upgrade() else {
+                return;
+            };
+            if let Some(cb) = win.imp().nav_changed_callback.borrow().as_ref() {
+                cb(crate::ui::sidebar::NavItem::Bookmarks);
+            }
+        });
+        bookmarks_box.append(&error_state);
+        self.imp().bookmarks_error_state.replace(Some(error_state));
 
         // Store references
         let imp = self.imp();
@@ -4350,6 +4481,9 @@ impl HangarWindow {
         }
         if let Some(empty_state) = self.imp().bookmarks_empty_state.borrow().as_ref() {
             empty_state.set_visible(empty);
+        }
+        if let Some(err) = self.imp().bookmarks_error_state.borrow().as_ref() {
+            err.set_visible(false);
         }
     }
 
@@ -4992,7 +5126,97 @@ impl HangarWindow {
         }
     }
 
-    /// Show a toast notification
+    /// One `set_X_load_failed` per rail feed; see `apply_load_failed`.
+    pub fn set_timeline_load_failed(&self) {
+        let imp = self.imp();
+        let empty = imp
+            .timeline_model
+            .borrow()
+            .as_ref()
+            .is_none_or(|m| m.n_items() == 0);
+        Self::apply_load_failed(
+            empty,
+            &imp.timeline_overlay,
+            &imp.timeline_empty_state,
+            &imp.timeline_error_state,
+        );
+    }
+
+    pub fn set_mentions_load_failed(&self) {
+        let imp = self.imp();
+        let empty = imp
+            .mentions_model
+            .borrow()
+            .as_ref()
+            .is_none_or(|m| m.n_items() == 0);
+        Self::apply_load_failed(
+            empty,
+            &imp.mentions_overlay,
+            &imp.mentions_empty_state,
+            &imp.mentions_error_state,
+        );
+    }
+
+    pub fn set_activity_load_failed(&self) {
+        let imp = self.imp();
+        let empty = imp
+            .activity_model
+            .borrow()
+            .as_ref()
+            .is_none_or(|m| m.n_items() == 0);
+        Self::apply_load_failed(
+            empty,
+            &imp.activity_overlay,
+            &imp.activity_empty_state,
+            &imp.activity_error_state,
+        );
+    }
+
+    pub fn set_likes_load_failed(&self) {
+        let imp = self.imp();
+        let empty = imp
+            .likes_model
+            .borrow()
+            .as_ref()
+            .is_none_or(|m| m.n_items() == 0);
+        Self::apply_load_failed(
+            empty,
+            &imp.likes_overlay,
+            &imp.likes_empty_state,
+            &imp.likes_error_state,
+        );
+    }
+
+    pub fn set_bookmarks_load_failed(&self) {
+        let imp = self.imp();
+        let empty = imp
+            .bookmarks_model
+            .borrow()
+            .as_ref()
+            .is_none_or(|m| m.n_items() == 0);
+        Self::apply_load_failed(
+            empty,
+            &imp.bookmarks_overlay,
+            &imp.bookmarks_empty_state,
+            &imp.bookmarks_error_state,
+        );
+    }
+
+    pub fn set_conversations_load_failed(&self) {
+        let imp = self.imp();
+        let empty = imp
+            .chat_model
+            .borrow()
+            .as_ref()
+            .is_none_or(|m| m.n_items() == 0);
+        Self::apply_load_failed(
+            empty,
+            &imp.chat_overlay,
+            &imp.chat_empty_state,
+            &imp.chat_error_state,
+        );
+    }
+
     /// Show or clear the offline banner, saying so aloud either way.
     pub fn set_offline(&self, offline: bool) {
         let Some(banner) = self.imp().offline_banner.borrow().clone() else {
@@ -5012,6 +5236,7 @@ impl HangarWindow {
         );
     }
 
+    /// Show a toast notification
     pub fn show_toast(&self, message: &str) {
         if let Some(overlay) = self.imp().toast_overlay.borrow().as_ref() {
             let toast = adw::Toast::new(message);
@@ -7780,6 +8005,103 @@ mod tests {
                 .is_some_and(|l| l.text() == "following"),
             "a missing count leaves the word as the whole stat"
         );
+
+        window.destroy();
+    }
+
+    /// A failed first load swaps in the error page, whose Try Again re-runs
+    /// the section's own fetch path; content arriving clears it, and a list
+    /// that already has content ignores the failure beyond its toast.
+    #[test]
+    fn failed_first_loads_offer_try_again() {
+        crate::ui::with_gtk(failed_first_loads_offer_try_again_body);
+    }
+
+    fn failed_first_loads_offer_try_again_body() {
+        let window: HangarWindow = glib::Object::builder().build();
+        let imp = window.imp();
+
+        let retried: Rc<RefCell<Vec<crate::ui::sidebar::NavItem>>> = Rc::new(RefCell::new(vec![]));
+        let sink = retried.clone();
+        window.set_nav_changed_callback(move |item| {
+            sink.borrow_mut().push(item);
+        });
+        let refreshed: Rc<RefCell<u32>> = Rc::default();
+        let sink = refreshed.clone();
+        window.set_refresh_callback(move || {
+            *sink.borrow_mut() += 1;
+        });
+
+        // Mentions: the nav-routed retry.
+        window.set_mentions_load_failed();
+        let error = imp.mentions_error_state.borrow().clone().unwrap();
+        assert!(error.get_visible(), "an empty failed list shows the error");
+        assert!(!imp.mentions_overlay.borrow().clone().unwrap().get_visible());
+        assert!(
+            !imp.mentions_empty_state
+                .borrow()
+                .clone()
+                .unwrap()
+                .get_visible()
+        );
+
+        let try_again = error
+            .child()
+            .and_downcast::<gtk4::Button>()
+            .expect("the error page holds Try Again");
+        try_again.emit_clicked();
+        assert_eq!(
+            retried.borrow().as_slice(),
+            [crate::ui::sidebar::NavItem::Mentions],
+            "Try Again re-opens the section"
+        );
+
+        window.set_mentions(vec![notification(true)]);
+        assert!(!error.get_visible(), "content clears the error page");
+        assert!(imp.mentions_overlay.borrow().clone().unwrap().get_visible());
+
+        // With content listed, a later failure keeps the list on screen.
+        window.set_mentions_load_failed();
+        assert!(!error.get_visible(), "content on screen outranks the error");
+
+        // Timeline: the refresh-routed retry.
+        window.set_timeline_load_failed();
+        let error = imp.timeline_error_state.borrow().clone().unwrap();
+        assert!(error.get_visible());
+        error
+            .child()
+            .and_downcast::<gtk4::Button>()
+            .unwrap()
+            .emit_clicked();
+        assert_eq!(*refreshed.borrow(), 1, "the feed retries through refresh");
+
+        // The remaining four share the machinery; prove they are wired.
+        window.set_activity_load_failed();
+        assert!(
+            imp.activity_error_state
+                .borrow()
+                .clone()
+                .unwrap()
+                .get_visible()
+        );
+        window.set_likes_load_failed();
+        assert!(
+            imp.likes_error_state
+                .borrow()
+                .clone()
+                .unwrap()
+                .get_visible()
+        );
+        window.set_bookmarks_load_failed();
+        assert!(
+            imp.bookmarks_error_state
+                .borrow()
+                .clone()
+                .unwrap()
+                .get_visible()
+        );
+        window.set_conversations_load_failed();
+        assert!(imp.chat_error_state.borrow().clone().unwrap().get_visible());
 
         window.destroy();
     }

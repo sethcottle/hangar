@@ -1100,6 +1100,9 @@ impl HangarApplication {
                 Ok(Err(e)) => {
                     eprintln!("Failed to fetch timeline: {}", e);
                     app.toast_unless_offline("Couldn't load the feed");
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.set_timeline_load_failed();
+                    }
                     app.report_session_expiry();
                     glib::ControlFlow::Break
                 }
@@ -2518,6 +2521,9 @@ impl HangarApplication {
                 Ok(Err(e)) => {
                     eprintln!("Failed to fetch mentions: {}", e);
                     app.toast_unless_offline("Couldn't load mentions");
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.set_mentions_load_failed();
+                    }
                     glib::ControlFlow::Break
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
@@ -2635,6 +2641,9 @@ impl HangarApplication {
                 Ok(Err(e)) => {
                     eprintln!("Failed to fetch activity: {}", e);
                     app.toast_unless_offline("Couldn't load activity");
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.set_activity_load_failed();
+                    }
                     glib::ControlFlow::Break
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
@@ -2748,6 +2757,10 @@ impl HangarApplication {
                 }
                 Ok(Err(e)) => {
                     eprintln!("Failed to fetch conversations: {}", e);
+                    app.toast_unless_offline("Couldn't load conversations");
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.set_conversations_load_failed();
+                    }
                     glib::ControlFlow::Break
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
@@ -3558,6 +3571,9 @@ impl HangarApplication {
                 Ok(Err(e)) => {
                     eprintln!("Failed to fetch likes: {}", e);
                     app.toast_unless_offline("Couldn't load likes");
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.set_likes_load_failed();
+                    }
                     glib::ControlFlow::Break
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
@@ -3676,6 +3692,7 @@ impl HangarApplication {
                             app.report_session_expiry();
                             if let Some(window) = app.imp().window.borrow().as_ref() {
                                 window.show_toast("Couldn't load saved posts");
+                                window.set_bookmarks_load_failed();
                             }
                         }
                     }
