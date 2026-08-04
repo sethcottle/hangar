@@ -42,14 +42,28 @@ fn text_links(text: &str) -> Vec<(std::ops::Range<usize>, String)> {
         }
     };
 
+    // Trailing punctuation belongs to the sentence, not the link. Same
+    // rule as `facets::trim_url_trailing`; `seth.social,` opened as
+    // `https://seth.social,` before this.
+    let trim = |m: &regex::Match| -> (std::ops::Range<usize>, usize) {
+        let trimmed = m.as_str().trim_end_matches(['.', ',', ';', '!', '?']);
+        (m.start()..m.start() + trimmed.len(), trimmed.len())
+    };
+
     for m in URL.find_iter(text) {
-        claim(m.range(), m.as_str().to_string());
+        let (range, len) = trim(&m);
+        if len > 0 {
+            claim(range, m.as_str()[..len].to_string());
+        }
     }
     for m in MENTION.find_iter(text) {
         claim(m.range(), format!("bsky-mention://{}", &m.as_str()[1..]));
     }
     for m in BARE_URL.find_iter(text) {
-        claim(m.range(), format!("https://{}", m.as_str()));
+        let (range, len) = trim(&m);
+        if len > 0 {
+            claim(range, format!("https://{}", &m.as_str()[..len]));
+        }
     }
     for m in HASHTAG.find_iter(text) {
         claim(m.range(), format!("bsky-tag://{}", &m.as_str()[1..]));
@@ -161,6 +175,23 @@ mod tests {
         assert_eq!(
             linkify("https://example.com/?a=1&b=2"),
             r#"<a href="https://example.com/?a=1&amp;b=2">https://example.com/?a=1&amp;b=2</a>"#
+        );
+
+        // Sentence punctuation stays out of the link. A bio reading
+        // "seth.social," linked to https://seth.social, and the browser
+        // shrugged at it.
+        assert_eq!(
+            linkify("find me at seth.social, or elsewhere"),
+            r#"find me at <a href="https://seth.social">seth.social</a>, or elsewhere"#
+        );
+        assert_eq!(
+            linkify("read https://example.com/post."),
+            r#"read <a href="https://example.com/post">https://example.com/post</a>."#
+        );
+        // Punctuation inside a path is still part of the link.
+        assert!(
+            linkify("https://example.com/a,b more")
+                .contains(r#"<a href="https://example.com/a,b">"#)
         );
     }
 
