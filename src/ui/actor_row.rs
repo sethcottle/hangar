@@ -10,6 +10,32 @@ use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
 use libadwaita as adw;
 
+thread_local! {
+    /// The signed-in user's DID; their own row hides the follow button.
+    static VIEWER_DID: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+    /// What a Follow click does. One handler serves every row, same as the
+    /// post row's delete and save handlers.
+    static FOLLOW_HANDLER: std::cell::RefCell<
+        Option<Box<dyn Fn(Profile, glib::WeakRef<ActorRow>)>>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+/// Record whose rows hide the follow button. `None` on sign-out.
+pub fn set_viewer_did(did: Option<&str>) {
+    VIEWER_DID.with(|cell| {
+        cell.replace(did.map(str::to_string));
+    });
+}
+
+/// Install the app-level follow flow. The row comes along weakly so the
+/// app can settle the button once the server answers.
+pub fn set_follow_handler<F: Fn(Profile, glib::WeakRef<ActorRow>) + 'static>(handler: F) {
+    FOLLOW_HANDLER.with(|cell| {
+        cell.replace(Some(Box::new(handler)));
+    });
+}
+
 mod actor_object {
     use super::*;
     use std::cell::RefCell;
@@ -46,6 +72,14 @@ mod actor_object {
         pub fn profile(&self) -> Option<Profile> {
             self.imp().profile.borrow().clone()
         }
+
+        /// Follow state settled after this object was built; a later
+        /// rebind reads the current truth.
+        pub fn set_viewer_following(&self, follow_uri: Option<String>) {
+            if let Some(profile) = self.imp().profile.borrow_mut().as_mut() {
+                profile.viewer_following = follow_uri;
+            }
+        }
     }
 }
 
@@ -63,6 +97,10 @@ mod imp {
         pub handle_label: RefCell<Option<gtk4::Label>>,
         pub follow_label: RefCell<Option<gtk4::Label>>,
         pub bio_label: RefCell<Option<gtk4::Label>>,
+        pub follow_btn: RefCell<Option<gtk4::Button>>,
+        /// The model object behind the current bind, so a follow that
+        /// settles after a scroll still lands in the list's state.
+        pub bound_object: RefCell<Option<glib::WeakRef<super::ActorObject>>>,
         pub activated_callback: RefCell<Option<Box<dyn Fn(Profile) + 'static>>>,
     }
 
@@ -152,6 +190,35 @@ impl ActorRow {
         info_box.append(&bio_label);
 
         main_box.append(&info_box);
+
+        // Follow/unfollow without leaving the list. The button claims its
+        // clicks, so the row's open-profile gesture stays out of it.
+        let follow_btn = gtk4::Button::new();
+        follow_btn.add_css_class("pill");
+        follow_btn.set_valign(gtk4::Align::Center);
+        follow_btn.set_visible(false);
+        let row_weak = self.downgrade();
+        follow_btn.connect_clicked(move |btn| {
+            let Some(row) = row_weak.upgrade() else {
+                return;
+            };
+            let Some(profile) = row.imp().profile.borrow().clone() else {
+                return;
+            };
+            // Show the hoped-for state, locked until the app reports back.
+            super::window::HangarWindow::sync_follow_button(
+                btn,
+                profile.viewer_following.is_none(),
+            );
+            btn.set_sensitive(false);
+            FOLLOW_HANDLER.with(|cell| {
+                if let Some(handler) = cell.borrow().as_ref() {
+                    handler(profile.clone(), row.downgrade());
+                }
+            });
+        });
+        main_box.append(&follow_btn);
+
         self.append(&main_box);
 
         let sep = gtk4::Separator::new(gtk4::Orientation::Horizontal);
@@ -180,6 +247,7 @@ impl ActorRow {
         imp.handle_label.replace(Some(handle_label));
         imp.follow_label.replace(Some(follow_label));
         imp.bio_label.replace(Some(bio_label));
+        imp.follow_btn.replace(Some(follow_btn));
     }
 
     /// Show `profile`. Rebinding a recycled row overwrites everything the
@@ -237,8 +305,58 @@ impl ActorRow {
             }
         }
 
+        if let Some(btn) = imp.follow_btn.borrow().as_ref() {
+            let own_row = VIEWER_DID
+                .with(|cell| cell.borrow().clone())
+                .is_none_or(|did| did == profile.did);
+            btn.set_visible(!own_row);
+            // sync_follow_button re-enables a row recycled mid-flight.
+            super::window::HangarWindow::sync_follow_button(
+                btn,
+                profile.viewer_following.is_some(),
+            );
+        }
+
         let a11y_label = format!("{}, @{}", display_name, profile.handle);
         self.update_property(&[gtk4::accessible::Property::Label(&a11y_label)]);
+    }
+
+    /// Remember the model object behind this bind; follow results write
+    /// through so a scrolled-away row comes back current.
+    pub fn set_bound_object(&self, object: &ActorObject) {
+        self.imp().bound_object.replace(Some(object.downgrade()));
+    }
+
+    /// DID of the profile currently shown, for settling async results on
+    /// the right occupant.
+    pub fn profile_did(&self) -> Option<String> {
+        self.imp().profile.borrow().as_ref().map(|p| p.did.clone())
+    }
+
+    /// Record the follow state the server confirmed: the row's profile,
+    /// its button, and the model object all take it together.
+    pub fn set_viewer_following(&self, follow_uri: Option<String>) {
+        let imp = self.imp();
+        if let Some(profile) = imp.profile.borrow_mut().as_mut() {
+            profile.viewer_following = follow_uri.clone();
+        }
+        if let Some(btn) = imp.follow_btn.borrow().as_ref() {
+            super::window::HangarWindow::sync_follow_button(btn, follow_uri.is_some());
+        }
+        if let Some(object) = imp
+            .bound_object
+            .borrow()
+            .as_ref()
+            .and_then(|weak| weak.upgrade())
+        {
+            let same = object
+                .profile()
+                .zip(imp.profile.borrow().clone())
+                .is_some_and(|(a, b)| a.did == b.did);
+            if same {
+                object.set_viewer_following(follow_uri);
+            }
+        }
     }
 
     /// Replace the activation callback, so a recycled row keeps exactly one.
@@ -303,5 +421,68 @@ mod tests {
             imp.handle_label.borrow().as_ref().unwrap().text(),
             "@second.bsky.social"
         );
+    }
+
+    /// The follow button reads the bound profile, reports one click with
+    /// it, settles through the row into the model object, and stays off
+    /// your own row.
+    #[test]
+    fn the_follow_button_serves_the_bound_profile_only() {
+        crate::ui::with_gtk(the_follow_button_serves_the_bound_profile_only_body);
+    }
+
+    fn the_follow_button_serves_the_bound_profile_only_body() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        set_viewer_did(Some("did:plc:me"));
+        let clicked: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(vec![]));
+        let sink = clicked.clone();
+        set_follow_handler(move |profile, _row| {
+            sink.borrow_mut().push(profile.did);
+        });
+
+        let row = ActorRow::new();
+        let btn = row.imp().follow_btn.borrow().clone().unwrap();
+
+        let stranger = a_profile("stranger");
+        let object = ActorObject::new(stranger.clone());
+        row.bind(&stranger);
+        row.set_bound_object(&object);
+
+        assert!(btn.is_visible());
+        assert_eq!(btn.label().as_deref(), Some("Follow"));
+
+        btn.emit_clicked();
+        assert_eq!(clicked.borrow().as_slice(), ["did:plc:stranger"]);
+        assert_eq!(
+            btn.label().as_deref(),
+            Some("Following"),
+            "the hoped-for state shows while the server is out"
+        );
+        assert!(!btn.is_sensitive());
+
+        // The app settles it: profile, button, and model object agree.
+        row.set_viewer_following(Some("at://did:plc:me/app.bsky.graph.follow/1".into()));
+        assert!(btn.is_sensitive());
+        assert_eq!(
+            object.profile().unwrap().viewer_following.as_deref(),
+            Some("at://did:plc:me/app.bsky.graph.follow/1"),
+            "a later rebind must read the settled state"
+        );
+
+        // A recycled row leaves the lock behind with the old profile.
+        let mut followed = a_profile("followed");
+        followed.viewer_following = Some("at://did:plc:me/app.bsky.graph.follow/2".into());
+        row.bind(&followed);
+        assert!(btn.is_sensitive());
+        assert_eq!(btn.label().as_deref(), Some("Following"));
+
+        // Your own row offers no follow button.
+        row.bind(&a_profile("me"));
+        assert!(!btn.is_visible());
+
+        set_follow_handler(|_, _| {});
+        set_viewer_did(None);
     }
 }

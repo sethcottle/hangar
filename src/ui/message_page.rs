@@ -41,6 +41,31 @@ const TOP_THRESHOLD: f64 = 200.0;
 /// so new messages keep the view pinned there.
 const BOTTOM_SLACK: f64 = 40.0;
 
+/// The actor in a bsky.app profile link, if that is what the link is.
+/// Deeper paths are posts and lists, not the profile itself.
+fn bsky_profile_target(uri: &str) -> Option<String> {
+    let rest = uri
+        .strip_prefix("https://bsky.app/profile/")
+        .or_else(|| uri.strip_prefix("http://bsky.app/profile/"))
+        .or_else(|| uri.strip_prefix("https://www.bsky.app/profile/"))?;
+    let actor = rest.split(['?', '#']).next().unwrap_or("");
+    if actor.is_empty() || actor.contains('/') {
+        return None;
+    }
+    Some(actor.to_string())
+}
+
+/// A message that is nothing but a GIF link plays as a GIF, not a URL.
+/// The GIF pickers send them exactly like this.
+fn lone_gif_link(text: &str) -> Option<(String, crate::atproto::GifEmbed)> {
+    let trimmed = text.trim();
+    if trimmed.split_whitespace().count() != 1 {
+        return None;
+    }
+    let gif = crate::atproto::gif::detect(trimmed)?;
+    Some((trimmed.to_string(), gif))
+}
+
 /// Whether the composer's draft may go on the wire.
 fn message_sendable(text: &str) -> bool {
     !text.trim().is_empty()
@@ -48,20 +73,47 @@ fn message_sendable(text: &str) -> bool {
         && text.graphemes(true).count() <= MAX_MESSAGE_GRAPHEMES
 }
 
+/// Whether the desktop asks for 12 hour clocks. GNOME keeps this in a
+/// gsetting; anywhere without the schema falls back to 24 hour.
+fn clock_uses_12h() -> bool {
+    thread_local! {
+        static TWELVE_HOUR: std::cell::OnceCell<bool> = const { std::cell::OnceCell::new() };
+    }
+    TWELVE_HOUR.with(|cell| {
+        *cell.get_or_init(|| {
+            gio::SettingsSchemaSource::default()
+                .and_then(|source| source.lookup("org.gnome.desktop.interface", true))
+                .map(|_| {
+                    gio::Settings::new("org.gnome.desktop.interface").string("clock-format")
+                        == "12h"
+                })
+                .unwrap_or(false)
+        })
+    })
+}
+
 /// Short label text and full tooltip text for a message timestamp.
 fn format_message_time(sent_at: &str) -> (String, String) {
-    use chrono::{DateTime, Local};
+    use chrono::DateTime;
 
     let Ok(time) = DateTime::parse_from_rfc3339(sent_at) else {
         return (String::new(), String::new());
     };
-    let local = time.with_timezone(&Local);
-    let short = if local.date_naive() == Local::now().date_naive() {
-        local.format("%H:%M").to_string()
+    format_local_time(time.with_timezone(&chrono::Local), clock_uses_12h())
+}
+
+fn format_local_time(local: chrono::DateTime<chrono::Local>, use_12h: bool) -> (String, String) {
+    let (time, date_time, full) = if use_12h {
+        ("%-I:%M %p", "%b %-d, %-I:%M %p", "%B %-d, %Y at %-I:%M %p")
     } else {
-        local.format("%b %-d, %H:%M").to_string()
+        ("%H:%M", "%b %-d, %H:%M", "%B %-d, %Y at %H:%M")
     };
-    (short, local.format("%B %-d, %Y at %H:%M").to_string())
+    let short = if local.date_naive() == chrono::Local::now().date_naive() {
+        local.format(time).to_string()
+    } else {
+        local.format(date_time).to_string()
+    };
+    (short, local.format(full).to_string())
 }
 
 /// What `HangarWindow::push_message_page` did with the request.
@@ -126,9 +178,18 @@ mod message_row {
             pub bubble: RefCell<Option<gtk4::Box>>,
             pub text_label: RefCell<Option<gtk4::Label>>,
             pub embed_slot: RefCell<Option<gtk4::Box>>,
+            pub reactions_box: RefCell<Option<gtk4::Box>>,
             pub time_label: RefCell<Option<gtk4::Label>>,
+            /// The bound message, read back by menu actions and chips.
+            pub message: RefCell<Option<ChatMessage>>,
+            pub my_did: RefCell<Option<String>>,
+            pub context_menu: RefCell<Option<gtk4::Popover>>,
+            pub emoji_chooser: RefCell<Option<gtk4::EmojiChooser>>,
             pub mention_callback: RefCell<Option<Box<dyn Fn(String) + 'static>>>,
             pub post_callback: RefCell<Option<Box<dyn Fn(Post) + 'static>>>,
+            /// Args: message id, emoji, true to add or false to remove.
+            pub react_callback: RefCell<Option<Box<dyn Fn(String, String, bool) + 'static>>>,
+            pub delete_callback: RefCell<Option<Box<dyn Fn(String) + 'static>>>,
         }
 
         #[glib::object_subclass]
@@ -142,6 +203,17 @@ mod message_row {
             fn constructed(&self) {
                 self.parent_constructed();
                 self.obj().setup_ui();
+            }
+
+            fn dispose(&self) {
+                // Popovers are parented by hand and must be unparented the
+                // same way.
+                if let Some(menu) = self.context_menu.take() {
+                    menu.unparent();
+                }
+                if let Some(chooser) = self.emoji_chooser.take() {
+                    chooser.unparent();
+                }
             }
         }
 
@@ -202,6 +274,14 @@ mod message_row {
                     glib::Propagation::Stop
                 } else if uri.starts_with("bsky-tag://") {
                     glib::Propagation::Stop
+                } else if let Some(actor) = bsky_profile_target(uri) {
+                    // A shared profile is a mention wearing a URL.
+                    if let Some(row) = row_weak.upgrade()
+                        && let Some(cb) = row.imp().mention_callback.borrow().as_ref()
+                    {
+                        cb(actor);
+                    }
+                    glib::Propagation::Stop
                 } else {
                     crate::ui::external::open_url(label, uri, "link");
                     glib::Propagation::Stop
@@ -213,6 +293,11 @@ mod message_row {
             let embed_slot = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
             bubble.append(&embed_slot);
 
+            // Reaction chips; bind rebuilds these per message too.
+            let reactions_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+            reactions_box.set_visible(false);
+            bubble.append(&reactions_box);
+
             let time_label = gtk4::Label::new(None);
             time_label.add_css_class("dim-label");
             time_label.add_css_class("caption");
@@ -221,17 +306,124 @@ mod message_row {
 
             self.append(&bubble);
 
+            // React, copy, delete live behind a right click or long press
+            // on the bubble.
+            let menu = gtk4::Popover::new();
+            menu.set_parent(&bubble);
+            menu.set_has_arrow(false);
+            let menu_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+
+            let react_item = gtk4::Button::with_label("React");
+            react_item.add_css_class("flat");
+            let row_weak = self.downgrade();
+            let menu_weak = menu.downgrade();
+            react_item.connect_clicked(move |_| {
+                if let Some(menu) = menu_weak.upgrade() {
+                    menu.popdown();
+                }
+                if let Some(row) = row_weak.upgrade()
+                    && let Some(chooser) = row.imp().emoji_chooser.borrow().as_ref()
+                {
+                    chooser.popup();
+                }
+            });
+            menu_box.append(&react_item);
+
+            let copy_item = gtk4::Button::with_label("Copy Text");
+            copy_item.add_css_class("flat");
+            let row_weak = self.downgrade();
+            let menu_weak = menu.downgrade();
+            copy_item.connect_clicked(move |_| {
+                if let Some(menu) = menu_weak.upgrade() {
+                    menu.popdown();
+                }
+                if let Some(row) = row_weak.upgrade()
+                    && let Some(message) = row.imp().message.borrow().as_ref()
+                {
+                    row.clipboard().set_text(&message.text);
+                }
+            });
+            menu_box.append(&copy_item);
+
+            let delete_item = gtk4::Button::with_label("Delete for Me");
+            delete_item.add_css_class("flat");
+            let row_weak = self.downgrade();
+            let menu_weak = menu.downgrade();
+            delete_item.connect_clicked(move |_| {
+                if let Some(menu) = menu_weak.upgrade() {
+                    menu.popdown();
+                }
+                if let Some(row) = row_weak.upgrade() {
+                    let id = row.imp().message.borrow().as_ref().map(|m| m.id.clone());
+                    if let Some(id) = id
+                        && let Some(cb) = row.imp().delete_callback.borrow().as_ref()
+                    {
+                        cb(id);
+                    }
+                }
+            });
+            menu_box.append(&delete_item);
+            menu.set_child(Some(&menu_box));
+
+            let chooser = gtk4::EmojiChooser::new();
+            chooser.set_parent(&bubble);
+            let row_weak = self.downgrade();
+            chooser.connect_emoji_picked(move |_, emoji| {
+                if let Some(row) = row_weak.upgrade() {
+                    let id = row.imp().message.borrow().as_ref().map(|m| m.id.clone());
+                    if let Some(id) = id
+                        && let Some(cb) = row.imp().react_callback.borrow().as_ref()
+                    {
+                        cb(id, emoji.to_string(), true);
+                    }
+                }
+            });
+
+            let row_weak = self.downgrade();
+            let open_menu = move |x: f64, y: f64| {
+                let Some(row) = row_weak.upgrade() else {
+                    return;
+                };
+                if let Some(menu) = row.imp().context_menu.borrow().as_ref() {
+                    let rect = gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1);
+                    menu.set_pointing_to(Some(&rect));
+                    menu.popup();
+                }
+            };
+
+            let right_click = gtk4::GestureClick::new();
+            right_click.set_button(3);
+            let open = open_menu.clone();
+            right_click.connect_released(move |gesture, _, x, y| {
+                gesture.set_state(gtk4::EventSequenceState::Claimed);
+                open(x, y);
+            });
+            bubble.add_controller(right_click);
+
+            let long_press = gtk4::GestureLongPress::new();
+            long_press.set_touch_only(true);
+            long_press.connect_pressed(move |gesture, x, y| {
+                gesture.set_state(gtk4::EventSequenceState::Claimed);
+                open_menu(x, y);
+            });
+            bubble.add_controller(long_press);
+
             let imp = self.imp();
             imp.bubble.replace(Some(bubble));
             imp.text_label.replace(Some(text_label));
             imp.embed_slot.replace(Some(embed_slot));
+            imp.reactions_box.replace(Some(reactions_box));
             imp.time_label.replace(Some(time_label));
+            imp.context_menu.replace(Some(menu));
+            imp.emoji_chooser.replace(Some(chooser));
         }
 
         /// Fill the row for one message. Recycled rows pass through here
         /// again, so every setter overwrites what the last message left.
-        pub fn bind(&self, message: &ChatMessage, mine: bool) {
+        pub fn bind(&self, message: &ChatMessage, mine: bool, my_did: Option<&str>) {
             let imp = self.imp();
+            imp.message.replace(Some(message.clone()));
+            imp.my_did.replace(my_did.map(String::from));
 
             if let Some(bubble) = imp.bubble.borrow().as_ref() {
                 if mine {
@@ -247,10 +439,13 @@ mod message_row {
                 bubble.set_tooltip_text(if full.is_empty() { None } else { Some(&full) });
             }
 
+            let gif = lone_gif_link(&message.text);
+
             if let Some(label) = imp.text_label.borrow().as_ref() {
                 crate::ui::rich_text::set_linkified(label, &message.text);
-                // A post shared without a comment has no text of its own.
-                label.set_visible(!message.text.is_empty());
+                // A post shared without a comment has no text of its own,
+                // and a lone GIF link reads as its player below.
+                label.set_visible(!message.text.is_empty() && gif.is_none());
             }
 
             if let Some(slot) = imp.embed_slot.borrow().as_ref() {
@@ -259,12 +454,64 @@ mod message_row {
                 }
                 if let Some(Embed::Quote(quote)) = &message.embed {
                     slot.append(&self.shared_post_card(quote));
+                } else if let Some((link, gif)) = gif {
+                    slot.append(&Self::gif_player(link, gif));
                 }
             }
+
+            self.rebuild_reaction_chips(message, my_did);
 
             if let Some(label) = imp.time_label.borrow().as_ref() {
                 let (short, _) = format_message_time(&message.sent_at);
                 label.set_text(&short);
+            }
+        }
+
+        /// One chip per distinct emoji, counted, in first-seen order. Your
+        /// own chip is marked and clicking it takes the reaction back;
+        /// clicking someone else's joins in.
+        fn rebuild_reaction_chips(&self, message: &ChatMessage, my_did: Option<&str>) {
+            let imp = self.imp();
+            let Some(strip) = imp.reactions_box.borrow().clone() else {
+                return;
+            };
+            while let Some(child) = strip.first_child() {
+                strip.remove(&child);
+            }
+            strip.set_visible(!message.reactions.is_empty());
+
+            let mut grouped: Vec<(String, u32, bool)> = Vec::new();
+            for reaction in &message.reactions {
+                let mine = my_did == Some(reaction.sender_did.as_str());
+                match grouped.iter_mut().find(|(v, _, _)| v == &reaction.value) {
+                    Some((_, count, own)) => {
+                        *count += 1;
+                        *own |= mine;
+                    }
+                    None => grouped.push((reaction.value.clone(), 1, mine)),
+                }
+            }
+
+            for (value, count, own) in grouped {
+                let chip = gtk4::Button::with_label(&format!("{value} {count}"));
+                chip.add_css_class("reaction-chip");
+                if own {
+                    chip.add_css_class("reaction-chip-mine");
+                }
+                chip.update_property(&[gtk4::accessible::Property::Label(&format!(
+                    "{count} reacted with {value}, {}",
+                    if own { "including you" } else { "react too" }
+                ))]);
+                let row_weak = self.downgrade();
+                let message_id = message.id.clone();
+                chip.connect_clicked(move |_| {
+                    if let Some(row) = row_weak.upgrade()
+                        && let Some(cb) = row.imp().react_callback.borrow().as_ref()
+                    {
+                        cb(message_id.clone(), value.clone(), !own);
+                    }
+                });
+                strip.append(&chip);
             }
         }
 
@@ -418,6 +665,49 @@ mod message_row {
             }
         }
 
+        /// A play affordance for a GIF sent as a bare link. The pickers
+        /// give no poster frame, so the badge and button carry it; play
+        /// opens the same dialog player GIFs use in the feed.
+        fn gif_player(link: String, gif: crate::atproto::GifEmbed) -> gtk4::Widget {
+            let overlay = gtk4::Overlay::new();
+
+            let frame = gtk4::Frame::new(None);
+            frame.set_overflow(gtk4::Overflow::Hidden);
+            frame.add_css_class("msg-card-thumb");
+            // Sized from the link's own stated pixels, capped for a bubble.
+            let (w, h) = gif.aspect_ratio;
+            let width = 240.0_f32;
+            let height = (width * h as f32 / w.max(1) as f32).clamp(100.0, 320.0);
+            frame.set_size_request(width as i32, height as i32);
+            overlay.set_child(Some(&frame));
+
+            let badge = gtk4::Label::new(Some("GIF"));
+            badge.add_css_class("gif-badge");
+            badge.set_halign(gtk4::Align::Start);
+            badge.set_valign(gtk4::Align::End);
+            badge.set_margin_start(8);
+            badge.set_margin_bottom(8);
+            badge.set_can_target(false);
+            overlay.add_overlay(&badge);
+
+            let play_btn = gtk4::Button::from_icon_name("media-playback-start-symbolic");
+            play_btn.add_css_class("circular");
+            play_btn.add_css_class("osd");
+            play_btn.set_halign(gtk4::Align::Center);
+            play_btn.set_valign(gtk4::Align::Center);
+            play_btn.set_tooltip_text(Some("Play GIF"));
+            play_btn.update_property(&[gtk4::accessible::Property::Label("Play GIF")]);
+            play_btn.connect_clicked(move |btn| {
+                crate::ui::media_viewer::show_video(
+                    btn,
+                    crate::ui::video_player::VideoSource::from_gif(&gif, None, Some(link.clone())),
+                );
+            });
+            overlay.add_overlay(&play_btn);
+
+            overlay.upcast()
+        }
+
         fn media_chip(icon: &str, text: &str) -> gtk4::Widget {
             let chip = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
             chip.set_halign(gtk4::Align::Start);
@@ -441,6 +731,16 @@ mod message_row {
         /// Replace the handler run when a shared post's card is activated.
         pub fn set_post_callback<F: Fn(Post) + 'static>(&self, callback: F) {
             self.imp().post_callback.replace(Some(Box::new(callback)));
+        }
+
+        /// Replace the reaction handler: message id, emoji, add or remove.
+        pub fn set_react_callback<F: Fn(String, String, bool) + 'static>(&self, callback: F) {
+            self.imp().react_callback.replace(Some(Box::new(callback)));
+        }
+
+        /// Replace the handler run when Delete for Me is chosen.
+        pub fn set_delete_callback<F: Fn(String) + 'static>(&self, callback: F) {
+            self.imp().delete_callback.replace(Some(Box::new(callback)));
         }
     }
 
@@ -493,6 +793,9 @@ mod imp {
         pub send_callback: RefCell<Option<Box<dyn Fn(String) + 'static>>>,
         pub mention_clicked_callback: RefCell<Option<Box<dyn Fn(String) + 'static>>>,
         pub post_clicked_callback: RefCell<Option<Box<dyn Fn(Post) + 'static>>>,
+        /// Args: message id, emoji, add or remove.
+        pub react_callback: RefCell<Option<Box<dyn Fn(String, String, bool) + 'static>>>,
+        pub delete_message_callback: RefCell<Option<Box<dyn Fn(String) + 'static>>>,
     }
 
     #[glib::object_subclass]
@@ -574,9 +877,9 @@ impl MessagePage {
                 && let Some(message) = object.message()
                 && let Some(row) = list_item.child().and_downcast::<MessageRow>()
             {
-                let mine =
-                    page.imp().my_did.borrow().as_deref() == Some(message.sender_did.as_str());
-                row.bind(&message, mine);
+                let my_did = page.imp().my_did.borrow().clone();
+                let mine = my_did.as_deref() == Some(message.sender_did.as_str());
+                row.bind(&message, mine, my_did.as_deref());
                 let page_weak = page.downgrade();
                 row.set_mention_callback(move |handle| {
                     let Some(page) = page_weak.upgrade() else {
@@ -593,6 +896,24 @@ impl MessagePage {
                     };
                     if let Some(cb) = page.imp().post_clicked_callback.borrow().as_ref() {
                         cb(post);
+                    }
+                });
+                let page_weak = page.downgrade();
+                row.set_react_callback(move |message_id, value, add| {
+                    let Some(page) = page_weak.upgrade() else {
+                        return;
+                    };
+                    if let Some(cb) = page.imp().react_callback.borrow().as_ref() {
+                        cb(message_id, value, add);
+                    }
+                });
+                let page_weak = page.downgrade();
+                row.set_delete_callback(move |message_id| {
+                    let Some(page) = page_weak.upgrade() else {
+                        return;
+                    };
+                    if let Some(cb) = page.imp().delete_message_callback.borrow().as_ref() {
+                        cb(message_id);
                     }
                 });
             }
@@ -826,13 +1147,18 @@ impl MessagePage {
     /// were actually new. Zero new messages means nothing to mark read.
     pub fn merge_new(&self, newest_first: Vec<ChatMessage>) -> u32 {
         let imp = self.imp();
-        let fresh: Vec<ChatMessage> = {
+        let (fresh, known_again): (Vec<ChatMessage>, Vec<ChatMessage>) = {
             let known = imp.known_ids.borrow();
             newest_first
                 .into_iter()
-                .filter(|m| !known.contains(&m.id))
-                .collect()
+                .partition(|m| !known.contains(&m.id))
         };
+
+        // Reactions land on messages already listed; carry them over.
+        for message in known_again {
+            self.update_message(message);
+        }
+
         if fresh.is_empty() {
             return 0;
         }
@@ -847,6 +1173,49 @@ impl MessagePage {
         }
         self.refresh_visibility();
         added
+    }
+
+    /// Replace a listed message with the server's newer copy, if it is
+    /// actually newer. Reactions are the only part that changes in place.
+    pub fn update_message(&self, message: ChatMessage) {
+        let Some(model) = self.imp().model.borrow().clone() else {
+            return;
+        };
+        for i in 0..model.n_items() {
+            let Some(object) = model.item(i).and_downcast::<MessageObject>() else {
+                continue;
+            };
+            let Some(listed) = object.message() else {
+                continue;
+            };
+            if listed.id != message.id {
+                continue;
+            }
+            if listed.reactions != message.reactions {
+                model.splice(i, 1, &[MessageObject::new(message)]);
+            }
+            return;
+        }
+    }
+
+    /// Take a message out of the list after a delete-for-me went through.
+    /// Its id stays known, so a straggling poll cannot bring it back.
+    pub fn remove_message(&self, message_id: &str) {
+        let Some(model) = self.imp().model.borrow().clone() else {
+            return;
+        };
+        for i in 0..model.n_items() {
+            let matches = model
+                .item(i)
+                .and_downcast::<MessageObject>()
+                .and_then(|o| o.message())
+                .is_some_and(|m| m.id == message_id);
+            if matches {
+                model.remove(i);
+                break;
+            }
+        }
+        self.refresh_visibility();
     }
 
     /// The send went through: clear the draft and show the message the
@@ -1080,12 +1449,24 @@ impl MessagePage {
             .post_clicked_callback
             .replace(Some(Box::new(callback)));
     }
+
+    /// Replace the reaction handler: message id, emoji, add or remove.
+    pub fn set_react_callback<F: Fn(String, String, bool) + 'static>(&self, callback: F) {
+        self.imp().react_callback.replace(Some(Box::new(callback)));
+    }
+
+    /// Replace the handler run when Delete for Me is chosen on a message.
+    pub fn set_delete_message_callback<F: Fn(String) + 'static>(&self, callback: F) {
+        self.imp()
+            .delete_message_callback
+            .replace(Some(Box::new(callback)));
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::atproto::Profile;
+    use crate::atproto::{ChatReaction, Profile};
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -1096,6 +1477,7 @@ mod tests {
             sender_did: sender.into(),
             sent_at: "2026-01-01T12:00:00Z".into(),
             embed: None,
+            reactions: vec![],
         }
     }
 
@@ -1188,7 +1570,11 @@ mod tests {
             "a & b < c > d",
             "&&&###@@@",
         ] {
-            row.bind(&message("m1", "did:plc:them", text), false);
+            row.bind(
+                &message("m1", "did:plc:them", text),
+                false,
+                Some("did:plc:me"),
+            );
             assert_eq!(
                 label.text().as_str(),
                 text,
@@ -1201,6 +1587,210 @@ mod tests {
             label.wrap_mode(),
             gtk4::pango::WrapMode::WordChar,
             "an unbroken run must wrap rather than widen the page"
+        );
+    }
+
+    /// Profile links route in-app like mentions; anything deeper in the
+    /// path is a post or list and stays a plain link. A message that is
+    /// just a GIF link is recognised for the player.
+    #[test]
+    fn profile_and_gif_links_are_recognized() {
+        assert_eq!(
+            bsky_profile_target("https://bsky.app/profile/them.bsky.social").as_deref(),
+            Some("them.bsky.social")
+        );
+        assert_eq!(
+            bsky_profile_target("https://bsky.app/profile/did:plc:abc123").as_deref(),
+            Some("did:plc:abc123")
+        );
+        assert_eq!(
+            bsky_profile_target("https://bsky.app/profile/them.bsky.social?tab=media").as_deref(),
+            Some("them.bsky.social")
+        );
+        assert!(
+            bsky_profile_target("https://bsky.app/profile/them.bsky.social/post/3abc").is_none(),
+            "post links stay links"
+        );
+        assert!(bsky_profile_target("https://example.com/profile/x").is_none());
+        assert!(bsky_profile_target("https://bsky.app/profile/").is_none());
+
+        let klipy = "https://static.klipy.com/ii/abc/1/2/deadbeef.gif?hh=270&ww=480&mp4=deadbeef";
+        let (link, gif) = lone_gif_link(&format!("  {klipy} ")).expect("a lone GIF link");
+        assert_eq!(link, klipy);
+        assert_eq!(gif.aspect_ratio, (480, 270));
+        assert!(
+            lone_gif_link(&format!("look at this {klipy}")).is_none(),
+            "words around the link keep it a link"
+        );
+        assert!(lone_gif_link("https://example.com/a.gif").is_none());
+    }
+
+    /// The clock setting decides how message times read.
+    #[test]
+    fn times_follow_the_clock_format() {
+        use chrono::TimeZone;
+        let local = chrono::Local
+            .with_ymd_and_hms(2026, 1, 1, 15, 7, 0)
+            .single()
+            .unwrap();
+
+        let (short, full) = format_local_time(local, false);
+        assert_eq!(short, "Jan 1, 15:07");
+        assert_eq!(full, "January 1, 2026 at 15:07");
+
+        let (short, full) = format_local_time(local, true);
+        assert_eq!(short, "Jan 1, 3:07 PM");
+        assert_eq!(full, "January 1, 2026 at 3:07 PM");
+    }
+
+    /// Reaction chips group by emoji, mark the viewer's own, and clicking
+    /// toggles: yours comes off, anyone else's joins in. A recycled row
+    /// drops them with the message.
+    #[test]
+    fn reaction_chips_group_and_toggle() {
+        crate::ui::with_gtk(reaction_chips_group_and_toggle_body);
+    }
+
+    fn reaction_chips_group_and_toggle_body() {
+        let row = MessageRow::new();
+        let asked: Rc<RefCell<Vec<(String, String, bool)>>> = Rc::new(RefCell::new(vec![]));
+        let sink = asked.clone();
+        row.set_react_callback(move |id, value, add| {
+            sink.borrow_mut().push((id, value, add));
+        });
+
+        let mut reacted = message("m1", "did:plc:them", "hey");
+        reacted.reactions = vec![
+            ChatReaction {
+                value: "\u{1F44D}".into(),
+                sender_did: "did:plc:me".into(),
+            },
+            ChatReaction {
+                value: "\u{1F44D}".into(),
+                sender_did: "did:plc:them".into(),
+            },
+            ChatReaction {
+                value: "\u{2764}".into(),
+                sender_did: "did:plc:them".into(),
+            },
+        ];
+        row.bind(&reacted, false, Some("did:plc:me"));
+
+        let strip = row.imp().reactions_box.borrow().clone().unwrap();
+        assert!(strip.is_visible());
+
+        let mut chips = Vec::new();
+        let mut child = strip.first_child();
+        while let Some(c) = child {
+            chips.push(c.clone().downcast::<gtk4::Button>().unwrap());
+            child = c.next_sibling();
+        }
+        assert_eq!(chips.len(), 2, "one chip per distinct emoji");
+        assert_eq!(chips[0].label().as_deref(), Some("\u{1F44D} 2"));
+        assert!(chips[0].has_css_class("reaction-chip-mine"));
+        assert_eq!(chips[1].label().as_deref(), Some("\u{2764} 1"));
+        assert!(!chips[1].has_css_class("reaction-chip-mine"));
+
+        chips[0].emit_clicked();
+        chips[1].emit_clicked();
+        assert_eq!(
+            asked.borrow().as_slice(),
+            [
+                ("m1".to_string(), "\u{1F44D}".to_string(), false),
+                ("m1".to_string(), "\u{2764}".to_string(), true),
+            ],
+            "your own chip removes, another's adds"
+        );
+
+        row.bind(
+            &message("m2", "did:plc:them", "plain"),
+            false,
+            Some("did:plc:me"),
+        );
+        assert!(!strip.is_visible());
+        assert!(strip.first_child().is_none());
+    }
+
+    /// The context menu serves the bound message: Delete for Me hands the
+    /// current id over, not the one from a previous bind.
+    #[test]
+    fn the_menu_serves_the_current_message() {
+        crate::ui::with_gtk(the_menu_serves_the_current_message_body);
+    }
+
+    fn the_menu_serves_the_current_message_body() {
+        let row = MessageRow::new();
+        let deleted: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(vec![]));
+        let sink = deleted.clone();
+        row.set_delete_callback(move |id| {
+            sink.borrow_mut().push(id);
+        });
+
+        let menu = row.imp().context_menu.borrow().clone().unwrap();
+        let menu_box = menu.child().unwrap();
+        let mut items = Vec::new();
+        let mut child = menu_box.first_child();
+        while let Some(c) = child {
+            items.push(c.clone().downcast::<gtk4::Button>().unwrap());
+            child = c.next_sibling();
+        }
+        let labels: Vec<_> = items.iter().filter_map(|b| b.label()).collect();
+        assert_eq!(labels, ["React", "Copy Text", "Delete for Me"]);
+
+        row.bind(&message("m1", "did:plc:them", "first"), false, None);
+        row.bind(&message("m2", "did:plc:them", "second"), false, None);
+        items[2].emit_clicked();
+        assert_eq!(
+            deleted.borrow().as_slice(),
+            ["m2"],
+            "the menu acts on the current occupant"
+        );
+    }
+
+    /// Poll pages carry reaction changes for messages already listed;
+    /// merge_new applies them without duplicating rows. A removed message
+    /// stays known, so a straggling poll cannot bring it back.
+    #[test]
+    fn merge_new_updates_reactions_and_removal_sticks() {
+        crate::ui::with_gtk(merge_new_updates_reactions_and_removal_sticks_body);
+    }
+
+    fn merge_new_updates_reactions_and_removal_sticks_body() {
+        let page = a_page();
+        page.set_initial_messages(vec![
+            message("m2", "did:plc:them", "two"),
+            message("m1", "did:plc:them", "one"),
+        ]);
+        assert_eq!(listed_ids(&page), ["m1", "m2"]);
+
+        let mut updated = message("m1", "did:plc:them", "one");
+        updated.reactions = vec![ChatReaction {
+            value: "\u{1F44D}".into(),
+            sender_did: "did:plc:them".into(),
+        }];
+        let added = page.merge_new(vec![updated]);
+        assert_eq!(added, 0, "a reaction change is not a new message");
+        assert_eq!(listed_ids(&page), ["m1", "m2"]);
+        let model = page.imp().model.borrow().clone().unwrap();
+        let m1 = model
+            .item(0)
+            .and_downcast::<MessageObject>()
+            .and_then(|o| o.message())
+            .unwrap();
+        assert_eq!(
+            m1.reactions.len(),
+            1,
+            "the listed copy carries the reaction"
+        );
+
+        page.remove_message("m1");
+        assert_eq!(listed_ids(&page), ["m2"]);
+        let added = page.merge_new(vec![message("m1", "did:plc:them", "one")]);
+        assert_eq!(added, 0);
+        assert_eq!(
+            listed_ids(&page),
+            ["m2"],
+            "a deleted message must not come back on the next poll"
         );
     }
 
@@ -1222,12 +1812,20 @@ mod tests {
             "halign cannot take a side unless the bubble takes the row"
         );
 
-        row.bind(&message("m1", "did:plc:me", "mine"), true);
+        row.bind(
+            &message("m1", "did:plc:me", "mine"),
+            true,
+            Some("did:plc:me"),
+        );
         assert_eq!(bubble.halign(), gtk4::Align::End);
         assert!(bubble.has_css_class("msg-out"));
         assert!(!bubble.has_css_class("msg-in"));
 
-        row.bind(&message("m2", "did:plc:them", "theirs"), false);
+        row.bind(
+            &message("m2", "did:plc:them", "theirs"),
+            false,
+            Some("did:plc:me"),
+        );
         assert_eq!(bubble.halign(), gtk4::Align::Start);
         assert!(bubble.has_css_class("msg-in"));
         assert!(
@@ -1253,7 +1851,7 @@ mod tests {
 
         let mut shared = message("m1", "did:plc:them", "");
         shared.embed = Some(shared_post("the shared post"));
-        row.bind(&shared, false);
+        row.bind(&shared, false, Some("did:plc:me"));
 
         let bubble = row.first_child().expect("the bubble");
         let text_label = bubble
@@ -1285,7 +1883,11 @@ mod tests {
         );
 
         // Rebind to a plain message: text back, card gone.
-        row.bind(&message("m2", "did:plc:them", "just words"), false);
+        row.bind(
+            &message("m2", "did:plc:them", "just words"),
+            false,
+            Some("did:plc:me"),
+        );
         assert!(text_label.is_visible());
         assert!(
             slot.first_child().is_none(),

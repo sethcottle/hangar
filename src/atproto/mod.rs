@@ -12,3 +12,6 @@ pub use types::{
     LinkCardData, Notification, Post, PostgateConfig, Profile, QuoteEmbed, ReplyContext,
     RepostReason, SavedFeed, Session, ThreadgateConfig, ThreadgateRule, VideoEmbed,
 };
+// Only test fixtures build reactions by hand so far.
+#[cfg(test)]
+pub use types::ChatReaction;

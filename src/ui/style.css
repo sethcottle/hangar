@@ -435,6 +435,18 @@ popover.menu > contents {
     border-radius: 6px;
 }
 
+/* Reaction chips under a message */
+.reaction-chip {
+    padding: 1px 8px;
+    border-radius: 10px;
+    font-size: 0.85em;
+    min-height: 0;
+}
+
+.reaction-chip-mine {
+    background-color: alpha(@accent_bg_color, 0.35);
+}
+
 /* Settings sidebar navigation */
 .settings-sidebar {
     background-color: @window_bg_color;

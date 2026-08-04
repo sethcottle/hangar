@@ -376,4 +376,16 @@ pub struct ChatMessage {
     /// record embeds, so this is always a quote when present.
     #[serde(default)]
     pub embed: Option<Embed>,
+    /// Emoji reactions on this message
+    #[serde(default)]
+    pub reactions: Vec<ChatReaction>,
+}
+
+/// One emoji reaction on a chat message
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatReaction {
+    /// The emoji itself
+    pub value: String,
+    /// DID of who reacted
+    pub sender_did: String,
 }

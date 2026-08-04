@@ -139,6 +139,7 @@ impl FollowListPage {
                 && let Some(row) = list_item.child().and_downcast::<ActorRow>()
             {
                 row.bind(&profile);
+                row.set_bound_object(&actor_object);
                 let page_weak = page.downgrade();
                 row.set_activated_callback(move |profile| {
                     let Some(page) = page_weak.upgrade() else {

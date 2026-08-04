@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-mod actor_row;
+pub mod actor_row;
 pub mod avatar_cache;
 mod compose_dialog;
 pub mod external;

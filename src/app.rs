@@ -245,6 +245,12 @@ mod imp {
                 app_clone.toggle_follow(did, uri_cell, btn_weak);
             });
 
+            // Follow from people rows, one handler for every list.
+            let app_clone = app.clone();
+            crate::ui::actor_row::set_follow_handler(move |profile, row_weak| {
+                app_clone.toggle_follow_row(profile, row_weak);
+            });
+
             let app_clone = app.clone();
             window.set_compose_callback(move || {
                 app_clone.open_compose_dialog();
@@ -499,6 +505,7 @@ impl HangarApplication {
         imp.cache.replace(None);
         // The next account must not inherit this one's Delete offers.
         crate::ui::post_row::set_current_user_did(None);
+        crate::ui::actor_row::set_viewer_did(None);
 
         // Clear the stored session
         thread::spawn(move || {
@@ -786,6 +793,8 @@ impl HangarApplication {
         self.imp().user_did.replace(Some(did.to_string()));
         // Rows check post authorship against this before offering Delete
         crate::ui::post_row::set_current_user_did(Some(did));
+        // People rows hide the follow button on your own row
+        crate::ui::actor_row::set_viewer_did(Some(did));
 
         // Every path here follows a successful sign-in, so the polls a dead
         // session parked may run again.
@@ -2667,6 +2676,24 @@ impl HangarApplication {
                     app.send_conversation_message(&page, text);
                 });
 
+                let app = self.clone();
+                let page_weak = page.downgrade();
+                page.set_react_callback(move |message_id, value, add| {
+                    let Some(page) = page_weak.upgrade() else {
+                        return;
+                    };
+                    app.toggle_message_reaction(&page, message_id, value, add);
+                });
+
+                let app = self.clone();
+                let page_weak = page.downgrade();
+                page.set_delete_message_callback(move |message_id| {
+                    let Some(page) = page_weak.upgrade() else {
+                        return;
+                    };
+                    app.confirm_delete_message(&page, message_id);
+                });
+
                 self.start_message_poll(&page);
                 page
             }
@@ -2928,6 +2955,123 @@ impl HangarApplication {
                     }
                     glib::ControlFlow::Break
                 }
+            }
+        });
+    }
+
+    /// Add or remove one emoji reaction. The server answers with the
+    /// updated message and the page swaps it in; nothing is guessed.
+    fn toggle_message_reaction(
+        &self,
+        page: &MessagePage,
+        message_id: String,
+        value: String,
+        add: bool,
+    ) {
+        let convo_id = page.convo_id();
+        let (tx, rx) = std::sync::mpsc::channel::<Result<ChatMessage, String>>();
+        let client = self.client();
+
+        thread::spawn(move || {
+            let result = runtime::block_on(async {
+                if add {
+                    client
+                        .add_chat_reaction(&convo_id, &message_id, &value)
+                        .await
+                } else {
+                    client
+                        .remove_chat_reaction(&convo_id, &message_id, &value)
+                        .await
+                }
+            });
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+
+        let app = self.clone();
+        let page_weak = page.downgrade();
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            match rx.try_recv() {
+                Ok(Ok(message)) => {
+                    if let Some(page) = page_weak.upgrade() {
+                        page.update_message(message);
+                    }
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(e)) => {
+                    eprintln!("Failed to update reaction: {}", e);
+                    app.report_session_expiry();
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.show_toast("Couldn't update the reaction");
+                    }
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+            }
+        });
+    }
+
+    /// Delete for Me is quiet but permanent for this account; ask first.
+    fn confirm_delete_message(&self, page: &MessagePage, message_id: String) {
+        let window = match self.imp().window.borrow().as_ref() {
+            Some(w) => w.clone(),
+            None => return,
+        };
+
+        let dialog = adw::AlertDialog::new(
+            Some("Delete for you?"),
+            Some("The message disappears from your view only. The other side keeps their copy."),
+        );
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("delete", "Delete");
+        dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+
+        let app = self.clone();
+        let page_weak = page.downgrade();
+        dialog.connect_response(Some("delete"), move |_, _| {
+            let Some(page) = page_weak.upgrade() else {
+                return;
+            };
+            app.delete_message_for_me(&page, message_id.clone());
+        });
+        dialog.present(Some(&window));
+    }
+
+    fn delete_message_for_me(&self, page: &MessagePage, message_id: String) {
+        let convo_id = page.convo_id();
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let client = self.client();
+        let id_for_call = message_id.clone();
+
+        thread::spawn(move || {
+            let result = runtime::block_on(async {
+                client.delete_chat_message(&convo_id, &id_for_call).await
+            });
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+
+        let app = self.clone();
+        let page_weak = page.downgrade();
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            match rx.try_recv() {
+                Ok(Ok(())) => {
+                    if let Some(page) = page_weak.upgrade() {
+                        page.remove_message(&message_id);
+                    }
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(e)) => {
+                    eprintln!("Failed to delete message: {}", e);
+                    app.report_session_expiry();
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.show_toast("Couldn't delete the message");
+                    }
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
             }
         });
     }
@@ -3388,17 +3532,15 @@ impl HangarApplication {
         });
     }
 
-    /// Follow or unfollow, decided by whether the page holds a record URI.
-    ///
-    /// The button already shows the hoped-for state and is insensitive; on
-    /// success the cell takes the new URI, on failure the button goes back.
-    fn toggle_follow(
+    /// Flip a follow on the server and hand the outcome to `done` on the
+    /// main thread: Ok(Some(uri)) followed, Ok(None) unfollowed. A failure
+    /// toasts and reports session expiry before `done` runs.
+    fn follow_flip<F: Fn(Result<Option<String>, String>) + 'static>(
         &self,
         did: String,
-        uri_cell: Rc<RefCell<Option<String>>>,
-        btn_weak: glib::WeakRef<gtk4::Button>,
+        current_uri: Option<String>,
+        done: F,
     ) {
-        let current_uri = uri_cell.borrow().clone();
         let unfollowing = current_uri.is_some();
         let (tx, rx) = std::sync::mpsc::channel::<Result<Option<String>, String>>();
         let client = self.client();
@@ -3416,31 +3558,70 @@ impl HangarApplication {
         let app = self.clone();
         glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
             match rx.try_recv() {
-                Ok(Ok(new_uri)) => {
-                    let following = new_uri.is_some();
-                    uri_cell.replace(new_uri);
-                    if let Some(btn) = btn_weak.upgrade() {
-                        HangarWindow::sync_follow_button(&btn, following);
+                Ok(result) => {
+                    if let Err(e) = &result {
+                        eprintln!("Failed to update follow: {}", e);
+                        app.report_session_expiry();
+                        if let Some(window) = app.imp().window.borrow().as_ref() {
+                            window.show_toast(if unfollowing {
+                                "Couldn't unfollow"
+                            } else {
+                                "Couldn't follow"
+                            });
+                        }
                     }
-                    glib::ControlFlow::Break
-                }
-                Ok(Err(e)) => {
-                    eprintln!("Failed to update follow: {}", e);
-                    app.report_session_expiry();
-                    if let Some(btn) = btn_weak.upgrade() {
-                        HangarWindow::sync_follow_button(&btn, uri_cell.borrow().is_some());
-                    }
-                    if let Some(window) = app.imp().window.borrow().as_ref() {
-                        window.show_toast(if unfollowing {
-                            "Couldn't unfollow"
-                        } else {
-                            "Couldn't follow"
-                        });
-                    }
+                    done(result);
                     glib::ControlFlow::Break
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+            }
+        });
+    }
+
+    /// Follow or unfollow from a profile page, decided by whether the page
+    /// holds a record URI.
+    ///
+    /// The button already shows the hoped-for state and is insensitive; on
+    /// success the cell takes the new URI, on failure the button goes back.
+    fn toggle_follow(
+        &self,
+        did: String,
+        uri_cell: Rc<RefCell<Option<String>>>,
+        btn_weak: glib::WeakRef<gtk4::Button>,
+    ) {
+        let current_uri = uri_cell.borrow().clone();
+        self.follow_flip(did, current_uri, move |result| {
+            if let Ok(new_uri) = result {
+                uri_cell.replace(new_uri);
+            }
+            if let Some(btn) = btn_weak.upgrade() {
+                HangarWindow::sync_follow_button(&btn, uri_cell.borrow().is_some());
+            }
+        });
+    }
+
+    /// Follow or unfollow from a people row. The result only lands if the
+    /// recycled row still shows the same profile; the model object behind
+    /// it is updated either way through the row.
+    fn toggle_follow_row(
+        &self,
+        profile: Profile,
+        row_weak: glib::WeakRef<crate::ui::actor_row::ActorRow>,
+    ) {
+        let did = profile.did.clone();
+        let current_uri = profile.viewer_following.clone();
+        self.follow_flip(profile.did, current_uri.clone(), move |result| {
+            let Some(row) = row_weak.upgrade() else {
+                return;
+            };
+            if row.profile_did().as_deref() != Some(did.as_str()) {
+                return;
+            }
+            match result {
+                Ok(new_uri) => row.set_viewer_following(new_uri),
+                // The button showed the hoped-for state; put it back.
+                Err(_) => row.set_viewer_following(current_uri.clone()),
             }
         });
     }

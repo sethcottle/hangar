@@ -4103,6 +4103,7 @@ impl HangarWindow {
                 && let Some(row) = list_item.child().and_downcast::<ActorRow>()
             {
                 row.bind(&profile);
+                row.set_bound_object(&actor_object);
                 // Open the profile in-app on click
                 let w = win.downgrade();
                 row.set_activated_callback(move |profile| {

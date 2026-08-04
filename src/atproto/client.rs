@@ -3,9 +3,9 @@
 
 use crate::atproto::facets;
 use crate::atproto::types::{
-    AuthMethod, ChatMessage, ComposeData, Conversation, Embed, ExternalEmbed, ImageEmbed,
-    LinkCardData, Notification, Post, PostgateConfig, Profile, QuoteEmbed, ReplyContext,
-    RepostReason, SavedFeed, Session, ThreadgateConfig, ThreadgateRule, VideoEmbed,
+    AuthMethod, ChatMessage, ChatReaction, ComposeData, Conversation, Embed, ExternalEmbed,
+    ImageEmbed, LinkCardData, Notification, Post, PostgateConfig, Profile, QuoteEmbed,
+    ReplyContext, RepostReason, SavedFeed, Session, ThreadgateConfig, ThreadgateRule, VideoEmbed,
 };
 use crate::config::DEFAULT_PDS;
 use atrium_api::agent::atp_agent::AtpAgent;
@@ -2395,12 +2395,28 @@ impl HangarClient {
             Union::Unknown(_) => None,
         });
 
+        let reactions = view
+            .data
+            .reactions
+            .as_ref()
+            .map(|reactions| {
+                reactions
+                    .iter()
+                    .map(|r| ChatReaction {
+                        value: r.data.value.clone(),
+                        sender_did: r.data.sender.data.did.to_string(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
         ChatMessage {
             id: view.data.id.clone(),
             text: view.data.text.clone(),
             sender_did: view.data.sender.data.did.to_string(),
             sent_at: view.data.sent_at.as_str().to_string(),
             embed,
+            reactions,
         }
     }
 
@@ -2443,6 +2459,111 @@ impl HangarClient {
             .map_err(|e| self.xrpc_error(e))?;
 
         Ok(self.chat_message_from_view(&output))
+        })
+    }
+
+    /// Add an emoji reaction to a message. The server answers with the
+    /// updated message, so the open view can refresh the row from truth.
+    #[allow(clippy::await_holding_lock)]
+    pub async fn add_chat_reaction(
+        &self,
+        convo_id: &str,
+        message_id: &str,
+        value: &str,
+    ) -> Result<ChatMessage, ClientError> {
+        use atrium_api::agent::bluesky::{AtprotoServiceType, BSKY_CHAT_DID};
+
+        with_agent!(self, agent => {
+
+        let chat_did = BSKY_CHAT_DID
+            .parse()
+            .map_err(|e| ClientError::Network(format!("invalid chat DID: {e}")))?;
+        let chat_api = agent.api_with_proxy(chat_did, AtprotoServiceType::BskyChat);
+
+        let input = atrium_api::chat::bsky::convo::add_reaction::InputData {
+            convo_id: convo_id.to_string(),
+            message_id: message_id.to_string(),
+            value: value.to_string(),
+        };
+
+        let output = chat_api
+            .chat
+            .bsky
+            .convo
+            .add_reaction(input.into())
+            .await
+            .map_err(|e| self.xrpc_error(e))?;
+
+        Ok(self.chat_message_from_view(&output.data.message))
+        })
+    }
+
+    /// Take a reaction back off a message. Same answer shape as adding.
+    #[allow(clippy::await_holding_lock)]
+    pub async fn remove_chat_reaction(
+        &self,
+        convo_id: &str,
+        message_id: &str,
+        value: &str,
+    ) -> Result<ChatMessage, ClientError> {
+        use atrium_api::agent::bluesky::{AtprotoServiceType, BSKY_CHAT_DID};
+
+        with_agent!(self, agent => {
+
+        let chat_did = BSKY_CHAT_DID
+            .parse()
+            .map_err(|e| ClientError::Network(format!("invalid chat DID: {e}")))?;
+        let chat_api = agent.api_with_proxy(chat_did, AtprotoServiceType::BskyChat);
+
+        let input = atrium_api::chat::bsky::convo::remove_reaction::InputData {
+            convo_id: convo_id.to_string(),
+            message_id: message_id.to_string(),
+            value: value.to_string(),
+        };
+
+        let output = chat_api
+            .chat
+            .bsky
+            .convo
+            .remove_reaction(input.into())
+            .await
+            .map_err(|e| self.xrpc_error(e))?;
+
+        Ok(self.chat_message_from_view(&output.data.message))
+        })
+    }
+
+    /// Delete a message from this account's view of the conversation. The
+    /// other side keeps their copy; there is no delete-for-everyone.
+    #[allow(clippy::await_holding_lock)]
+    pub async fn delete_chat_message(
+        &self,
+        convo_id: &str,
+        message_id: &str,
+    ) -> Result<(), ClientError> {
+        use atrium_api::agent::bluesky::{AtprotoServiceType, BSKY_CHAT_DID};
+
+        with_agent!(self, agent => {
+
+        let chat_did = BSKY_CHAT_DID
+            .parse()
+            .map_err(|e| ClientError::Network(format!("invalid chat DID: {e}")))?;
+        let chat_api = agent.api_with_proxy(chat_did, AtprotoServiceType::BskyChat);
+
+        let input = atrium_api::chat::bsky::convo::delete_message_for_self::InputData {
+            convo_id: convo_id.to_string(),
+            message_id: message_id.to_string(),
+        };
+
+        chat_api
+            .chat
+            .bsky
+            .convo
+            .delete_message_for_self(input.into())
+            .await
+            .map_err(|e| self.xrpc_error(e))?;
+
+        Ok(())
         })
     }
 
