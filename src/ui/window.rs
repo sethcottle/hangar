@@ -72,7 +72,8 @@ pub enum FollowListPush {
 /// buttons, its scroll handler, and the app's fetch completions. The
 /// generation strands a fetch whose tab was switched away mid-flight.
 pub struct ProfileFeedCtx {
-    pub did: String,
+    /// A RefCell because the own page is built before sign-in fills it.
+    pub did: RefCell<String>,
     pub filter: Cell<&'static str>,
     pub cursor: RefCell<Option<String>>,
     pub fetching: Cell<bool>,
@@ -81,6 +82,15 @@ pub struct ProfileFeedCtx {
 }
 
 impl ProfileFeedCtx {
+    /// Back to a clean first page: tab switches and reopens both start
+    /// here, stranding whatever the previous state still had in flight.
+    pub fn begin_refresh(&self) {
+        self.generation.set(self.generation.get() + 1);
+        self.cursor.replace(None);
+        self.fetching.set(false);
+        self.model.remove_all();
+    }
+
     /// Posts landing from a fetch; the model stays this module's business.
     pub fn append_posts(&self, posts: Vec<Post>) {
         for post in posts {
@@ -281,9 +291,9 @@ mod imp {
         // Profile page state (for own profile in sidebar)
         pub profile_nav_view: RefCell<Option<adw::NavigationView>>,
         pub profile_page_model: RefCell<Option<gio::ListStore>>,
+        pub own_profile_feed_ctx: RefCell<Option<Rc<ProfileFeedCtx>>>,
         pub profile_page_spinner: RefCell<Option<gtk4::Spinner>>,
         pub profile_page_scrolled: RefCell<Option<gtk4::ScrolledWindow>>,
-        pub profile_load_more_callback: RefCell<Option<Box<dyn Fn() + 'static>>>,
         // Store current profile for updating UI
         pub current_profile: RefCell<Option<Profile>>,
         // Profile page widgets (for updating header)
@@ -1128,6 +1138,12 @@ impl HangarWindow {
             .replace(Some(Box::new(callback)));
     }
 
+    /// The own page's feed context, for the app to point at the signed-in
+    /// DID and refresh.
+    pub fn own_profile_feed_ctx(&self) -> Option<Rc<ProfileFeedCtx>> {
+        self.imp().own_profile_feed_ctx.borrow().clone()
+    }
+
     /// Args: the page's feed context and whether this is a first page.
     pub fn set_profile_tab_callback<F>(&self, callback: F)
     where
@@ -1136,6 +1152,83 @@ impl HangarWindow {
         self.imp()
             .profile_tab_callback
             .replace(Some(Box::new(callback)));
+    }
+
+    /// Posts, Replies, Media, Videos. Switching clears the list and asks
+    /// the app for the tab's own feed; the shared context strands stale
+    /// fetches. Centered to sit under the centered profile header.
+    fn build_profile_tabs(&self, feed_ctx: &Rc<ProfileFeedCtx>) -> gtk4::Box {
+        let tabs = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        tabs.add_css_class("linked");
+        tabs.set_halign(gtk4::Align::Center);
+        tabs.set_margin_top(12);
+        tabs.set_margin_bottom(8);
+        let mut first_tab: Option<gtk4::ToggleButton> = None;
+        for (label, filter) in [
+            ("Posts", "posts_and_author_threads"),
+            ("Replies", "posts_with_replies"),
+            ("Media", "posts_with_media"),
+            ("Videos", "posts_with_video"),
+        ] {
+            let tab = gtk4::ToggleButton::with_label(label);
+            match &first_tab {
+                Some(first) => tab.set_group(Some(first)),
+                None => {
+                    tab.set_active(true);
+                    first_tab = Some(tab.clone());
+                }
+            }
+            let win = self.downgrade();
+            let ctx = feed_ctx.clone();
+            tab.connect_toggled(move |tab| {
+                if !tab.is_active() || ctx.filter.get() == filter {
+                    return;
+                }
+                ctx.filter.set(filter);
+                ctx.begin_refresh();
+                if let Some(win) = win.upgrade()
+                    && let Some(cb) = win.imp().profile_tab_callback.borrow().as_ref()
+                {
+                    cb(ctx.clone(), true);
+                }
+            });
+            tabs.append(&tab);
+        }
+        tabs
+    }
+
+    /// "No posts yet", following the model so every tab can say when it
+    /// has nothing.
+    fn build_feed_empty_label(model: &gio::ListStore, initially_visible: bool) -> gtk4::Label {
+        let none = gtk4::Label::new(Some("No posts yet"));
+        none.add_css_class("dim-label");
+        none.set_margin_top(12);
+        none.set_margin_bottom(12);
+        none.set_visible(initially_visible);
+        let none_weak = none.downgrade();
+        model.connect_items_changed(move |model, _, _, _| {
+            if let Some(none) = none_weak.upgrade() {
+                none.set_visible(model.n_items() == 0);
+            }
+        });
+        none
+    }
+
+    /// Near the scroller's bottom, ask for the current tab's next page.
+    fn wire_feed_pagination(&self, scrolled: &gtk4::ScrolledWindow, feed_ctx: &Rc<ProfileFeedCtx>) {
+        let win = self.downgrade();
+        let ctx = feed_ctx.clone();
+        scrolled.vadjustment().connect_value_changed(move |adj| {
+            let near_bottom = adj.value() >= adj.upper() - adj.page_size() - 400.0;
+            if near_bottom
+                && ctx.cursor.borrow().is_some()
+                && !ctx.fetching.get()
+                && let Some(win) = win.upgrade()
+                && let Some(cb) = win.imp().profile_tab_callback.borrow().as_ref()
+            {
+                cb(ctx.clone(), false);
+            }
+        });
     }
 
     /// One StatusPage, hidden until its list turns out empty.
@@ -2291,7 +2384,7 @@ impl HangarWindow {
         let model = gio::ListStore::new::<PostObject>();
 
         let feed_ctx = Rc::new(ProfileFeedCtx {
-            did: profile.did.clone(),
+            did: RefCell::new(profile.did.clone()),
             filter: Cell::new("posts_and_author_threads"),
             cursor: RefCell::new(feed_cursor),
             fetching: Cell::new(false),
@@ -2299,63 +2392,8 @@ impl HangarWindow {
             model: model.clone(),
         });
 
-        // Posts, Replies, Media. Switching clears the list and asks the app
-        // for the tab's own feed; the shared context strands stale fetches.
-        let tabs = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-        tabs.add_css_class("linked");
-        tabs.set_halign(gtk4::Align::Start);
-        tabs.set_margin_start(16);
-        tabs.set_margin_top(12);
-        tabs.set_margin_bottom(8);
-        let mut first_tab: Option<gtk4::ToggleButton> = None;
-        for (label, filter) in [
-            ("Posts", "posts_and_author_threads"),
-            ("Replies", "posts_with_replies"),
-            ("Media", "posts_with_media"),
-            ("Videos", "posts_with_video"),
-        ] {
-            let tab = gtk4::ToggleButton::with_label(label);
-            match &first_tab {
-                Some(first) => tab.set_group(Some(first)),
-                None => {
-                    tab.set_active(true);
-                    first_tab = Some(tab.clone());
-                }
-            }
-            let win = self.downgrade();
-            let ctx = feed_ctx.clone();
-            tab.connect_toggled(move |tab| {
-                if !tab.is_active() || ctx.filter.get() == filter {
-                    return;
-                }
-                ctx.filter.set(filter);
-                ctx.generation.set(ctx.generation.get() + 1);
-                ctx.cursor.replace(None);
-                ctx.fetching.set(false);
-                ctx.model.remove_all();
-                if let Some(win) = win.upgrade()
-                    && let Some(cb) = win.imp().profile_tab_callback.borrow().as_ref()
-                {
-                    cb(ctx.clone(), true);
-                }
-            });
-            tabs.append(&tab);
-        }
-        header_block.append(&tabs);
-
-        // Follows the model, so every tab can say when it has nothing.
-        let none = gtk4::Label::new(Some("No posts yet"));
-        none.add_css_class("dim-label");
-        none.set_margin_top(12);
-        none.set_margin_bottom(12);
-        none.set_visible(no_posts);
-        let none_weak = none.downgrade();
-        model.connect_items_changed(move |model, _, _, _| {
-            if let Some(none) = none_weak.upgrade() {
-                none.set_visible(model.n_items() == 0);
-            }
-        });
-        header_block.append(&none);
+        header_block.append(&self.build_profile_tabs(&feed_ctx));
+        header_block.append(&Self::build_feed_empty_label(&model, no_posts));
         let header_marker = gio::ListStore::new::<gtk4::StringObject>();
         header_marker.append(&gtk4::StringObject::new("profile-header"));
         let sections = gio::ListStore::new::<gio::ListStore>();
@@ -2600,20 +2638,7 @@ impl HangarWindow {
         revealer.set_valign(gtk4::Align::Start);
         revealer.set_child(Some(&bar));
 
-        // Near the bottom, ask for the current tab's next page.
-        let win = self.downgrade();
-        let ctx = feed_ctx.clone();
-        scrolled.vadjustment().connect_value_changed(move |adj| {
-            let near_bottom = adj.value() >= adj.upper() - adj.page_size() - 400.0;
-            if near_bottom
-                && ctx.cursor.borrow().is_some()
-                && !ctx.fetching.get()
-                && let Some(win) = win.upgrade()
-                && let Some(cb) = win.imp().profile_tab_callback.borrow().as_ref()
-            {
-                cb(ctx.clone(), false);
-            }
-        });
+        self.wire_feed_pagination(&scrolled, &feed_ctx);
 
         // Reveal once the full header is out of view. Re-sync the bar's
         // follow button on each toggle; the header's copy may have settled
@@ -3520,20 +3545,27 @@ impl HangarWindow {
         let sep = gtk4::Separator::new(gtk4::Orientation::Horizontal);
         header_block.append(&sep);
 
-        // Posts label
-        let posts_label = gtk4::Label::new(Some("Posts"));
-        posts_label.add_css_class("title-4");
-        posts_label.set_halign(gtk4::Align::Start);
-        posts_label.set_margin_start(16);
-        posts_label.set_margin_top(12);
-        posts_label.set_margin_bottom(8);
-        header_block.append(&posts_label);
-
         // Posts list. A GtkFlattenListModel over two stores: a one-item store
         // for the header, then the posts. `profile_page_model` stays the posts
         // store, so `set_profile_posts` and `append_profile_posts` are
         // unchanged and cannot clear the header.
         let model = gio::ListStore::new::<PostObject>();
+
+        // The same tabs and context as the drill-down pages. The DID is
+        // empty until sign-in; `fetch_profile_posts` fills it.
+        let feed_ctx = Rc::new(ProfileFeedCtx {
+            did: RefCell::new(String::new()),
+            filter: Cell::new("posts_and_author_threads"),
+            cursor: RefCell::new(None),
+            fetching: Cell::new(false),
+            generation: Cell::new(0),
+            model: model.clone(),
+        });
+        header_block.append(&self.build_profile_tabs(&feed_ctx));
+        header_block.append(&Self::build_feed_empty_label(&model, true));
+        self.imp()
+            .own_profile_feed_ctx
+            .replace(Some(feed_ctx.clone()));
         let header_marker = gio::ListStore::new::<gtk4::StringObject>();
         header_marker.append(&gtk4::StringObject::new("profile-header"));
         let sections = gio::ListStore::new::<gio::ListStore>();
@@ -3740,22 +3772,7 @@ impl HangarWindow {
         imp.profile_page_spinner.replace(Some(spinner));
         imp.profile_page_scrolled.replace(Some(scrolled.clone()));
 
-        // Infinite scroll
-        let adj = scrolled.vadjustment();
-        let win = self.downgrade();
-        adj.connect_value_changed(move |adj| {
-            let Some(win) = win.upgrade() else {
-                return;
-            };
-            let value = adj.value();
-            let upper = adj.upper();
-            let page_size = adj.page_size();
-            if value >= upper - page_size - 200.0 {
-                if let Some(cb) = win.imp().profile_load_more_callback.borrow().as_ref() {
-                    cb();
-                }
-            }
-        });
+        self.wire_feed_pagination(&scrolled, &feed_ctx);
 
         profile_box
     }
@@ -4098,21 +4115,6 @@ impl HangarWindow {
                 model.append(&PostObject::new(post));
             }
         }
-    }
-
-    /// Set loading state for profile page
-    pub fn set_profile_loading(&self, loading: bool) {
-        if let Some(spinner) = self.imp().profile_page_spinner.borrow().as_ref() {
-            spinner.set_visible(loading);
-            spinner.set_spinning(loading);
-        }
-    }
-
-    /// Set callback for loading more profile posts
-    pub fn set_profile_load_more_callback<F: Fn() + 'static>(&self, callback: F) {
-        self.imp()
-            .profile_load_more_callback
-            .replace(Some(Box::new(callback)));
     }
 
     /// Show the profile page (top-level navigation, instant switch)
@@ -8318,6 +8320,57 @@ mod tests {
         window.destroy();
     }
 
+    /// The own profile page shares the drill-down tab machinery: the same
+    /// four tabs, and a context whose DID waits for sign-in.
+    #[test]
+    fn the_own_profile_shares_the_tab_machinery() {
+        crate::ui::with_gtk(the_own_profile_shares_the_tab_machinery_body);
+    }
+
+    fn the_own_profile_shares_the_tab_machinery_body() {
+        let window: HangarWindow = glib::Object::builder().build();
+
+        let ctx = window
+            .own_profile_feed_ctx()
+            .expect("the own page built its feed context");
+        assert!(
+            ctx.did.borrow().is_empty(),
+            "the DID waits for sign-in to fill it"
+        );
+
+        let asked: Rc<RefCell<Vec<(String, bool)>>> = Rc::new(RefCell::new(vec![]));
+        let sink = asked.clone();
+        window.set_profile_tab_callback(move |ctx, first| {
+            sink.borrow_mut()
+                .push((ctx.filter.get().to_string(), first));
+        });
+
+        // No drill-down page is pushed, so the only tabs are the own page's.
+        let mut widgets = Vec::new();
+        walk(&window.clone().upcast::<gtk4::Widget>(), 0, &mut widgets);
+        let replies = widgets
+            .iter()
+            .find_map(|(_, w)| {
+                let t = w.downcast_ref::<gtk4::ToggleButton>()?;
+                (t.label().as_deref() == Some("Replies")).then(|| t.clone())
+            })
+            .expect("the own page has the tabs");
+        replies.set_active(true);
+        assert_eq!(
+            asked.borrow().as_slice(),
+            [("posts_with_replies".to_string(), true)]
+        );
+
+        // Sign-in points the context at the account and starts over.
+        ctx.did.replace("did:plc:me".into());
+        ctx.begin_refresh();
+        assert_eq!(ctx.listed(), 0);
+        ctx.append_posts(vec![a_post("mine")]);
+        assert_eq!(ctx.listed(), 1, "the own page finally paginates via ctx");
+
+        window.destroy();
+    }
+
     /// The profile tabs ask the app for their own feed: switching clears
     /// the list, hands over the tab's filter as a first page, and bumps
     /// the generation so a fetch from the abandoned tab lands nowhere.
@@ -8359,6 +8412,11 @@ mod tests {
         };
 
         assert!(tab("Posts").is_active(), "Posts is the opening tab");
+        assert_eq!(
+            tab("Posts").parent().unwrap().halign(),
+            gtk4::Align::Center,
+            "the selector sits centered under the centered header"
+        );
         assert!(
             asked.borrow().is_empty(),
             "the opening tab rides the pushed posts, no refetch"

@@ -105,8 +105,6 @@ mod imp {
         pub chat_cursor: RefCell<Option<String>>,
         pub chat_loading_more: RefCell<bool>,
         /// Profile state
-        pub profile_cursor: RefCell<Option<String>>,
-        pub profile_loading_more: RefCell<bool>,
         /// Store the logged-in user's DID for fetching own profile
         pub user_did: RefCell<Option<String>>,
         /// Likes state
@@ -347,11 +345,6 @@ mod imp {
             let app_clone = app.clone();
             window.set_conversation_clicked_callback(move |conversation| {
                 app_clone.open_conversation_view(conversation);
-            });
-
-            let app_clone = app.clone();
-            window.set_profile_load_more_callback(move || {
-                app_clone.fetch_profile_more();
             });
 
             let app_clone = app.clone();
@@ -3426,115 +3419,35 @@ impl HangarApplication {
             window.show_profile_page();
         }
 
-        // Only fetch if we haven't loaded profile posts yet
-        if self.imp().profile_cursor.borrow().is_none() {
+        // The first open loads; after that the page keeps what it has.
+        let loaded = self
+            .imp()
+            .window
+            .borrow()
+            .as_ref()
+            .and_then(|w| w.own_profile_feed_ctx())
+            .is_some_and(|ctx| !ctx.did.borrow().is_empty());
+        if !loaded {
             self.fetch_profile_posts();
         }
     }
 
     /// Fetch posts for the logged-in user's profile
     fn fetch_profile_posts(&self) {
-        let user_did = match self.imp().user_did.borrow().clone() {
-            Some(did) => did,
-            None => {
-                eprintln!("Cannot fetch profile posts: no user DID");
-                return;
-            }
-        };
-
-        let (tx, rx) = std::sync::mpsc::channel::<Result<(Vec<Post>, Option<String>), String>>();
-        let client = self.client();
-
-        thread::spawn(move || {
-            let result =
-                runtime::block_on(async { client.get_author_feed(&user_did, None, None).await });
-            let _ = tx.send(result.map_err(|e| e.to_string()));
-        });
-
-        let app = self.clone();
-        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
-            match rx.try_recv() {
-                Ok(Ok((posts, next_cursor))) => {
-                    app.imp().profile_cursor.replace(next_cursor);
-                    if let Some(window) = app.imp().window.borrow().as_ref() {
-                        window.set_profile_posts(posts);
-                    }
-                    glib::ControlFlow::Break
-                }
-                Ok(Err(e)) => {
-                    eprintln!("Failed to fetch profile posts: {}", e);
-                    glib::ControlFlow::Break
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    eprintln!("Failed to fetch profile posts: connection lost");
-                    glib::ControlFlow::Break
-                }
-            }
-        });
-    }
-
-    /// Fetch more posts for the profile page (infinite scroll)
-    fn fetch_profile_more(&self) {
-        if *self.imp().profile_loading_more.borrow() {
+        let Some(user_did) = self.imp().user_did.borrow().clone() else {
+            eprintln!("Cannot fetch profile posts: no user DID");
             return;
-        }
-        let cursor = match self.imp().profile_cursor.borrow().as_ref() {
-            Some(c) => c.clone(),
-            None => return,
         };
-        let user_did = match self.imp().user_did.borrow().clone() {
-            Some(did) => did,
-            None => return,
+        let Some(window) = self.imp().window.borrow().clone() else {
+            return;
         };
-        self.imp().profile_loading_more.replace(true);
-
-        if let Some(window) = self.imp().window.borrow().as_ref() {
-            window.set_profile_loading(true);
-        }
-
-        let (tx, rx) = std::sync::mpsc::channel::<Result<(Vec<Post>, Option<String>), String>>();
-        let client = self.client();
-
-        thread::spawn(move || {
-            let result = runtime::block_on(async {
-                client.get_author_feed(&user_did, Some(&cursor), None).await
-            });
-            let _ = tx.send(result.map_err(|e| e.to_string()));
-        });
-
-        let app = self.clone();
-        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
-            match rx.try_recv() {
-                Ok(Ok((posts, next_cursor))) => {
-                    app.imp().profile_loading_more.replace(false);
-                    app.imp().profile_cursor.replace(next_cursor);
-                    if let Some(window) = app.imp().window.borrow().as_ref() {
-                        window.set_profile_loading(false);
-                        if !posts.is_empty() {
-                            window.append_profile_posts(posts);
-                        }
-                    }
-                    glib::ControlFlow::Break
-                }
-                Ok(Err(e)) => {
-                    app.imp().profile_loading_more.replace(false);
-                    if let Some(window) = app.imp().window.borrow().as_ref() {
-                        window.set_profile_loading(false);
-                    }
-                    eprintln!("Failed to fetch more profile posts: {}", e);
-                    glib::ControlFlow::Break
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    app.imp().profile_loading_more.replace(false);
-                    if let Some(window) = app.imp().window.borrow().as_ref() {
-                        window.set_profile_loading(false);
-                    }
-                    glib::ControlFlow::Break
-                }
-            }
-        });
+        let Some(ctx) = window.own_profile_feed_ctx() else {
+            return;
+        };
+        // A reopen starts the active tab over from the top.
+        ctx.did.replace(user_did);
+        ctx.begin_refresh();
+        self.fetch_profile_tab(ctx, true);
     }
 
     /// Open the likes view
@@ -3972,9 +3885,13 @@ impl HangarApplication {
         if ctx.fetching.get() {
             return;
         }
+        let did = ctx.did.borrow().clone();
+        // The own page's context exists before sign-in does.
+        if did.is_empty() {
+            return;
+        }
         ctx.fetching.set(true);
         let generation = ctx.generation.get();
-        let did = ctx.did.clone();
         let filter = ctx.filter.get();
         let cursor = if first_page {
             None
