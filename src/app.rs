@@ -312,6 +312,19 @@ mod imp {
                 app_clone.open_report_for_post(post);
             });
 
+            // Feed-level moderation starts from a clean cell: mute always
+            // mutes, block always confirms then blocks. The profile page
+            // owns the stateful undo side.
+            let app_clone = app.clone();
+            crate::ui::post_row::set_mute_account_handler(move |did| {
+                app_clone.toggle_mute(did, std::rc::Rc::new(std::cell::Cell::new(false)));
+            });
+
+            let app_clone = app.clone();
+            crate::ui::post_row::set_block_account_handler(move |profile| {
+                app_clone.toggle_block(profile, std::rc::Rc::new(RefCell::new(None)));
+            });
+
             let app_clone = app.clone();
             window.set_compose_callback(move || {
                 app_clone.open_compose_dialog();

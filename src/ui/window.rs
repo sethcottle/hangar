@@ -1197,6 +1197,106 @@ impl HangarWindow {
             .replace(Some(Box::new(callback)));
     }
 
+    /// Mute, block, report, behind one quiet menu. The labels read the
+    /// shared cells fresh every time the menu opens, so a toggle that
+    /// settled elsewhere still shows the truth. Built twice per page: once
+    /// for the header, once for the condensed bar.
+    fn build_moderation_menu(
+        &self,
+        profile: &Profile,
+        muted: &Rc<Cell<bool>>,
+        blocking: &Rc<RefCell<Option<String>>>,
+    ) -> gtk4::MenuButton {
+        let mod_popover_box = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+        mod_popover_box.set_margin_top(6);
+        mod_popover_box.set_margin_bottom(6);
+        mod_popover_box.set_margin_start(6);
+        mod_popover_box.set_margin_end(6);
+
+        let mute_item = gtk4::Button::new();
+        mute_item.add_css_class("flat");
+        mod_popover_box.append(&mute_item);
+        let block_item = gtk4::Button::new();
+        block_item.add_css_class("flat");
+        block_item.add_css_class("destructive-action");
+        mod_popover_box.append(&block_item);
+        let report_item = gtk4::Button::with_label("Report Account...");
+        report_item.add_css_class("flat");
+        mod_popover_box.append(&report_item);
+
+        let mod_popover = gtk4::Popover::new();
+        mod_popover.set_child(Some(&mod_popover_box));
+        mod_popover.add_css_class("menu");
+        mod_popover.set_has_arrow(false);
+
+        let mute_ref = mute_item.clone();
+        let block_ref = block_item.clone();
+        let muted_ref = muted.clone();
+        let blocking_ref = blocking.clone();
+        let sync_labels = move || {
+            mute_ref.set_label(if muted_ref.get() {
+                "Unmute Account"
+            } else {
+                "Mute Account"
+            });
+            block_ref.set_label(if blocking_ref.borrow().is_some() {
+                "Unblock Account"
+            } else {
+                "Block Account..."
+            });
+        };
+        sync_labels();
+        let sync = sync_labels.clone();
+        mod_popover.connect_show(move |_| sync());
+
+        let win = self.downgrade();
+        let did = profile.did.clone();
+        let muted_cell = muted.clone();
+        let mod_pop = mod_popover.clone();
+        mute_item.connect_clicked(move |_| {
+            mod_pop.popdown();
+            if let Some(win) = win.upgrade()
+                && let Some(cb) = win.imp().mute_callback.borrow().as_ref()
+            {
+                cb(did.clone(), muted_cell.clone());
+            }
+        });
+
+        let win = self.downgrade();
+        let profile_for_block = profile.clone();
+        let blocking_cell = blocking.clone();
+        let mod_pop = mod_popover.clone();
+        block_item.connect_clicked(move |_| {
+            mod_pop.popdown();
+            if let Some(win) = win.upgrade()
+                && let Some(cb) = win.imp().block_callback.borrow().as_ref()
+            {
+                cb(profile_for_block.clone(), blocking_cell.clone());
+            }
+        });
+
+        let win = self.downgrade();
+        let profile_for_report = profile.clone();
+        let mod_pop = mod_popover.clone();
+        report_item.connect_clicked(move |_| {
+            mod_pop.popdown();
+            if let Some(win) = win.upgrade()
+                && let Some(cb) = win.imp().report_account_callback.borrow().as_ref()
+            {
+                cb(profile_for_report.clone());
+            }
+        });
+
+        let mod_btn = gtk4::MenuButton::new();
+        mod_btn.set_icon_name("view-more-symbolic");
+        mod_btn.add_css_class("flat");
+        mod_btn.add_css_class("circular");
+        mod_btn.set_tooltip_text(Some("More options"));
+        mod_btn.update_property(&[gtk4::accessible::Property::Label("More options")]);
+        mod_btn.set_popover(Some(&mod_popover));
+        mod_btn
+    }
+
     /// Posts, Replies, Media, Videos. Switching clears the list and asks
     /// the app for the tab's own feed; the shared context strands stale
     /// fetches. Centered to sit under the centered profile header.
@@ -2378,9 +2478,11 @@ impl HangarWindow {
         // record URI lives in a cell shared with the app; each click hands
         // its button over and goes insensitive until the result comes back.
         let own_page = self.imp().current_user_did.borrow().as_deref() == Some(&profile.did);
-        // Shared with the condensed bar's copy of the button, so both read
-        // the same record URI.
+        // Shared with the condensed bar's copies of the buttons, so both
+        // spots read the same state.
         let follow_uri = Rc::new(RefCell::new(profile.viewer_following.clone()));
+        let muted = Rc::new(Cell::new(profile.viewer_muted));
+        let blocking = Rc::new(RefCell::new(profile.viewer_blocking.clone()));
         if !own_page {
             let buttons_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
             buttons_row.set_halign(gtk4::Align::Center);
@@ -2422,99 +2524,7 @@ impl HangarWindow {
             });
             buttons_row.append(&message_btn);
 
-            // Mute, block, report, behind one quiet menu. The labels read
-            // the cells fresh every time the menu opens, so a toggle that
-            // settled while it was closed still shows the truth.
-            let muted = Rc::new(Cell::new(profile.viewer_muted));
-            let blocking = Rc::new(RefCell::new(profile.viewer_blocking.clone()));
-
-            let mod_popover_box = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
-            mod_popover_box.set_margin_top(6);
-            mod_popover_box.set_margin_bottom(6);
-            mod_popover_box.set_margin_start(6);
-            mod_popover_box.set_margin_end(6);
-
-            let mute_item = gtk4::Button::new();
-            mute_item.add_css_class("flat");
-            mod_popover_box.append(&mute_item);
-            let block_item = gtk4::Button::new();
-            block_item.add_css_class("flat");
-            block_item.add_css_class("destructive-action");
-            mod_popover_box.append(&block_item);
-            let report_item = gtk4::Button::with_label("Report Account...");
-            report_item.add_css_class("flat");
-            mod_popover_box.append(&report_item);
-
-            let mod_popover = gtk4::Popover::new();
-            mod_popover.set_child(Some(&mod_popover_box));
-            mod_popover.add_css_class("menu");
-            mod_popover.set_has_arrow(false);
-
-            let mute_ref = mute_item.clone();
-            let block_ref = block_item.clone();
-            let muted_ref = muted.clone();
-            let blocking_ref = blocking.clone();
-            let sync_labels = move || {
-                mute_ref.set_label(if muted_ref.get() {
-                    "Unmute Account"
-                } else {
-                    "Mute Account"
-                });
-                block_ref.set_label(if blocking_ref.borrow().is_some() {
-                    "Unblock Account"
-                } else {
-                    "Block Account..."
-                });
-            };
-            sync_labels();
-            let sync = sync_labels.clone();
-            mod_popover.connect_show(move |_| sync());
-
-            let win = self.downgrade();
-            let did = profile.did.clone();
-            let muted_cell = muted.clone();
-            let mod_pop = mod_popover.clone();
-            mute_item.connect_clicked(move |_| {
-                mod_pop.popdown();
-                if let Some(win) = win.upgrade()
-                    && let Some(cb) = win.imp().mute_callback.borrow().as_ref()
-                {
-                    cb(did.clone(), muted_cell.clone());
-                }
-            });
-
-            let win = self.downgrade();
-            let profile_for_block = profile.clone();
-            let blocking_cell = blocking.clone();
-            let mod_pop = mod_popover.clone();
-            block_item.connect_clicked(move |_| {
-                mod_pop.popdown();
-                if let Some(win) = win.upgrade()
-                    && let Some(cb) = win.imp().block_callback.borrow().as_ref()
-                {
-                    cb(profile_for_block.clone(), blocking_cell.clone());
-                }
-            });
-
-            let win = self.downgrade();
-            let profile_for_report = profile.clone();
-            let mod_pop = mod_popover.clone();
-            report_item.connect_clicked(move |_| {
-                mod_pop.popdown();
-                if let Some(win) = win.upgrade()
-                    && let Some(cb) = win.imp().report_account_callback.borrow().as_ref()
-                {
-                    cb(profile_for_report.clone());
-                }
-            });
-
-            let mod_btn = gtk4::MenuButton::new();
-            mod_btn.set_icon_name("view-more-symbolic");
-            mod_btn.add_css_class("flat");
-            mod_btn.add_css_class("circular");
-            mod_btn.set_tooltip_text(Some("More options"));
-            mod_btn.update_property(&[gtk4::accessible::Property::Label("More options")]);
-            mod_btn.set_popover(Some(&mod_popover));
+            let mod_btn = self.build_moderation_menu(profile, &muted, &blocking);
             buttons_row.append(&mod_btn);
 
             profile_header.append(&buttons_row);
@@ -2803,6 +2813,9 @@ impl HangarWindow {
                 }
             });
             bar.append(&bar_message);
+
+            // The moderation menu rides along; same cells, same truth.
+            bar.append(&self.build_moderation_menu(profile, &muted, &blocking));
         }
 
         let revealer = gtk4::Revealer::new();
@@ -9001,6 +9014,17 @@ mod tests {
         assert!(
             !revealer.reveals_child(),
             "the bar waits for the header to scroll away"
+        );
+
+        // The bar carries its own copy of the moderation menu, so mute,
+        // block, and report stay in reach once the header scrolls away.
+        let mut bar_widgets = Vec::new();
+        walk(&revealer.child().unwrap(), 0, &mut bar_widgets);
+        assert!(
+            bar_widgets
+                .iter()
+                .any(|(_, w)| w.downcast_ref::<gtk4::MenuButton>().is_some()),
+            "the moderation menu rides the condensed bar"
         );
 
         window.destroy();

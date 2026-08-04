@@ -59,6 +59,12 @@ thread_local! {
     /// What Report Post does. The item existed unwired before this.
     static REPORT_POST_HANDLER: std::cell::RefCell<Option<Box<dyn Fn(Post)>>> =
         const { std::cell::RefCell::new(None) };
+    /// Feed-level moderation, acting on the post's author.
+    static MUTE_ACCOUNT_HANDLER: std::cell::RefCell<Option<Box<dyn Fn(String)>>> =
+        const { std::cell::RefCell::new(None) };
+    static BLOCK_ACCOUNT_HANDLER: std::cell::RefCell<
+        Option<Box<dyn Fn(crate::atproto::Profile)>>,
+    > = const { std::cell::RefCell::new(None) };
 }
 
 /// Record whose posts are deletable. `None` on sign-out.
@@ -87,6 +93,20 @@ pub fn set_bookmark_post_handler<F: Fn(Post, glib::WeakRef<PostRow>) + 'static>(
 /// Install the app-level report flow. See [`set_delete_post_handler`].
 pub fn set_report_post_handler<F: Fn(Post) + 'static>(handler: F) {
     REPORT_POST_HANDLER.with(|cell| {
+        cell.replace(Some(Box::new(handler)));
+    });
+}
+
+/// Install the app-level mute flow for a post's author.
+pub fn set_mute_account_handler<F: Fn(String) + 'static>(handler: F) {
+    MUTE_ACCOUNT_HANDLER.with(|cell| {
+        cell.replace(Some(Box::new(handler)));
+    });
+}
+
+/// Install the app-level block flow for a post's author.
+pub fn set_block_account_handler<F: Fn(crate::atproto::Profile) + 'static>(handler: F) {
+    BLOCK_ACCOUNT_HANDLER.with(|cell| {
         cell.replace(Some(Box::new(handler)));
     });
 }
@@ -151,7 +171,10 @@ mod imp {
         pub delete_item: RefCell<Option<gtk4::Button>>,
         /// Separator plus Delete button, shown and hidden as one block so no
         /// stray separator trails the menu on other people's posts.
+        pub mute_item: RefCell<Option<gtk4::Button>>,
+        pub block_item: RefCell<Option<gtk4::Button>>,
         pub delete_section: RefCell<Option<gtk4::Box>>,
+        pub moderation_section: RefCell<Option<gtk4::Box>>,
         // Track current like/repost state (may differ from original post after user actions)
         pub is_liked: RefCell<bool>,
         pub is_reposted: RefCell<bool>,
@@ -484,13 +507,76 @@ impl PostRow {
             open_link_item,
             bookmark_item,
             bookmark_item_label,
+            copy_text_item,
+            mute_item,
+            block_item,
             report_item,
             delete_item,
             delete_section,
+            moderation_section,
         ) = Self::create_post_menu_button();
         menu_btn.set_tooltip_text(Some("More options"));
         menu_btn.update_property(&[gtk4::accessible::Property::Label("More options")]);
         actions.append(&menu_btn);
+
+        // Copy Post Text: local, no app involvement.
+        let row_weak = self.downgrade();
+        let copy_popover = menu_btn.popover();
+        copy_text_item.connect_clicked(move |_| {
+            if let Some(p) = &copy_popover {
+                p.popdown();
+            }
+            if let Some(row) = row_weak.upgrade()
+                && let Some(post) = row.imp().post.borrow().as_ref()
+            {
+                row.clipboard().set_text(&post.text);
+            }
+        });
+
+        // Mute and Block act on the author; the profile page has the
+        // stateful undo side.
+        let row_weak = self.downgrade();
+        let mute_popover = menu_btn.popover();
+        mute_item.connect_clicked(move |_| {
+            if let Some(p) = &mute_popover {
+                p.popdown();
+            }
+            let Some(row) = row_weak.upgrade() else {
+                return;
+            };
+            let did = row
+                .imp()
+                .post
+                .borrow()
+                .as_ref()
+                .map(|p| p.author.did.clone());
+            if let Some(did) = did {
+                MUTE_ACCOUNT_HANDLER.with(|cell| {
+                    if let Some(handler) = cell.borrow().as_ref() {
+                        handler(did);
+                    }
+                });
+            }
+        });
+
+        let row_weak = self.downgrade();
+        let block_popover = menu_btn.popover();
+        block_item.connect_clicked(move |_| {
+            if let Some(p) = &block_popover {
+                p.popdown();
+            }
+            let Some(row) = row_weak.upgrade() else {
+                return;
+            };
+            let author = row.imp().post.borrow().as_ref().map(|p| p.author.clone());
+            if let Some(author) = author {
+                BLOCK_ACCOUNT_HANDLER.with(|cell| {
+                    if let Some(handler) = cell.borrow().as_ref() {
+                        handler(author);
+                    }
+                });
+            }
+        });
 
         // Report, wired once for the same reason as Delete below.
         let row_weak = self.downgrade();
@@ -609,8 +695,11 @@ impl PostRow {
         imp.open_link_item.replace(Some(open_link_item));
         imp.bookmark_item.replace(Some(bookmark_item));
         imp.bookmark_item_label.replace(Some(bookmark_item_label));
+        imp.mute_item.replace(Some(mute_item));
+        imp.block_item.replace(Some(block_item));
         imp.delete_item.replace(Some(delete_item));
         imp.delete_section.replace(Some(delete_section));
+        imp.moderation_section.replace(Some(moderation_section));
         imp.main_box.replace(Some(main_box));
     }
 
@@ -799,6 +888,10 @@ impl PostRow {
         gtk4::Label,
         gtk4::Button,
         gtk4::Button,
+        gtk4::Button,
+        gtk4::Button,
+        gtk4::Button,
+        gtk4::Box,
         gtk4::Box,
     ) {
         let popover_box = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
@@ -857,6 +950,42 @@ impl PostRow {
         sep2.set_margin_bottom(4);
         popover_box.append(&sep2);
 
+        // Copy Post Text
+        let copy_text_item = gtk4::Button::new();
+        let copy_text_content = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        copy_text_content.append(&gtk4::Image::from_icon_name("edit-copy-symbolic"));
+        copy_text_content.append(&gtk4::Label::new(Some("Copy Post Text")));
+        copy_text_item.set_child(Some(&copy_text_content));
+        copy_text_item.add_css_class("flat");
+        popover_box.append(&copy_text_item);
+
+        // Moderation, in a block of its own. Bind hides it on the
+        // signed-in user's posts; you cannot mute yourself.
+        let moderation_section = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+        let sep_mod = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+        sep_mod.set_margin_top(4);
+        sep_mod.set_margin_bottom(4);
+        moderation_section.append(&sep_mod);
+
+        // Mute Account, on the post's author
+        let mute_item = gtk4::Button::new();
+        let mute_content = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        mute_content.append(&gtk4::Image::from_icon_name("audio-volume-muted-symbolic"));
+        mute_content.append(&gtk4::Label::new(Some("Mute Account")));
+        mute_item.set_child(Some(&mute_content));
+        mute_item.add_css_class("flat");
+        moderation_section.append(&mute_item);
+
+        // Block Account
+        let block_item = gtk4::Button::new();
+        let block_content = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        block_content.append(&gtk4::Image::from_icon_name("action-unavailable-symbolic"));
+        block_content.append(&gtk4::Label::new(Some("Block Account...")));
+        block_item.set_child(Some(&block_content));
+        block_item.add_css_class("flat");
+        block_item.add_css_class("destructive-action");
+        moderation_section.append(&block_item);
+
         // Report Post
         let report_item = gtk4::Button::new();
         let report_content = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
@@ -864,7 +993,8 @@ impl PostRow {
         report_content.append(&gtk4::Label::new(Some("Report Post...")));
         report_item.set_child(Some(&report_content));
         report_item.add_css_class("flat");
-        popover_box.append(&report_item);
+        moderation_section.append(&report_item);
+        popover_box.append(&moderation_section);
 
         // Delete Post, in a block of its own. Hidden until bind sees the post
         // belongs to the signed-in user.
@@ -885,8 +1015,16 @@ impl PostRow {
         delete_section.set_visible(false);
         popover_box.append(&delete_section);
 
+        // The menu grew past what a short window can show; it scrolls
+        // inside its natural height instead of clipping.
+        let menu_scroll = gtk4::ScrolledWindow::new();
+        menu_scroll.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
+        menu_scroll.set_propagate_natural_height(true);
+        menu_scroll.set_max_content_height(420);
+        menu_scroll.set_child(Some(&popover_box));
+
         let popover = gtk4::Popover::new();
-        popover.set_child(Some(&popover_box));
+        popover.set_child(Some(&menu_scroll));
         popover.add_css_class("menu");
         popover.set_has_arrow(false);
 
@@ -903,9 +1041,13 @@ impl PostRow {
             open_link_item,
             bookmark_item,
             bookmark_item_label,
+            copy_text_item,
+            mute_item,
+            block_item,
             report_item,
             delete_item,
             delete_section,
+            moderation_section,
         )
     }
 
@@ -1365,10 +1507,14 @@ impl PostRow {
 
         // Delete is offered only on the signed-in user's own posts, decided
         // fresh on every bind so a recycled row cannot keep the offer.
+        let own = CURRENT_USER_DID
+            .with(|cell| cell.borrow().as_deref() == Some(post.author.did.as_str()));
         if let Some(section) = imp.delete_section.borrow().as_ref() {
-            let own = CURRENT_USER_DID
-                .with(|cell| cell.borrow().as_deref() == Some(post.author.did.as_str()));
             section.set_visible(own);
+        }
+        // Moderation is the inverse: only other people's posts.
+        if let Some(section) = imp.moderation_section.borrow().as_ref() {
+            section.set_visible(!own);
         }
 
         // The Save/Remove label follows the post, fresh on every bind so a
@@ -3524,6 +3670,71 @@ mod tests {
 
         // Other tests bind posts authored by did:plc:test; leave nothing set.
         super::set_current_user_did(None);
+    }
+
+    /// Feed-level moderation: the section hides on own posts, and Mute and
+    /// Block hand the app the author of the post the row shows now.
+    #[test]
+    fn moderation_targets_the_bound_author_and_skips_own_posts() {
+        crate::ui::with_gtk(moderation_targets_the_bound_author_and_skips_own_posts_body);
+    }
+
+    fn moderation_targets_the_bound_author_and_skips_own_posts_body() {
+        use std::cell::RefCell as StdRefCell;
+        use std::rc::Rc;
+
+        let muted: Rc<StdRefCell<Vec<String>>> = Rc::default();
+        let sink = Rc::clone(&muted);
+        super::set_mute_account_handler(move |did| sink.borrow_mut().push(did));
+        let blocked: Rc<StdRefCell<Vec<String>>> = Rc::default();
+        let sink = Rc::clone(&blocked);
+        super::set_block_account_handler(move |profile| sink.borrow_mut().push(profile.did));
+
+        let row = PostRow::new();
+        let section = row
+            .imp()
+            .moderation_section
+            .borrow()
+            .clone()
+            .expect("built in setup_ui");
+
+        let theirs = post_with(None, "at://did:plc:test/app.bsky.feed.post/theirs");
+        row.bind(&theirs);
+        assert!(
+            section.get_visible(),
+            "someone else's post offers moderation"
+        );
+
+        super::set_current_user_did(Some("did:plc:test"));
+        row.bind(&theirs);
+        assert!(!section.get_visible(), "you cannot mute yourself");
+        super::set_current_user_did(None);
+
+        // Recycled across posts, a click still targets the current author.
+        let other = {
+            let mut post = post_with(None, "at://did:plc:other/app.bsky.feed.post/x");
+            post.author = Profile {
+                did: "did:plc:other".into(),
+                ..profile()
+            };
+            post
+        };
+        row.bind(&theirs);
+        row.bind(&other);
+        row.imp()
+            .mute_item
+            .borrow()
+            .as_ref()
+            .expect("built in setup_ui")
+            .emit_clicked();
+        row.imp()
+            .block_item
+            .borrow()
+            .as_ref()
+            .expect("built in setup_ui")
+            .emit_clicked();
+        assert_eq!(*muted.borrow(), vec!["did:plc:other".to_string()]);
+        assert_eq!(*blocked.borrow(), vec!["did:plc:other".to_string()]);
     }
 
     /// The menu's Save entry follows the post: bind decides the label fresh
