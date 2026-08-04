@@ -2462,6 +2462,60 @@ impl HangarClient {
         })
     }
 
+    /// The conversation with `did`, if the server allows one.
+    ///
+    /// Ok(None) means messaging is unavailable: DMs off, a block, or an
+    /// account restriction. The server does not say which. When chat is
+    /// allowed but no conversation exists yet, get_convo_for_members
+    /// mints an empty one.
+    #[allow(clippy::await_holding_lock)]
+    pub async fn start_conversation(&self, did: &str) -> Result<Option<Conversation>, ClientError> {
+        use atrium_api::agent::bluesky::{AtprotoServiceType, BSKY_CHAT_DID};
+
+        with_agent!(self, agent => {
+
+        let chat_did = BSKY_CHAT_DID
+            .parse()
+            .map_err(|e| ClientError::Network(format!("invalid chat DID: {e}")))?;
+        let chat_api = agent.api_with_proxy(chat_did, AtprotoServiceType::BskyChat);
+
+        let member: atrium_api::types::string::Did = did
+            .parse()
+            .map_err(|e| ClientError::InvalidResponse(format!("invalid did: {e}")))?;
+
+        let params = atrium_api::chat::bsky::convo::get_convo_availability::ParametersData {
+            members: vec![member.clone()],
+        };
+        let availability = chat_api
+            .chat
+            .bsky
+            .convo
+            .get_convo_availability(params.into())
+            .await
+            .map_err(|e| self.xrpc_error(e))?;
+
+        if !availability.data.can_chat {
+            return Ok(None);
+        }
+        if let Some(convo) = availability.data.convo.clone() {
+            return Ok(Some(self.convert_convo_view(convo)));
+        }
+
+        let params = atrium_api::chat::bsky::convo::get_convo_for_members::ParametersData {
+            members: vec![member],
+        };
+        let output = chat_api
+            .chat
+            .bsky
+            .convo
+            .get_convo_for_members(params.into())
+            .await
+            .map_err(|e| self.xrpc_error(e))?;
+
+        Ok(Some(self.convert_convo_view(output.data.convo.clone())))
+        })
+    }
+
     /// Add an emoji reaction to a message. The server answers with the
     /// updated message, so the open view can refresh the row from truth.
     #[allow(clippy::await_holding_lock)]

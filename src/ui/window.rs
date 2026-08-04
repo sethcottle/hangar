@@ -195,6 +195,9 @@ mod imp {
                 >,
             >,
         >,
+        /// Args: the profile to message and the button that asked.
+        pub message_callback:
+            RefCell<Option<Box<dyn Fn(Profile, glib::WeakRef<gtk4::Button>) + 'static>>>,
         pub nav_changed_callback:
             RefCell<Option<Box<dyn Fn(crate::ui::sidebar::NavItem) + 'static>>>,
         // Mentions page state
@@ -949,6 +952,16 @@ impl HangarWindow {
         F: Fn(String, Rc<RefCell<Option<String>>>, glib::WeakRef<gtk4::Button>) + 'static,
     {
         self.imp().follow_callback.replace(Some(Box::new(callback)));
+    }
+
+    /// Args: the profile to message and the button that asked.
+    pub fn set_message_callback<F>(&self, callback: F)
+    where
+        F: Fn(Profile, glib::WeakRef<gtk4::Button>) + 'static,
+    {
+        self.imp()
+            .message_callback
+            .replace(Some(Box::new(callback)));
     }
 
     /// Point a Follow button at the given state: label, style, and back on.
@@ -1856,15 +1869,17 @@ impl HangarWindow {
             profile_header.append(&follows_you);
         }
 
-        // Follow/unfollow, hidden on your own page. The record URI lives in
-        // a cell shared with the app; the click hands both over and goes
-        // insensitive until the result comes back.
+        // Follow/unfollow and Message, hidden on your own page. The follow
+        // record URI lives in a cell shared with the app; each click hands
+        // its button over and goes insensitive until the result comes back.
         let own_page = self.imp().current_user_did.borrow().as_deref() == Some(&profile.did);
         if !own_page {
+            let buttons_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+            buttons_row.set_halign(gtk4::Align::Center);
+
             let follow_uri = Rc::new(RefCell::new(profile.viewer_following.clone()));
             let follow_btn = gtk4::Button::new();
             follow_btn.add_css_class("pill");
-            follow_btn.set_halign(gtk4::Align::Center);
             Self::sync_follow_button(&follow_btn, follow_uri.borrow().is_some());
 
             let win = self.downgrade();
@@ -1882,7 +1897,25 @@ impl HangarWindow {
                     cb(did.clone(), uri_cell.clone(), btn.downgrade());
                 }
             });
-            profile_header.append(&follow_btn);
+            buttons_row.append(&follow_btn);
+
+            let message_btn = gtk4::Button::with_label("Message");
+            message_btn.add_css_class("pill");
+            let win = self.downgrade();
+            let profile_for_message = profile.clone();
+            message_btn.connect_clicked(move |btn| {
+                let Some(win) = win.upgrade() else {
+                    return;
+                };
+                if let Some(cb) = win.imp().message_callback.borrow().as_ref() {
+                    // Locked while the availability check is out.
+                    btn.set_sensitive(false);
+                    cb(profile_for_message.clone(), btn.downgrade());
+                }
+            });
+            buttons_row.append(&message_btn);
+
+            profile_header.append(&buttons_row);
         }
 
         // Followers and following, clickable. A count can be missing when
@@ -2716,6 +2749,21 @@ impl HangarWindow {
     /// Get sidebar reference
     pub fn sidebar(&self) -> Option<crate::ui::sidebar::Sidebar> {
         self.imp().sidebar.borrow().clone()
+    }
+
+    /// Set callback for when My Profile is clicked in the avatar popover
+    pub fn set_my_profile_clicked_callback<F: Fn() + 'static>(&self, f: F) {
+        if let Some(sidebar) = self.imp().sidebar.borrow().as_ref() {
+            sidebar.connect_my_profile_clicked(f);
+        }
+    }
+
+    /// Move the rail's highlight without dispatching a section switch;
+    /// programmatic selection does not emit `row-activated`.
+    pub fn select_nav(&self, item: crate::ui::sidebar::NavItem) {
+        if let Some(sidebar) = self.imp().sidebar.borrow().as_ref() {
+            sidebar.select_nav_item(item);
+        }
     }
 
     /// Set callback for when Settings is clicked in the avatar popover
@@ -7142,6 +7190,57 @@ mod tests {
                 .downcast_ref::<gtk4::Button>()
                 .is_some_and(|b| matches!(b.label().as_deref(), Some("Follow" | "Following")))),
             "no follow button on your own page"
+        );
+
+        window.destroy();
+    }
+
+    /// The Message button hands the shown profile over once and locks
+    /// while the availability check is out, and stays off your own page.
+    #[test]
+    fn the_message_button_asks_once_and_locks() {
+        crate::ui::with_gtk(the_message_button_asks_once_and_locks_body);
+    }
+
+    fn the_message_button_asks_once_and_locks_body() {
+        let window: HangarWindow = glib::Object::builder().build();
+
+        let asked: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(vec![]));
+        let sink = asked.clone();
+        window.set_message_callback(move |profile, _btn| {
+            sink.borrow_mut().push(profile.did);
+        });
+
+        let message_button_on = |tag: &str| -> Option<gtk4::Button> {
+            let nav_view = window.imp().home_nav_view.borrow().clone().unwrap();
+            let page = nav_view.find_page(tag).expect("page is in the stack");
+            let mut widgets = Vec::new();
+            walk(&page.upcast::<gtk4::Widget>(), 0, &mut widgets);
+            widgets.iter().find_map(|(_, w)| {
+                let btn = w.downcast_ref::<gtk4::Button>()?;
+                (btn.label().as_deref() == Some("Message")).then(|| btn.clone())
+            })
+        };
+
+        let stranger = Profile::minimal(
+            "did:plc:stranger".into(),
+            "stranger.bsky.social".into(),
+            None,
+            None,
+        );
+        window.push_profile_page(&stranger, vec![]);
+
+        let btn = message_button_on("profile:did:plc:stranger").expect("a Message button");
+        btn.emit_clicked();
+        assert_eq!(asked.borrow().as_slice(), ["did:plc:stranger"]);
+        assert!(!btn.is_sensitive(), "locked until the check answers");
+
+        window.set_current_user_did("did:plc:me");
+        let me = Profile::minimal("did:plc:me".into(), "me.bsky.social".into(), None, None);
+        window.push_profile_page(&me, vec![]);
+        assert!(
+            message_button_on("profile:did:plc:me").is_none(),
+            "no Message button on your own page"
         );
 
         window.destroy();

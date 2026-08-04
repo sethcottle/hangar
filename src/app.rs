@@ -252,6 +252,11 @@ mod imp {
             });
 
             let app_clone = app.clone();
+            window.set_message_callback(move |profile, btn_weak| {
+                app_clone.open_direct_message(profile, btn_weak);
+            });
+
+            let app_clone = app.clone();
             window.set_compose_callback(move || {
                 app_clone.open_compose_dialog();
             });
@@ -341,7 +346,15 @@ mod imp {
                 app_clone.execute_search(query);
             });
 
-            // Avatar menu callbacks: Settings & Sign Out
+            // Avatar menu callbacks: My Profile, Settings, Sign Out
+            let app_clone = app.clone();
+            window.set_my_profile_clicked_callback(move || {
+                if let Some(window) = app_clone.imp().window.borrow().as_ref() {
+                    window.select_nav(NavItem::Profile);
+                }
+                app_clone.open_own_profile_view();
+            });
+
             let app_clone = app.clone();
             window.set_settings_clicked_callback(move || {
                 if let Some(window) = app_clone.imp().window.borrow().as_ref() {
@@ -2633,6 +2646,62 @@ impl HangarApplication {
     }
 
     /// Open a conversation in the message view, pushed onto the chat stack.
+    /// Message from a profile. The server decides whether messaging is
+    /// allowed; DMs off, blocks, and account restrictions all come back as
+    /// a plain no, so the toast says so without guessing the reason.
+    fn open_direct_message(&self, profile: Profile, btn_weak: glib::WeakRef<gtk4::Button>) {
+        let (tx, rx) = std::sync::mpsc::channel::<Result<Option<Conversation>, String>>();
+        let client = self.client();
+        let did = profile.did.clone();
+
+        thread::spawn(move || {
+            let result = runtime::block_on(async { client.start_conversation(&did).await });
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+
+        let app = self.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            match rx.try_recv() {
+                Ok(Ok(Some(conversation))) => {
+                    if let Some(btn) = btn_weak.upgrade() {
+                        btn.set_sensitive(true);
+                    }
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        // The message page lives on the chat stack; go there
+                        // with the rail highlight in tow.
+                        window.select_nav(NavItem::Chat);
+                        window.switch_to_page("chat");
+                    }
+                    app.open_conversation_view(conversation);
+                    glib::ControlFlow::Break
+                }
+                Ok(Ok(None)) => {
+                    // Stays locked: asking again will not change the answer.
+                    if let Some(btn) = btn_weak.upgrade() {
+                        btn.set_tooltip_text(Some("This account can't receive your messages"));
+                    }
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.show_toast("This account can't receive your messages");
+                    }
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(e)) => {
+                    eprintln!("Failed to check messaging: {}", e);
+                    app.report_session_expiry();
+                    if let Some(btn) = btn_weak.upgrade() {
+                        btn.set_sensitive(true);
+                    }
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.show_toast("Couldn't open messaging");
+                    }
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+            }
+        });
+    }
+
     fn open_conversation_view(&self, conversation: Conversation) {
         let pushed = {
             let window = self.imp().window.borrow();

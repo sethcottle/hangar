@@ -72,6 +72,7 @@ mod imp {
         pub nav_list: RefCell<Option<gtk4::ListBox>>,
         pub selected_item: Cell<Option<NavItem>>,
         pub compose_btn: RefCell<Option<gtk4::Button>>,
+        pub my_profile_callback: RefCell<Option<Box<dyn Fn() + 'static>>>,
         pub settings_callback: RefCell<Option<Box<dyn Fn() + 'static>>>,
         pub sign_out_callback: RefCell<Option<Box<dyn Fn() + 'static>>>,
         /// Unread badge per nav row, in `NavItem::all()` order.
@@ -140,6 +141,15 @@ impl Sidebar {
         popover_box.set_margin_start(8);
         popover_box.set_margin_end(8);
 
+        // My Profile item. The avatar reads as "me"; give it a way there.
+        let my_profile_item = gtk4::Button::new();
+        let my_profile_content = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        my_profile_content.append(&gtk4::Image::from_icon_name("avatar-default-symbolic"));
+        my_profile_content.append(&gtk4::Label::new(Some("My Profile")));
+        my_profile_item.set_child(Some(&my_profile_content));
+        my_profile_item.add_css_class("flat");
+        popover_box.append(&my_profile_item);
+
         // Settings item
         let settings_item = gtk4::Button::new();
         let settings_content = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
@@ -177,6 +187,18 @@ impl Sidebar {
         avatar_menu_btn.add_css_class("circular");
         avatar_menu_btn.set_tooltip_text(Some("Account"));
         avatar_menu_btn.update_property(&[gtk4::accessible::Property::Label("Account menu")]);
+
+        // Wire up my profile click
+        let sidebar_weak = self.downgrade();
+        let popover_ref = popover.clone();
+        my_profile_item.connect_clicked(move |_| {
+            popover_ref.popdown();
+            if let Some(sidebar) = sidebar_weak.upgrade() {
+                if let Some(cb) = sidebar.imp().my_profile_callback.borrow().as_ref() {
+                    cb();
+                }
+            }
+        });
 
         // Wire up settings click
         let sidebar_weak = self.downgrade();
@@ -345,6 +367,12 @@ impl Sidebar {
                 }
             });
         }
+    }
+
+    pub fn connect_my_profile_clicked<F: Fn() + 'static>(&self, callback: F) {
+        self.imp()
+            .my_profile_callback
+            .replace(Some(Box::new(callback)));
     }
 
     pub fn connect_settings_clicked<F: Fn() + 'static>(&self, callback: F) {

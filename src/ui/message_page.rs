@@ -400,6 +400,20 @@ mod message_row {
             });
             bubble.add_controller(right_click);
 
+            // Double click hearts the message. Single clicks pass through
+            // untouched so links in the text keep working.
+            let double_click = gtk4::GestureClick::new();
+            double_click.set_button(1);
+            let row_weak = self.downgrade();
+            double_click.connect_released(move |_, n_press, _, _| {
+                if n_press == 2
+                    && let Some(row) = row_weak.upgrade()
+                {
+                    row.react_heart();
+                }
+            });
+            bubble.add_controller(double_click);
+
             let long_press = gtk4::GestureLongPress::new();
             long_press.set_touch_only(true);
             long_press.connect_pressed(move |gesture, x, y| {
@@ -731,6 +745,17 @@ mod message_row {
         /// Replace the handler run when a shared post's card is activated.
         pub fn set_post_callback<F: Fn(Post) + 'static>(&self, callback: F) {
             self.imp().post_callback.replace(Some(Box::new(callback)));
+        }
+
+        /// Heart the bound message, the double-click shortcut. Adding is
+        /// idempotent server-side, so a second double-click is harmless.
+        pub(super) fn react_heart(&self) {
+            let id = self.imp().message.borrow().as_ref().map(|m| m.id.clone());
+            if let Some(id) = id
+                && let Some(cb) = self.imp().react_callback.borrow().as_ref()
+            {
+                cb(id, "\u{2764}\u{FE0F}".to_string(), true);
+            }
         }
 
         /// Replace the reaction handler: message id, emoji, add or remove.
@@ -1709,6 +1734,14 @@ mod tests {
         );
         assert!(!strip.is_visible());
         assert!(strip.first_child().is_none());
+
+        // The double-click shortcut hearts whatever is bound now.
+        row.react_heart();
+        assert_eq!(
+            asked.borrow().last(),
+            Some(&("m2".to_string(), "\u{2764}\u{FE0F}".to_string(), true)),
+            "a double click asks to add the heart"
+        );
     }
 
     /// The context menu serves the bound message: Delete for Me hands the
