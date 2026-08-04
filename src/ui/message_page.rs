@@ -190,6 +190,9 @@ mod message_row {
 
         #[derive(Default)]
         pub struct MessageRow {
+            /// Bubble plus the reaction strip under it; halign takes the
+            /// message's side here.
+            pub column: RefCell<Option<gtk4::Box>>,
             pub bubble: RefCell<Option<gtk4::Box>>,
             pub text_label: RefCell<Option<gtk4::Label>>,
             pub embed_slot: RefCell<Option<gtk4::Box>>,
@@ -257,13 +260,15 @@ mod message_row {
             self.set_margin_top(3);
             self.set_margin_bottom(3);
 
-            // Without hexpand the row gives the bubble its natural width
+            // Without hexpand the row gives the column its natural width
             // and the halign flip in bind never moves anything; every
-            // message sat left. With it, halign places the bubble and the
-            // background still hugs the content.
+            // message sat left. With it, halign places the column and the
+            // bubble background still hugs the content.
+            let column = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+            column.set_hexpand(true);
+
             let bubble = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
             bubble.add_css_class("msg-bubble");
-            bubble.set_hexpand(true);
 
             // Wire text. Escaped and linkified by `set_linkified`; wrapped
             // WordChar so an unbroken run cannot widen the page.
@@ -308,18 +313,22 @@ mod message_row {
             let embed_slot = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
             bubble.append(&embed_slot);
 
-            // Reaction chips; bind rebuilds these per message too.
-            let reactions_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
-            reactions_box.set_visible(false);
-            bubble.append(&reactions_box);
-
             let time_label = gtk4::Label::new(None);
             time_label.add_css_class("dim-label");
             time_label.add_css_class("caption");
             time_label.set_halign(gtk4::Align::End);
             bubble.append(&time_label);
 
-            self.append(&bubble);
+            column.append(&bubble);
+
+            // Reaction chips hang on the bubble's bottom edge, outside it;
+            // bind rebuilds them per message.
+            let reactions_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+            reactions_box.add_css_class("msg-reactions");
+            reactions_box.set_visible(false);
+            column.append(&reactions_box);
+
+            self.append(&column);
 
             // React, copy, delete live behind a right click or long press
             // on the bubble.
@@ -439,6 +448,7 @@ mod message_row {
             bubble.add_controller(long_press);
 
             let imp = self.imp();
+            imp.column.replace(Some(column));
             imp.bubble.replace(Some(bubble));
             imp.text_label.replace(Some(text_label));
             imp.embed_slot.replace(Some(embed_slot));
@@ -455,15 +465,20 @@ mod message_row {
             imp.message.replace(Some(message.clone()));
             imp.my_did.replace(my_did.map(String::from));
 
+            if let Some(column) = imp.column.borrow().as_ref() {
+                column.set_halign(if mine {
+                    gtk4::Align::End
+                } else {
+                    gtk4::Align::Start
+                });
+            }
             if let Some(bubble) = imp.bubble.borrow().as_ref() {
                 if mine {
                     bubble.add_css_class("msg-out");
                     bubble.remove_css_class("msg-in");
-                    bubble.set_halign(gtk4::Align::End);
                 } else {
                     bubble.add_css_class("msg-in");
                     bubble.remove_css_class("msg-out");
-                    bubble.set_halign(gtk4::Align::Start);
                 }
                 let (_, full) = format_message_time(&message.sent_at);
                 bubble.set_tooltip_text(if full.is_empty() { None } else { Some(&full) });
@@ -489,7 +504,7 @@ mod message_row {
                 }
             }
 
-            self.rebuild_reaction_chips(message, my_did);
+            self.rebuild_reaction_chips(message, my_did, mine);
 
             if let Some(label) = imp.time_label.borrow().as_ref() {
                 let (short, _) = format_message_time(&message.sent_at);
@@ -500,7 +515,7 @@ mod message_row {
         /// One chip per distinct emoji, counted, in first-seen order. Your
         /// own chip is marked and clicking it takes the reaction back;
         /// clicking someone else's joins in.
-        fn rebuild_reaction_chips(&self, message: &ChatMessage, my_did: Option<&str>) {
+        fn rebuild_reaction_chips(&self, message: &ChatMessage, my_did: Option<&str>, mine: bool) {
             let imp = self.imp();
             let Some(strip) = imp.reactions_box.borrow().clone() else {
                 return;
@@ -509,6 +524,12 @@ mod message_row {
                 strip.remove(&child);
             }
             strip.set_visible(!message.reactions.is_empty());
+            // Hug the bubble's edge on the message's own side.
+            strip.set_halign(if mine {
+                gtk4::Align::End
+            } else {
+                gtk4::Align::Start
+            });
 
             let mut grouped: Vec<(String, u32, bool)> = Vec::new();
             for reaction in &message.reactions {
@@ -1603,7 +1624,8 @@ mod tests {
 
     fn hostile_message_text_renders_as_written_body() {
         let row = MessageRow::new();
-        let bubble = row.first_child().expect("the bubble");
+        let column = row.first_child().expect("the column");
+        let bubble = column.first_child().expect("the bubble");
         let label = bubble
             .first_child()
             .and_downcast::<gtk4::Label>()
@@ -1723,6 +1745,11 @@ mod tests {
 
         let strip = row.imp().reactions_box.borrow().clone().unwrap();
         assert!(strip.is_visible());
+        assert_eq!(
+            strip.halign(),
+            gtk4::Align::Start,
+            "their message wears its reactions on its own side"
+        );
 
         let mut chips = Vec::new();
         let mut child = strip.first_child();
@@ -1856,13 +1883,14 @@ mod tests {
 
     fn messages_take_their_sides_and_rebind_cleanly_body() {
         let row = MessageRow::new();
-        let bubble = row.first_child().expect("the bubble");
+        let column = row.first_child().expect("the column");
+        let bubble = column.first_child().expect("the bubble");
 
-        // Without hexpand the bubble only ever gets its natural width and
+        // Without hexpand the column only ever gets its natural width and
         // halign has nothing to place it in; every message sat left.
         assert!(
-            bubble.hexpands(),
-            "halign cannot take a side unless the bubble takes the row"
+            column.hexpands(),
+            "halign cannot take a side unless the column takes the row"
         );
 
         row.bind(
@@ -1870,7 +1898,7 @@ mod tests {
             true,
             Some("did:plc:me"),
         );
-        assert_eq!(bubble.halign(), gtk4::Align::End);
+        assert_eq!(column.halign(), gtk4::Align::End);
         assert!(bubble.has_css_class("msg-out"));
         assert!(!bubble.has_css_class("msg-in"));
 
@@ -1879,7 +1907,7 @@ mod tests {
             false,
             Some("did:plc:me"),
         );
-        assert_eq!(bubble.halign(), gtk4::Align::Start);
+        assert_eq!(column.halign(), gtk4::Align::Start);
         assert!(bubble.has_css_class("msg-in"));
         assert!(
             !bubble.has_css_class("msg-out"),
@@ -1906,7 +1934,8 @@ mod tests {
         shared.embed = Some(shared_post("the shared post"));
         row.bind(&shared, false, Some("did:plc:me"));
 
-        let bubble = row.first_child().expect("the bubble");
+        let column = row.first_child().expect("the column");
+        let bubble = column.first_child().expect("the bubble");
         let text_label = bubble
             .first_child()
             .and_downcast::<gtk4::Label>()

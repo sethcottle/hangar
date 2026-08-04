@@ -428,6 +428,22 @@ popover.menu > contents {
     text-decoration: underline;
 }
 
+/* Profile pages */
+.profile-banner {
+    background-color: alpha(@accent_bg_color, 0.2);
+}
+
+.profile-avatar {
+    border-radius: 50%;
+    box-shadow: 0 0 0 4px @window_bg_color;
+}
+
+.condensed-profile-bar {
+    background-color: @window_bg_color;
+    padding: 6px 12px;
+    border-bottom: 1px solid alpha(@borders, 0.6);
+}
+
 /* Shared posts in chat. The button supplies the card look; margins on the
    content box do the padding. */
 .msg-post-card {
@@ -438,12 +454,20 @@ popover.menu > contents {
     border-radius: 6px;
 }
 
-/* Reaction chips under a message */
+/* Reaction chips hang on the bubble's bottom edge */
+.msg-reactions {
+    margin-top: -10px;
+    margin-left: 10px;
+    margin-right: 10px;
+}
+
 .reaction-chip {
     padding: 1px 8px;
     border-radius: 10px;
     font-size: 0.85em;
     min-height: 0;
+    background-color: @card_bg_color;
+    border: 1px solid alpha(@borders, 0.8);
 }
 
 .reaction-chip-mine {

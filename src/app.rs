@@ -495,7 +495,7 @@ impl HangarApplication {
 
     /// The About dialog, separate from presenting so tests can read it.
     fn build_about_dialog() -> adw::AboutDialog {
-        adw::AboutDialog::builder()
+        let about = adw::AboutDialog::builder()
             .application_name("Hangar")
             .application_icon(config::APP_ID)
             .developer_name("Seth Cottle")
@@ -503,7 +503,21 @@ impl HangarApplication {
             .license_type(gtk4::License::Mpl20)
             .website("https://hangar.blue")
             .issue_url("https://github.com/sethcottle/hangar/issues")
-            .build()
+            .build();
+        // Standing on the shoulders of giants; each entry links home.
+        about.add_acknowledgement_section(
+            Some("Built On"),
+            &[
+                "GTK https://gtk.org",
+                "Libadwaita https://gitlab.gnome.org/GNOME/libadwaita",
+                "gtk-rs https://gtk-rs.org",
+                "GStreamer https://gstreamer.freedesktop.org",
+                "atrium https://github.com/atrium-rs/atrium",
+                "Tokio https://tokio.rs",
+                "SQLite https://sqlite.org",
+            ],
+        );
+        about
     }
 
     fn show_about(&self) {

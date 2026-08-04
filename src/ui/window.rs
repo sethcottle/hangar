@@ -244,6 +244,7 @@ mod imp {
         // Store current profile for updating UI
         pub current_profile: RefCell<Option<Profile>>,
         // Profile page widgets (for updating header)
+        pub profile_banner_picture: RefCell<Option<gtk4::Picture>>,
         pub profile_name_label: RefCell<Option<gtk4::Label>>,
         pub profile_handle_label: RefCell<Option<gtk4::Label>>,
         pub profile_bio_label: RefCell<Option<gtk4::Label>>,
@@ -1967,19 +1968,53 @@ impl HangarWindow {
 
         content_box.append(&header);
 
-        // Profile header section
+        // Everything above the posts scrolls with them; see the list below.
+        let header_block = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+
+        // Banner strip. A tinted strip stands in when the profile has none,
+        // so the avatar always has an edge to straddle.
+        let banner_frame = gtk4::Frame::new(None);
+        banner_frame.set_overflow(gtk4::Overflow::Hidden);
+        banner_frame.add_css_class("profile-banner");
+        banner_frame.set_hexpand(true);
+        banner_frame.set_size_request(-1, 140);
+        if let Some(banner_url) = &profile.banner {
+            let banner_picture = gtk4::Picture::new();
+            banner_picture.set_hexpand(true);
+            banner_picture.set_vexpand(true);
+            banner_picture.set_can_shrink(true);
+            banner_picture.set_content_fit(gtk4::ContentFit::Cover);
+            banner_frame.set_child(Some(&banner_picture));
+            crate::ui::avatar_cache::load_image_into_picture(banner_picture, banner_url.clone());
+        }
+
+        // Text stays off the banner; only the avatar overlaps it, so there
+        // is no contrast problem to scrim away.
         let profile_header = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
         profile_header.set_margin_start(16);
         profile_header.set_margin_end(16);
-        profile_header.set_margin_top(16);
+        // Room for the avatar's lower half hanging in from the banner.
+        profile_header.set_margin_top(52);
         profile_header.set_margin_bottom(16);
+
+        let header_column = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        header_column.append(&banner_frame);
+        header_column.append(&profile_header);
+
+        let header_overlay = gtk4::Overlay::new();
+        header_overlay.set_child(Some(&header_column));
 
         let avatar = adw::Avatar::new(80, Some(display_name), true);
         if let Some(avatar_url) = &profile.avatar {
             crate::ui::avatar_cache::load_avatar(avatar.clone(), avatar_url.clone());
         }
         avatar.set_halign(gtk4::Align::Center);
-        profile_header.append(&avatar);
+        avatar.set_valign(gtk4::Align::Start);
+        avatar.set_margin_top(96);
+        avatar.add_css_class("profile-avatar");
+        header_overlay.add_overlay(&avatar);
+
+        header_block.append(&header_overlay);
 
         let name_label = gtk4::Label::new(Some(display_name));
         name_label.add_css_class("title-1");
@@ -2005,11 +2040,13 @@ impl HangarWindow {
         // record URI lives in a cell shared with the app; each click hands
         // its button over and goes insensitive until the result comes back.
         let own_page = self.imp().current_user_did.borrow().as_deref() == Some(&profile.did);
+        // Shared with the condensed bar's copy of the button, so both read
+        // the same record URI.
+        let follow_uri = Rc::new(RefCell::new(profile.viewer_following.clone()));
         if !own_page {
             let buttons_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
             buttons_row.set_halign(gtk4::Align::Center);
 
-            let follow_uri = Rc::new(RefCell::new(profile.viewer_following.clone()));
             let follow_btn = gtk4::Button::new();
             follow_btn.add_css_class("pill");
             Self::sync_follow_button(&follow_btn, follow_uri.borrow().is_some());
@@ -2076,43 +2113,132 @@ impl HangarWindow {
             profile_header.append(&bio_label);
         }
 
-        content_box.append(&profile_header);
+        // The profile header itself is already in the tree through the
+        // banner overlay; only the separator and posts label follow it.
+        header_block.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
 
-        // Separator
-        let separator = gtk4::Separator::new(gtk4::Orientation::Horizontal);
-        content_box.append(&separator);
-
-        // Posts section label
         let posts_label = gtk4::Label::new(Some("Posts"));
         posts_label.add_css_class("title-4");
         posts_label.set_halign(gtk4::Align::Start);
         posts_label.set_margin_start(16);
         posts_label.set_margin_top(12);
         posts_label.set_margin_bottom(8);
-        content_box.append(&posts_label);
+        header_block.append(&posts_label);
 
-        // Build posts list
+        // The page is built once with its posts; nothing arrives later, so
+        // an empty list can say so statically.
+        if no_posts {
+            let none = gtk4::Label::new(Some("No posts yet"));
+            none.add_css_class("dim-label");
+            none.set_margin_top(12);
+            none.set_margin_bottom(12);
+            header_block.append(&none);
+        }
+
+        // The header scrolls with the posts: row 0 of the list is a marker
+        // the factory answers with the header widget. Same mechanism as the
+        // own profile page; see `build_own_profile_content`.
         let model = gio::ListStore::new::<PostObject>();
+        let header_marker = gio::ListStore::new::<gtk4::StringObject>();
+        header_marker.append(&gtk4::StringObject::new("profile-header"));
+        let sections = gio::ListStore::new::<gio::ListStore>();
+        sections.append(&header_marker);
+        sections.append(&model);
+        let flattened = gtk4::FlattenListModel::new(Some(sections));
+
+        // The header parks here whenever no slot holds it, so it stays
+        // findable and dies with the page.
+        let parking = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        parking.set_visible(false);
+        parking.append(&header_block);
+        content_box.append(&parking);
+
         let factory = gtk4::SignalListItemFactory::new();
 
+        // Each slot can be either row; see `build_own_profile_content` for
+        // why this is a box with a hidden host and not a stack.
         factory.connect_setup(|_, item| {
+            let Some(list_item) = item.downcast_ref::<gtk4::ListItem>() else {
+                return;
+            };
+            let slot = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+            let header_host = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+            header_host.set_visible(false);
             let post_row = PostRow::new();
-            if let Some(list_item) = item.downcast_ref::<gtk4::ListItem>() {
-                list_item.set_child(Some(&post_row));
-            }
+            slot.append(&header_host);
+            slot.append(&post_row);
+            list_item.set_child(Some(&slot));
         });
         Self::release_video_on_unbind(&factory);
 
+        let header_for_unbind = header_block.clone();
+        let parking_for_unbind = parking.clone();
+        factory.connect_unbind(move |_, item| {
+            let Some(list_item) = item.downcast_ref::<gtk4::ListItem>() else {
+                return;
+            };
+            let Some(host) = header_for_unbind.parent().and_downcast::<gtk4::Box>() else {
+                return;
+            };
+            if host.parent() != list_item.child() {
+                return;
+            }
+            host.remove(&header_for_unbind);
+            host.set_visible(false);
+            parking_for_unbind.append(&header_for_unbind);
+        });
+
         let win = self.downgrade();
+        let header_for_bind = header_block.clone();
         factory.connect_bind(move |_, item| {
             let Some(win) = win.upgrade() else {
                 return;
             };
-            if let Some(list_item) = item.downcast_ref::<gtk4::ListItem>()
-                && let Some(post_object) = list_item.item().and_downcast::<PostObject>()
-                && let Some(post) = post_object.post()
-                && let Some(post_row) = list_item.child().and_downcast::<PostRow>()
+            let Some(list_item) = item.downcast_ref::<gtk4::ListItem>() else {
+                return;
+            };
+            let slot = list_item.child().and_downcast::<gtk4::Box>();
+            let host = slot
+                .as_ref()
+                .and_then(|slot| slot.first_child())
+                .and_downcast::<gtk4::Box>();
+
+            // Row 0: the header takes this slot.
+            if list_item
+                .item()
+                .and_downcast::<gtk4::StringObject>()
+                .is_some()
             {
+                if let Some(host) = host.as_ref() {
+                    if let Some(previous) = header_for_bind.parent().and_downcast::<gtk4::Box>() {
+                        previous.remove(&header_for_bind);
+                        previous.set_visible(false);
+                    }
+                    host.append(&header_for_bind);
+                    host.set_visible(true);
+                    if let Some(post_row) = host.next_sibling() {
+                        post_row.set_visible(false);
+                    }
+                }
+                return;
+            }
+
+            // An ordinary post. Reclaim the header if this slot held it.
+            if let Some(host) = host.as_ref() {
+                if header_for_bind.parent().as_ref() == Some(host.upcast_ref::<gtk4::Widget>()) {
+                    host.remove(&header_for_bind);
+                }
+                host.set_visible(false);
+            }
+
+            if let Some(post_object) = list_item.item().and_downcast::<PostObject>()
+                && let Some(post) = post_object.post()
+                && let Some(post_row) = host
+                    .as_ref()
+                    .and_then(|host| host.next_sibling())
+                    .and_downcast::<PostRow>()
+            {
+                post_row.set_visible(true);
                 post_row.bind(&post);
                 // Wire up like/repost/reply/quote callbacks
                 let post_for_like = post.clone();
@@ -2177,7 +2303,7 @@ impl HangarWindow {
             model.append(&PostObject::new(post));
         }
 
-        let selection = gtk4::NoSelection::new(Some(model));
+        let selection = gtk4::NoSelection::new(Some(flattened));
         let list_view = gtk4::ListView::new(Some(selection), Some(factory));
         list_view.add_css_class("background");
 
@@ -2195,15 +2321,97 @@ impl HangarWindow {
         scrolled.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
         scrolled.set_child(Some(&clamp));
 
-        // The page is built once with its posts; nothing arrives later, so
-        // an empty list can say so statically.
-        if no_posts {
-            let none = gtk4::Label::new(Some("No posts yet"));
-            none.add_css_class("dim-label");
-            none.set_margin_top(12);
-            content_box.append(&none);
+        // A condensed bar keeps who and the actions in reach once the full
+        // header has scrolled away.
+        let bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        bar.add_css_class("condensed-profile-bar");
+
+        let bar_avatar = adw::Avatar::new(24, Some(display_name), true);
+        if let Some(avatar_url) = &profile.avatar {
+            crate::ui::avatar_cache::load_avatar(bar_avatar.clone(), avatar_url.clone());
         }
-        content_box.append(&scrolled);
+        bar.append(&bar_avatar);
+
+        let bar_name = gtk4::Label::new(Some(display_name));
+        bar_name.add_css_class("heading");
+        bar_name.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        bar.append(&bar_name);
+
+        let bar_spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        bar_spacer.set_hexpand(true);
+        bar.append(&bar_spacer);
+
+        let bar_follow = gtk4::Button::new();
+        if !own_page {
+            bar_follow.add_css_class("pill");
+            Self::sync_follow_button(&bar_follow, follow_uri.borrow().is_some());
+            let win = self.downgrade();
+            let did = profile.did.clone();
+            let uri_cell = follow_uri.clone();
+            bar_follow.connect_clicked(move |btn| {
+                let Some(win) = win.upgrade() else {
+                    return;
+                };
+                if let Some(cb) = win.imp().follow_callback.borrow().as_ref() {
+                    let following = uri_cell.borrow().is_some();
+                    HangarWindow::sync_follow_button(btn, !following);
+                    btn.set_sensitive(false);
+                    cb(did.clone(), uri_cell.clone(), btn.downgrade());
+                }
+            });
+            bar.append(&bar_follow);
+
+            let bar_message = gtk4::Button::with_label("Message");
+            bar_message.add_css_class("pill");
+            let win = self.downgrade();
+            let profile_for_message = profile.clone();
+            bar_message.connect_clicked(move |btn| {
+                let Some(win) = win.upgrade() else {
+                    return;
+                };
+                if let Some(cb) = win.imp().message_callback.borrow().as_ref() {
+                    btn.set_sensitive(false);
+                    cb(profile_for_message.clone(), btn.downgrade());
+                }
+            });
+            bar.append(&bar_message);
+        }
+
+        let revealer = gtk4::Revealer::new();
+        revealer.set_transition_type(gtk4::RevealerTransitionType::SlideDown);
+        revealer.set_valign(gtk4::Align::Start);
+        revealer.set_child(Some(&bar));
+
+        // Reveal once the full header is out of view. Re-sync the bar's
+        // follow button on each toggle; the header's copy may have settled
+        // a different state while the bar was hidden.
+        let revealer_weak = revealer.downgrade();
+        let bar_follow_weak = bar_follow.downgrade();
+        let uri_cell = follow_uri.clone();
+        let bar_own_page = own_page;
+        scrolled.vadjustment().connect_value_changed(move |adj| {
+            let Some(revealer) = revealer_weak.upgrade() else {
+                return;
+            };
+            let past_header = adj.value() > 240.0;
+            if revealer.reveals_child() != past_header {
+                revealer.set_reveal_child(past_header);
+                if past_header && !bar_own_page {
+                    if let Some(btn) = bar_follow_weak.upgrade() {
+                        if btn.is_sensitive() {
+                            HangarWindow::sync_follow_button(&btn, uri_cell.borrow().is_some());
+                        }
+                    }
+                }
+            }
+        });
+
+        let list_overlay = gtk4::Overlay::new();
+        list_overlay.set_vexpand(true);
+        list_overlay.set_child(Some(&scrolled));
+        list_overlay.add_overlay(&revealer);
+
+        content_box.append(&list_overlay);
 
         // The tag is set by push_profile_page, which derives it from the DID so
         // two different profiles cannot collide.
@@ -3261,12 +3469,21 @@ impl HangarWindow {
     fn build_profile_header_section(&self) -> gtk4::Box {
         let header_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
 
-        // Banner placeholder (will be updated when profile loads)
+        // Banner: the placeholder color shows until a profile with a banner
+        // image loads into the picture.
         let banner_overlay = gtk4::Overlay::new();
         banner_overlay.set_height_request(150);
 
         let banner_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         banner_box.add_css_class("profile-banner-placeholder");
+        banner_box.set_overflow(gtk4::Overflow::Hidden);
+        let banner_picture = gtk4::Picture::new();
+        banner_picture.set_hexpand(true);
+        banner_picture.set_vexpand(true);
+        banner_picture.set_can_shrink(true);
+        banner_picture.set_content_fit(gtk4::ContentFit::Cover);
+        banner_picture.set_visible(false);
+        banner_box.append(&banner_picture);
         banner_overlay.set_child(Some(&banner_box));
 
         // Avatar overlaid on banner (positioned at bottom)
@@ -3378,6 +3595,7 @@ impl HangarWindow {
         imp.profile_name_label.replace(Some(name_label));
         imp.profile_handle_label.replace(Some(handle_label));
         imp.profile_bio_label.replace(Some(bio_label));
+        imp.profile_banner_picture.replace(Some(banner_picture));
         imp.profile_avatar.replace(Some(avatar));
         imp.profile_followers_label.replace(Some(followers_count));
         imp.profile_following_label.replace(Some(following_count));
@@ -3486,6 +3704,17 @@ impl HangarWindow {
         imp.current_profile.replace(Some(profile.clone()));
 
         let display_name = profile.display_name.as_deref().unwrap_or(&profile.handle);
+
+        // Banner, over the placeholder color when the profile has one
+        if let Some(picture) = imp.profile_banner_picture.borrow().as_ref() {
+            match &profile.banner {
+                Some(url) => {
+                    picture.set_visible(true);
+                    crate::ui::avatar_cache::load_image_into_picture(picture.clone(), url.clone());
+                }
+                None => picture.set_visible(false),
+            }
+        }
 
         // Update name
         if let Some(label) = imp.profile_name_label.borrow().as_ref() {
@@ -5743,7 +5972,6 @@ mod activity_row {
             pub post_author_avatar: RefCell<Option<adw::Avatar>>,
             pub post_author_label: RefCell<Option<gtk4::Label>>,
             pub post_text_label: RefCell<Option<gtk4::Label>>,
-            pub post_time_label: RefCell<Option<gtk4::Label>>,
             pub profile_clicked_callback:
                 RefCell<Option<Box<dyn Fn(&super::ActivityRow) + 'static>>>,
             pub clicked_callback: RefCell<Option<Box<dyn Fn(&super::ActivityRow) + 'static>>>,
@@ -5792,8 +6020,11 @@ mod activity_row {
             // Main content box (horizontal: avatar + content)
             let main_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
 
-            // Avatar with badge overlay
+            // Avatar with badge overlay. Top-aligned: left to fill, a tall
+            // row (embedded card) stretched the overlay and the badge sank
+            // to the row's bottom, nowhere near the avatar.
             let avatar_overlay = gtk4::Overlay::new();
+            avatar_overlay.set_valign(gtk4::Align::Start);
             let avatar = adw::Avatar::new(48, None, true);
             avatar_overlay.set_child(Some(&avatar));
 
@@ -5867,15 +6098,8 @@ mod activity_row {
             post_author_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
             post_header.append(&post_author_label);
 
-            let post_spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-            post_spacer.set_hexpand(true);
-            post_header.append(&post_spacer);
-
-            let post_time_label = gtk4::Label::new(None);
-            post_time_label.add_css_class("dim-label");
-            post_time_label.add_css_class("caption");
-            post_header.append(&post_time_label);
-
+            // No date in the card: the row already carries the event time,
+            // and a reply's card repeated it to the pixel.
             card_inner.append(&post_header);
 
             // Post text
@@ -5921,7 +6145,6 @@ mod activity_row {
             imp.post_author_avatar.replace(Some(post_author_avatar));
             imp.post_author_label.replace(Some(post_author_label));
             imp.post_text_label.replace(Some(post_text_label));
-            imp.post_time_label.replace(Some(post_time_label));
         }
 
         pub fn bind(&self, notification: &Notification) {
@@ -5941,9 +6164,11 @@ mod activity_row {
                 }
             }
 
-            // Badge icon based on reason
+            // Badge icon based on reason. The like badge matches the like
+            // button; emblem-favorite went missing from newer icon themes
+            // and rendered as the broken-image glyph.
             let icon_name = match notification.reason.as_str() {
-                "like" => "emblem-favorite-symbolic",
+                "like" => "emote-love-symbolic",
                 "repost" => "media-playlist-repeat-symbolic",
                 "follow" => "system-users-symbolic",
                 "mention" => "chat-message-new-symbolic",
@@ -6021,11 +6246,6 @@ mod activity_row {
                 // Post text
                 if let Some(label) = imp.post_text_label.borrow().as_ref() {
                     label.set_text(&post.text);
-                }
-
-                // Post time
-                if let Some(label) = imp.post_time_label.borrow().as_ref() {
-                    label.set_text(&Self::format_relative_time(&post.indexed_at));
                 }
             } else {
                 if let Some(card) = imp.post_card.borrow().as_ref() {
@@ -7096,12 +7316,17 @@ mod tests {
             .expect("the pushed profile page is in the stack");
         let profile_list = find_list_view(&profile_page.clone().upcast::<gtk4::Widget>())
             .expect("the pushed profile page has a list");
+        // Header marker store first, posts store second; see
+        // `build_profile_page`.
         let profile_model = profile_list
             .model()
             .and_then(|m| m.downcast::<gtk4::NoSelection>().ok())
             .and_then(|ns| ns.model())
+            .and_downcast::<gtk4::FlattenListModel>()
+            .and_then(|flat| flat.model())
+            .and_then(|sections| sections.item(1))
             .and_downcast::<gio::ListStore>()
-            .expect("the pushed profile list sits on a plain store");
+            .expect("the pushed profile list flattens a header and a post store");
         assert_eq!(
             uris(&profile_model),
             vec![a_post("kept").uri],
@@ -7279,6 +7504,64 @@ mod tests {
                 .and_downcast::<gtk4::Label>()
                 .is_some_and(|l| l.text() == "following"),
             "a missing count leaves the word as the whole stat"
+        );
+
+        window.destroy();
+    }
+
+    /// A pushed profile page holds one list whose first row is the header
+    /// marker, so the whole page scrolls; the condensed bar waits unrevealed
+    /// on top of the scroller.
+    #[test]
+    fn the_profile_page_scrolls_whole_with_a_waiting_bar() {
+        crate::ui::with_gtk(the_profile_page_scrolls_whole_with_a_waiting_bar_body);
+    }
+
+    fn the_profile_page_scrolls_whole_with_a_waiting_bar_body() {
+        let window: HangarWindow = glib::Object::builder().build();
+
+        let profile = Profile::minimal(
+            "did:plc:scrolls".into(),
+            "scrolls.bsky.social".into(),
+            None,
+            None,
+        );
+        window.push_profile_page(&profile, vec![a_post("p1"), a_post("p2")]);
+
+        let nav_view = window.imp().home_nav_view.borrow().clone().unwrap();
+        let page = nav_view.find_page("profile:did:plc:scrolls").unwrap();
+
+        let list = find_list_view(&page.clone().upcast::<gtk4::Widget>())
+            .expect("the profile page has its list");
+        let flattened = list
+            .model()
+            .and_then(|m| m.downcast::<gtk4::NoSelection>().ok())
+            .and_then(|ns| ns.model())
+            .and_downcast::<gtk4::FlattenListModel>()
+            .expect("the header rides the list as its first row");
+        assert_eq!(flattened.n_items(), 3, "marker plus two posts");
+        assert!(
+            flattened
+                .item(0)
+                .and_downcast::<gtk4::StringObject>()
+                .is_some(),
+            "row 0 is the header marker"
+        );
+
+        let mut widgets = Vec::new();
+        walk(&page.clone().upcast::<gtk4::Widget>(), 0, &mut widgets);
+        let revealer = widgets
+            .iter()
+            .find_map(|(_, w)| {
+                let r = w.downcast_ref::<gtk4::Revealer>()?;
+                r.child()?
+                    .has_css_class("condensed-profile-bar")
+                    .then(|| r.clone())
+            })
+            .expect("the condensed bar sits in a revealer");
+        assert!(
+            !revealer.reveals_child(),
+            "the bar waits for the header to scroll away"
         );
 
         window.destroy();
