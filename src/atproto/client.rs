@@ -2328,7 +2328,7 @@ impl HangarClient {
             .into_iter()
             .filter_map(|msg| match msg {
                 Union::Refs(OutputMessagesItem::ChatBskyConvoDefsMessageView(view)) => {
-                    Some(Self::chat_message_from_view(&view))
+                    Some(self.chat_message_from_view(&view))
                 }
                 // Skip deleted messages
                 Union::Refs(OutputMessagesItem::ChatBskyConvoDefsDeletedMessageView(_)) => None,
@@ -2364,7 +2364,7 @@ impl HangarClient {
 
         let last_message = convo.data.last_message.as_ref().and_then(|msg| match msg {
             Union::Refs(ConvoViewLastMessageRefs::MessageView(view)) => {
-                Some(Self::chat_message_from_view(view))
+                Some(self.chat_message_from_view(view))
             }
             _ => None,
         });
@@ -2380,13 +2380,27 @@ impl HangarClient {
 
     /// Convert an atrium MessageView to our ChatMessage type
     fn chat_message_from_view(
+        &self,
         view: &atrium_api::chat::bsky::convo::defs::MessageView,
     ) -> ChatMessage {
+        use atrium_api::chat::bsky::convo::defs::MessageViewEmbedRefs;
+        use atrium_api::types::Union;
+
+        // The chat lexicon's only embed is a record view, a post shared
+        // into the conversation.
+        let embed = view.data.embed.as_ref().and_then(|e| match e {
+            Union::Refs(MessageViewEmbedRefs::AppBskyEmbedRecordView(record_view)) => {
+                self.extract_quote_embed(&record_view.data.record)
+            }
+            Union::Unknown(_) => None,
+        });
+
         ChatMessage {
             id: view.data.id.clone(),
             text: view.data.text.clone(),
             sender_did: view.data.sender.data.did.to_string(),
             sent_at: view.data.sent_at.as_str().to_string(),
+            embed,
         }
     }
 
@@ -2428,7 +2442,7 @@ impl HangarClient {
             .await
             .map_err(|e| self.xrpc_error(e))?;
 
-        Ok(Self::chat_message_from_view(&output))
+        Ok(self.chat_message_from_view(&output))
         })
     }
 
@@ -3284,10 +3298,51 @@ mod tests {
         }
         .into();
 
-        let message = HangarClient::chat_message_from_view(&view);
+        let client = HangarClient::new();
+        let message = client.chat_message_from_view(&view);
         assert_eq!(message.id, "3kmsgid");
         assert_eq!(message.text, "hi there & <hello>");
         assert_eq!(message.sender_did, "did:plc:sender");
         assert_eq!(message.sent_at, "2026-01-01T00:00:00Z");
+        assert!(message.embed.is_none());
+    }
+
+    /// A post shared into a conversation comes through as a quote embed;
+    /// its own media rides along for the card to hint at.
+    #[test]
+    fn a_shared_post_rides_the_message_as_a_quote() {
+        let view: atrium_api::chat::bsky::convo::defs::MessageView =
+            serde_json::from_value(serde_json::json!({
+                "id": "3kmsgid",
+                "rev": "22",
+                "text": "look at this",
+                "sender": { "did": "did:plc:sender" },
+                "sentAt": "2026-01-01T00:00:00Z",
+                "embed": {
+                    "$type": "app.bsky.embed.record#view",
+                    "record": {
+                        "$type": "app.bsky.embed.record#viewRecord",
+                        "uri": "at://did:plc:author/app.bsky.feed.post/shared",
+                        "cid": "bafyreidfayvfuwqa7qlnopdjiqrxzs6blmoeu4rujcjtnci5beludirz2a",
+                        "author": { "did": "did:plc:author", "handle": "author.bsky.social" },
+                        "value": {
+                            "$type": "app.bsky.feed.post",
+                            "text": "the shared post",
+                            "createdAt": "2026-01-01T00:00:00Z"
+                        },
+                        "indexedAt": "2026-01-01T00:00:00Z"
+                    }
+                }
+            }))
+            .expect("a valid message view");
+
+        let client = HangarClient::new();
+        let message = client.chat_message_from_view(&view);
+        let Some(Embed::Quote(quote)) = message.embed else {
+            panic!("the shared post is a quote embed");
+        };
+        assert_eq!(quote.uri, "at://did:plc:author/app.bsky.feed.post/shared");
+        assert_eq!(quote.text, "the shared post");
+        assert_eq!(quote.author.handle, "author.bsky.social");
     }
 }

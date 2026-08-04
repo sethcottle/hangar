@@ -2627,6 +2627,17 @@ impl HangarWindow {
             }
         });
 
+        // Shared posts open their thread, on the chat stack.
+        let win = self.downgrade();
+        page.set_post_clicked_callback(move |post| {
+            let Some(win) = win.upgrade() else {
+                return;
+            };
+            if let Some(cb) = win.imp().post_clicked_callback.borrow().as_ref() {
+                cb(post);
+            }
+        });
+
         let content_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         content_box.set_hexpand(true);
 

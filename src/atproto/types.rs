@@ -372,4 +372,8 @@ pub struct ChatMessage {
     pub sender_did: String,
     /// When the message was sent
     pub sent_at: String,
+    /// A post shared into the conversation. The chat lexicon only allows
+    /// record embeds, so this is always a quote when present.
+    #[serde(default)]
+    pub embed: Option<Embed>,
 }

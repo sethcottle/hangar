@@ -14,7 +14,8 @@
 //! the top and the scroll position is nudged to keep the same messages in
 //! view.
 
-use crate::atproto::{ChatMessage, Conversation};
+use crate::atproto::{ChatMessage, Conversation, Embed, Post, QuoteEmbed};
+use crate::ui::avatar_cache;
 use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
 use gtk4::{gio, glib};
@@ -124,8 +125,10 @@ mod message_row {
         pub struct MessageRow {
             pub bubble: RefCell<Option<gtk4::Box>>,
             pub text_label: RefCell<Option<gtk4::Label>>,
+            pub embed_slot: RefCell<Option<gtk4::Box>>,
             pub time_label: RefCell<Option<gtk4::Label>>,
             pub mention_callback: RefCell<Option<Box<dyn Fn(String) + 'static>>>,
+            pub post_callback: RefCell<Option<Box<dyn Fn(Post) + 'static>>>,
         }
 
         #[glib::object_subclass]
@@ -167,8 +170,13 @@ mod message_row {
             self.set_margin_top(3);
             self.set_margin_bottom(3);
 
+            // Without hexpand the row gives the bubble its natural width
+            // and the halign flip in bind never moves anything; every
+            // message sat left. With it, halign places the bubble and the
+            // background still hugs the content.
             let bubble = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
             bubble.add_css_class("msg-bubble");
+            bubble.set_hexpand(true);
 
             // Wire text. Escaped and linkified by `set_linkified`; wrapped
             // WordChar so an unbroken run cannot widen the page.
@@ -201,6 +209,10 @@ mod message_row {
             });
             bubble.append(&text_label);
 
+            // A shared post's card goes here; bind rebuilds it per message.
+            let embed_slot = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+            bubble.append(&embed_slot);
+
             let time_label = gtk4::Label::new(None);
             time_label.add_css_class("dim-label");
             time_label.add_css_class("caption");
@@ -212,6 +224,7 @@ mod message_row {
             let imp = self.imp();
             imp.bubble.replace(Some(bubble));
             imp.text_label.replace(Some(text_label));
+            imp.embed_slot.replace(Some(embed_slot));
             imp.time_label.replace(Some(time_label));
         }
 
@@ -236,6 +249,17 @@ mod message_row {
 
             if let Some(label) = imp.text_label.borrow().as_ref() {
                 crate::ui::rich_text::set_linkified(label, &message.text);
+                // A post shared without a comment has no text of its own.
+                label.set_visible(!message.text.is_empty());
+            }
+
+            if let Some(slot) = imp.embed_slot.borrow().as_ref() {
+                while let Some(child) = slot.first_child() {
+                    slot.remove(&child);
+                }
+                if let Some(Embed::Quote(quote)) = &message.embed {
+                    slot.append(&self.shared_post_card(quote));
+                }
             }
 
             if let Some(label) = imp.time_label.borrow().as_ref() {
@@ -244,11 +268,179 @@ mod message_row {
             }
         }
 
+        /// Compact card for a post shared into the conversation: author,
+        /// text, and a hint of its media. Clicking opens the thread, where
+        /// the media plays for real. A Button, unlike the feed's quote
+        /// card: nothing inside this one takes clicks of its own.
+        fn shared_post_card(&self, quote: &QuoteEmbed) -> gtk4::Button {
+            let card = gtk4::Button::new();
+            card.add_css_class("card");
+            card.add_css_class("msg-post-card");
+
+            let content = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
+            content.set_margin_start(10);
+            content.set_margin_end(10);
+            content.set_margin_top(8);
+            content.set_margin_bottom(8);
+
+            let author_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+            let avatar = adw::Avatar::new(20, None, true);
+            let author_name = quote
+                .author
+                .display_name
+                .as_deref()
+                .unwrap_or(&quote.author.handle);
+            avatar.set_text(Some(author_name));
+            if let Some(url) = &quote.author.avatar {
+                avatar_cache::load_avatar(avatar.clone(), url.clone());
+            }
+            author_row.append(&avatar);
+
+            let name_label = gtk4::Label::new(Some(author_name));
+            name_label.add_css_class("heading");
+            name_label.add_css_class("caption");
+            name_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+            author_row.append(&name_label);
+
+            let handle_label = gtk4::Label::new(Some(&format!("@{}", quote.author.handle)));
+            handle_label.add_css_class("dim-label");
+            handle_label.add_css_class("caption");
+            handle_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+            author_row.append(&handle_label);
+            content.append(&author_row);
+
+            if !quote.text.is_empty() {
+                let text_label = gtk4::Label::new(Some(&quote.text));
+                text_label.set_halign(gtk4::Align::Start);
+                text_label.set_xalign(0.0);
+                text_label.set_wrap(true);
+                text_label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+                text_label.set_max_width_chars(45);
+                text_label.add_css_class("caption");
+                content.append(&text_label);
+            }
+
+            if let Some(nested) = &quote.embed {
+                content.append(&Self::media_hint(nested));
+            }
+
+            card.set_child(Some(&content));
+            card.update_property(&[gtk4::accessible::Property::Label(&format!(
+                "Shared post by {author_name}"
+            ))]);
+
+            // The card is the whole post as far as navigation cares.
+            let post = Post {
+                uri: quote.uri.clone(),
+                cid: quote.cid.clone(),
+                author: quote.author.clone(),
+                text: quote.text.clone(),
+                created_at: quote.indexed_at.clone(),
+                indexed_at: quote.indexed_at.clone(),
+                like_count: None,
+                repost_count: None,
+                reply_count: None,
+                embed: quote.embed.as_deref().cloned(),
+                viewer_like: None,
+                viewer_repost: None,
+                viewer_bookmarked: None,
+                repost_reason: None,
+                reply_context: None,
+            };
+            let row_weak = self.downgrade();
+            card.connect_clicked(move |_| {
+                if let Some(row) = row_weak.upgrade()
+                    && let Some(cb) = row.imp().post_callback.borrow().as_ref()
+                {
+                    cb(post.clone());
+                }
+            });
+            card
+        }
+
+        /// Thumbnails for images, a labeled chip for everything else. The
+        /// thread view the card opens does the real rendering.
+        fn media_hint(embed: &Embed) -> gtk4::Widget {
+            match embed {
+                Embed::Images(images) => {
+                    let strip = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+                    for img in images.iter().take(4) {
+                        let frame = gtk4::Frame::new(None);
+                        frame.set_overflow(gtk4::Overflow::Hidden);
+                        frame.add_css_class("msg-card-thumb");
+                        frame.set_size_request(72, 72);
+                        let picture = gtk4::Picture::new();
+                        picture.set_can_shrink(true);
+                        picture.set_content_fit(gtk4::ContentFit::Cover);
+                        if !img.alt.is_empty() {
+                            picture.set_tooltip_text(Some(&img.alt));
+                        }
+                        frame.set_child(Some(&picture));
+                        avatar_cache::load_image_into_picture(picture, img.thumb.clone());
+                        strip.append(&frame);
+                    }
+                    strip.upcast()
+                }
+                Embed::Video(video) => match &video.thumbnail {
+                    Some(thumb) => {
+                        let frame = gtk4::Frame::new(None);
+                        frame.set_overflow(gtk4::Overflow::Hidden);
+                        frame.add_css_class("msg-card-thumb");
+                        frame.set_size_request(128, 72);
+                        frame.set_halign(gtk4::Align::Start);
+                        let picture = gtk4::Picture::new();
+                        picture.set_can_shrink(true);
+                        picture.set_content_fit(gtk4::ContentFit::Cover);
+                        if let Some(alt) = video.alt.as_deref().filter(|a| !a.is_empty()) {
+                            picture.set_tooltip_text(Some(alt));
+                        }
+                        frame.set_child(Some(&picture));
+                        avatar_cache::load_image_into_picture(picture, thumb.clone());
+                        frame.upcast()
+                    }
+                    None => Self::media_chip("video-x-generic-symbolic", "Video"),
+                },
+                Embed::External(external) => {
+                    if crate::atproto::gif::detect(&external.uri).is_some() {
+                        Self::media_chip("image-x-generic-symbolic", "GIF")
+                    } else {
+                        let label = if external.title.is_empty() {
+                            &external.uri
+                        } else {
+                            &external.title
+                        };
+                        Self::media_chip("emblem-symbolic-link", label)
+                    }
+                }
+                Embed::Quote(_) | Embed::QuoteWithMedia { .. } => {
+                    Self::media_chip("mail-forward-symbolic", "Quoted post")
+                }
+            }
+        }
+
+        fn media_chip(icon: &str, text: &str) -> gtk4::Widget {
+            let chip = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+            chip.set_halign(gtk4::Align::Start);
+            chip.append(&gtk4::Image::from_icon_name(icon));
+            let label = gtk4::Label::new(Some(text));
+            label.add_css_class("dim-label");
+            label.add_css_class("caption");
+            label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+            label.set_max_width_chars(40);
+            chip.append(&label);
+            chip.upcast()
+        }
+
         /// Replace the handler run when a mention in the text is activated.
         pub fn set_mention_callback<F: Fn(String) + 'static>(&self, callback: F) {
             self.imp()
                 .mention_callback
                 .replace(Some(Box::new(callback)));
+        }
+
+        /// Replace the handler run when a shared post's card is activated.
+        pub fn set_post_callback<F: Fn(Post) + 'static>(&self, callback: F) {
+            self.imp().post_callback.replace(Some(Box::new(callback)));
         }
     }
 
@@ -300,6 +492,7 @@ mod imp {
         pub retry_callback: RefCell<Option<Box<dyn Fn() + 'static>>>,
         pub send_callback: RefCell<Option<Box<dyn Fn(String) + 'static>>>,
         pub mention_clicked_callback: RefCell<Option<Box<dyn Fn(String) + 'static>>>,
+        pub post_clicked_callback: RefCell<Option<Box<dyn Fn(Post) + 'static>>>,
     }
 
     #[glib::object_subclass]
@@ -391,6 +584,15 @@ impl MessagePage {
                     };
                     if let Some(cb) = page.imp().mention_clicked_callback.borrow().as_ref() {
                         cb(handle);
+                    }
+                });
+                let page_weak = page.downgrade();
+                row.set_post_callback(move |post| {
+                    let Some(page) = page_weak.upgrade() else {
+                        return;
+                    };
+                    if let Some(cb) = page.imp().post_clicked_callback.borrow().as_ref() {
+                        cb(post);
                     }
                 });
             }
@@ -871,6 +1073,13 @@ impl MessagePage {
             .mention_clicked_callback
             .replace(Some(Box::new(callback)));
     }
+
+    /// Replace the handler run when a shared post's card is activated.
+    pub fn set_post_clicked_callback<F: Fn(Post) + 'static>(&self, callback: F) {
+        self.imp()
+            .post_clicked_callback
+            .replace(Some(Box::new(callback)));
+    }
 }
 
 #[cfg(test)]
@@ -886,7 +1095,24 @@ mod tests {
             text: text.into(),
             sender_did: sender.into(),
             sent_at: "2026-01-01T12:00:00Z".into(),
+            embed: None,
         }
+    }
+
+    fn shared_post(text: &str) -> Embed {
+        Embed::Quote(QuoteEmbed {
+            uri: "at://did:plc:author/app.bsky.feed.post/shared".into(),
+            cid: "cid".into(),
+            author: Profile::minimal(
+                "did:plc:author".into(),
+                "author.bsky.social".into(),
+                Some("Author".into()),
+                None,
+            ),
+            text: text.into(),
+            indexed_at: "2026-01-01T00:00:00Z".into(),
+            embed: None,
+        })
     }
 
     fn conversation() -> Conversation {
@@ -989,6 +1215,13 @@ mod tests {
         let row = MessageRow::new();
         let bubble = row.first_child().expect("the bubble");
 
+        // Without hexpand the bubble only ever gets its natural width and
+        // halign has nothing to place it in; every message sat left.
+        assert!(
+            bubble.hexpands(),
+            "halign cannot take a side unless the bubble takes the row"
+        );
+
         row.bind(&message("m1", "did:plc:me", "mine"), true);
         assert_eq!(bubble.halign(), gtk4::Align::End);
         assert!(bubble.has_css_class("msg-out"));
@@ -1001,6 +1234,74 @@ mod tests {
             !bubble.has_css_class("msg-out"),
             "a recycled row must shed the other side's styling"
         );
+    }
+
+    /// A shared post renders as a card that opens the post once, and a
+    /// recycled row drops the card with the message that owned it.
+    #[test]
+    fn a_shared_post_card_opens_its_post_and_leaves_with_it() {
+        crate::ui::with_gtk(a_shared_post_card_opens_its_post_and_leaves_with_it_body);
+    }
+
+    fn a_shared_post_card_opens_its_post_and_leaves_with_it_body() {
+        let row = MessageRow::new();
+        let opened: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(vec![]));
+        let sink = opened.clone();
+        row.set_post_callback(move |post| {
+            sink.borrow_mut().push(post.uri);
+        });
+
+        let mut shared = message("m1", "did:plc:them", "");
+        shared.embed = Some(shared_post("the shared post"));
+        row.bind(&shared, false);
+
+        let bubble = row.first_child().expect("the bubble");
+        let text_label = bubble
+            .first_child()
+            .and_downcast::<gtk4::Label>()
+            .expect("the text label");
+        assert!(
+            !text_label.is_visible(),
+            "a share without a comment shows no empty text line"
+        );
+
+        let slot = text_label.next_sibling().expect("the embed slot");
+        let card = slot
+            .first_child()
+            .and_downcast::<gtk4::Button>()
+            .expect("the shared post renders a card");
+
+        let mut texts = Vec::new();
+        collect_labels(&card.clone().upcast(), &mut texts);
+        assert!(texts.iter().any(|t| t == "Author"));
+        assert!(texts.iter().any(|t| t == "@author.bsky.social"));
+        assert!(texts.iter().any(|t| t == "the shared post"));
+
+        card.emit_clicked();
+        assert_eq!(
+            opened.borrow().as_slice(),
+            ["at://did:plc:author/app.bsky.feed.post/shared"],
+            "one click opens the post once"
+        );
+
+        // Rebind to a plain message: text back, card gone.
+        row.bind(&message("m2", "did:plc:them", "just words"), false);
+        assert!(text_label.is_visible());
+        assert!(
+            slot.first_child().is_none(),
+            "a recycled row must not keep the previous message's card"
+        );
+    }
+
+    fn collect_labels(widget: &gtk4::Widget, out: &mut Vec<String>) {
+        if let Some(label) = widget.downcast_ref::<gtk4::Label>() {
+            out.push(label.text().to_string());
+        }
+        let mut child = widget.first_child();
+        while let Some(c) = child {
+            collect_labels(&c, out);
+            child = c.next_sibling();
+        }
     }
 
     /// The wire hands pages newest first; the screen reads oldest first.

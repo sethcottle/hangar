@@ -425,6 +425,16 @@ popover.menu > contents {
     text-decoration: underline;
 }
 
+/* Shared posts in chat. The button supplies the card look; margins on the
+   content box do the padding. */
+.msg-post-card {
+    padding: 0;
+}
+
+.msg-card-thumb {
+    border-radius: 6px;
+}
+
 /* Settings sidebar navigation */
 .settings-sidebar {
     background-color: @window_bg_color;
