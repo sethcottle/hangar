@@ -159,10 +159,11 @@ menubutton.flat.circular.reposted > button {
     color: @error_color;
 }
 
-/* Timeline background. Tooltip windows carry .background too, and their
-   text is white in both themes; painting them with the window color made
-   them unreadable in light theme. Leave them to the theme. */
-.background:not(tooltip) {
+/* Timeline background, scoped to the nodes that ask for it. Tooltip and
+   popover windows carry .background too and painting them broke light
+   theme tooltips and drew slabs behind chat context menus. */
+listview.background,
+box.background {
     background-color: @window_bg_color;
 }
 

@@ -73,23 +73,38 @@ fn message_sendable(text: &str) -> bool {
         && text.graphemes(true).count() <= MAX_MESSAGE_GRAPHEMES
 }
 
-/// Whether the desktop asks for 12 hour clocks. GNOME keeps this in a
-/// gsetting; anywhere without the schema falls back to 24 hour.
+/// Whether the desktop asks for 12 hour clocks.
+///
+/// A deliberately set GNOME toggle wins. Reading the setting's value
+/// would answer the schema default (24h) even on a machine where nothing
+/// was ever toggled, so unset falls through to the locale instead.
 fn clock_uses_12h() -> bool {
     thread_local! {
         static TWELVE_HOUR: std::cell::OnceCell<bool> = const { std::cell::OnceCell::new() };
     }
     TWELVE_HOUR.with(|cell| {
         *cell.get_or_init(|| {
-            gio::SettingsSchemaSource::default()
+            let toggled = gio::SettingsSchemaSource::default()
                 .and_then(|source| source.lookup("org.gnome.desktop.interface", true))
-                .map(|_| {
-                    gio::Settings::new("org.gnome.desktop.interface").string("clock-format")
-                        == "12h"
+                .and_then(|_| {
+                    gio::Settings::new("org.gnome.desktop.interface").user_value("clock-format")
                 })
-                .unwrap_or(false)
+                .and_then(|value| value.str().map(str::to_string));
+            match toggled.as_deref() {
+                Some("12h") => true,
+                Some(_) => false,
+                None => locale_uses_12h(),
+            }
         })
     })
+}
+
+/// Whether the locale writes one in the afternoon without a 13.
+fn locale_uses_12h() -> bool {
+    glib::DateTime::from_local(2000, 1, 1, 13, 0, 0.0)
+        .ok()
+        .and_then(|dt| dt.format("%X").ok())
+        .is_some_and(|formatted| !formatted.contains("13"))
 }
 
 /// Short label text and full tooltip text for a message timestamp.
@@ -311,6 +326,7 @@ mod message_row {
             let menu = gtk4::Popover::new();
             menu.set_parent(&bubble);
             menu.set_has_arrow(false);
+            menu.add_css_class("menu");
             let menu_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
 
             let react_item = gtk4::Button::with_label("React");
@@ -888,6 +904,10 @@ impl MessagePage {
         factory.connect_setup(|_, item| {
             let row = MessageRow::new();
             if let Some(list_item) = item.downcast_ref::<gtk4::ListItem>() {
+                // The list's activation machinery claims first clicks, so a
+                // double click never counted to two for the heart shortcut.
+                list_item.set_activatable(false);
+                list_item.set_selectable(false);
                 list_item.set_child(Some(&row));
             }
         });
