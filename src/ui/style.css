@@ -428,6 +428,13 @@ popover.menu > contents {
     text-decoration: underline;
 }
 
+/* A focused post row shows where the post shortcuts will land */
+.post-row:focus-visible {
+    outline: 2px solid @accent_color;
+    outline-offset: -2px;
+    border-radius: 8px;
+}
+
 /* Profile pages */
 .profile-banner {
     background-color: alpha(@accent_bg_color, 0.2);

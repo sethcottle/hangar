@@ -555,11 +555,24 @@ impl HangarWindow {
             }
         }
 
+        // Single letters, live while a post row has keyboard focus.
+        let posts: gtk4::ShortcutsGroup = glib::Object::builder()
+            .property("title", "Focused Post")
+            .build();
+        posts.add_shortcut(&shortcut("Next Post", "J"));
+        posts.add_shortcut(&shortcut("Previous Post", "K"));
+        posts.add_shortcut(&shortcut("Like", "L"));
+        posts.add_shortcut(&shortcut("Reply", "R"));
+        posts.add_shortcut(&shortcut("Repost or Quote", "T"));
+        posts.add_shortcut(&shortcut("Open Thread", "O"));
+        posts.add_shortcut(&shortcut("More Options", "M"));
+
         let section: gtk4::ShortcutsSection = glib::Object::builder()
             .property("section-name", "shortcuts")
             .build();
         section.add_group(&general);
         section.add_group(&navigation);
+        section.add_group(&posts);
 
         let window: gtk4::ShortcutsWindow = glib::Object::builder().property("modal", true).build();
         window.add_section(&section);
@@ -702,6 +715,7 @@ impl HangarWindow {
                     && let Some(post_row) = list_item.child().and_downcast::<PostRow>()
                 {
                     post_row.bind(&post);
+                    post_row.set_list_position(list_item.position());
                     // Like callback receives (post_row, was_liked, like_uri) captured before toggle
                     let post_for_like = post.clone();
                     let w = win.downgrade();
@@ -2240,6 +2254,7 @@ impl HangarWindow {
             {
                 post_row.set_visible(true);
                 post_row.bind(&post);
+                post_row.set_list_position(list_item.position());
                 // Wire up like/repost/reply/quote callbacks
                 let post_for_like = post.clone();
                 let w = win.downgrade();
@@ -3346,6 +3361,7 @@ impl HangarWindow {
             {
                 post_row.set_visible(true);
                 post_row.bind(&post);
+                post_row.set_list_position(list_item.position());
                 let post_for_like = post.clone();
                 let w = win.downgrade();
                 post_row.connect_like_clicked(move |row, was_liked, like_uri| {
@@ -3880,6 +3896,7 @@ impl HangarWindow {
                 && let Some(post_row) = list_item.child().and_downcast::<PostRow>()
             {
                 post_row.bind(&post);
+                post_row.set_list_position(list_item.position());
                 let post_for_like = post.clone();
                 let w = win.downgrade();
                 post_row.connect_like_clicked(move |row, was_liked, like_uri| {
@@ -4112,6 +4129,7 @@ impl HangarWindow {
                 && let Some(post_row) = list_item.child().and_downcast::<PostRow>()
             {
                 post_row.bind(&post);
+                post_row.set_list_position(list_item.position());
                 let post_for_like = post.clone();
                 let w = win.downgrade();
                 post_row.connect_like_clicked(move |row, was_liked, like_uri| {
@@ -4408,6 +4426,7 @@ impl HangarWindow {
                 && let Some(post_row) = list_item.child().and_downcast::<PostRow>()
             {
                 post_row.bind(&post);
+                post_row.set_list_position(list_item.position());
                 let post_for_like = post.clone();
                 let w = win.downgrade();
                 post_row.connect_like_clicked(move |row, was_liked, like_uri| {
@@ -7616,10 +7635,15 @@ mod tests {
             .filter(|(_, w)| w.is::<gtk4::ShortcutsShortcut>())
             .map(|(_, w)| w.property::<String>("title"))
             .collect();
-        assert_eq!(titles.len(), 12, "4 general + back + 7 sections");
+        assert_eq!(
+            titles.len(),
+            19,
+            "4 general + back + 7 sections + 7 post keys"
+        );
         assert!(titles.contains("Refresh"));
         assert!(titles.contains("Saved"));
         assert!(titles.contains("Search"), "one entry carries both keys");
+        assert!(titles.contains("Like"), "the post keys are listed");
         overlay.destroy();
     }
 

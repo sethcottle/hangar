@@ -92,6 +92,9 @@ mod imp {
         /// row-body click without touching post_clicked_callback, which
         /// embedded quote cards still need in order to navigate.
         pub is_focused_post: Cell<bool>,
+        /// The row's position at bind time, so J and K can land on the
+        /// neighbouring item of the list this row sits in.
+        pub list_position: Cell<u32>,
         pub avatar: RefCell<Option<adw::Avatar>>,
         pub display_name_label: RefCell<Option<gtk4::Label>>,
         pub handle_label: RefCell<Option<gtk4::Label>>,
@@ -168,6 +171,30 @@ mod imp {
             // to provide screen readers with meaningful context.
             // Article role requires v4_14 feature flag.
             klass.set_accessible_role(gtk4::AccessibleRole::Group);
+
+            // Post shortcuts, live while the row itself has focus. Focus on
+            // a button inside the row keeps that button's own keys.
+            klass.install_action("post.like", None, |row, _, _| row.key_like());
+            klass.install_action("post.reply", None, |row, _, _| row.key_reply());
+            klass.install_action("post.repost", None, |row, _, _| row.key_repost_menu());
+            klass.install_action("post.open", None, |row, _, _| row.key_open());
+            klass.install_action("post.menu", None, |row, _, _| row.key_menu());
+            let empty = gtk4::gdk::ModifierType::empty();
+            klass.add_binding_action(gtk4::gdk::Key::l, empty, "post.like");
+            klass.add_binding_action(gtk4::gdk::Key::r, empty, "post.reply");
+            klass.add_binding_action(gtk4::gdk::Key::t, empty, "post.repost");
+            klass.add_binding_action(gtk4::gdk::Key::o, empty, "post.open");
+            klass.add_binding_action(gtk4::gdk::Key::m, empty, "post.menu");
+            klass.add_binding_action(gtk4::gdk::Key::Return, empty, "post.open");
+            klass.add_binding_action(gtk4::gdk::Key::KP_Enter, empty, "post.open");
+            klass.add_binding(gtk4::gdk::Key::j, empty, |row| {
+                row.focus_neighbor(1);
+                glib::Propagation::Stop
+            });
+            klass.add_binding(gtk4::gdk::Key::k, empty, |row| {
+                row.focus_neighbor(-1);
+                glib::Propagation::Stop
+            });
         }
     }
 
@@ -203,6 +230,8 @@ impl PostRow {
         self.set_margin_top(8);
         self.set_margin_bottom(8);
         self.add_css_class("post-row");
+        // A keyboard stop of its own; the post.* shortcuts act on it.
+        self.set_focusable(true);
 
         // Main horizontal layout: avatar on left, content on right
         // This entire area is clickable to open the thread
@@ -635,6 +664,74 @@ impl PostRow {
             repost_item_label,
             quote_item,
         )
+    }
+
+    /// L: the like button, optimistic path and all.
+    fn key_like(&self) {
+        if let Some(btn) = self.imp().like_btn.borrow().as_ref() {
+            btn.emit_clicked();
+        }
+    }
+
+    /// R: the reply button.
+    fn key_reply(&self) {
+        if let Some(btn) = self.imp().reply_btn.borrow().as_ref() {
+            btn.emit_clicked();
+        }
+    }
+
+    /// T: the repost menu, so quote stays one arrow key away.
+    fn key_repost_menu(&self) {
+        if let Some(btn) = self.imp().repost_btn.borrow().as_ref() {
+            btn.popup();
+        }
+    }
+
+    /// O: open the thread, same rules as clicking the row body.
+    fn key_open(&self) {
+        let imp = self.imp();
+        if imp.is_focused_post.get() {
+            return;
+        }
+        if let Some(post) = imp.post.borrow().as_ref() {
+            if let Some(cb) = imp.post_clicked_callback.borrow().as_ref() {
+                cb(post.clone());
+            }
+        }
+    }
+
+    /// M: the overflow menu.
+    fn key_menu(&self) {
+        if let Some(btn) = self.imp().post_menu_btn.borrow().as_ref() {
+            btn.popup();
+        }
+    }
+
+    /// J and K. In a ListView, land focus on the neighbouring item; a
+    /// thread page's plain box falls back to ordinary focus movement.
+    fn focus_neighbor(&self, delta: i64) {
+        let mut ancestor = self.parent();
+        while let Some(widget) = ancestor {
+            if let Some(list) = widget.downcast_ref::<gtk4::ListView>() {
+                let target = self.imp().list_position.get() as i64 + delta;
+                let count = list.model().map(|m| m.n_items() as i64).unwrap_or(0);
+                if (0..count).contains(&target) {
+                    list.scroll_to(target as u32, gtk4::ListScrollFlags::FOCUS, None);
+                }
+                return;
+            }
+            ancestor = widget.parent();
+        }
+        self.emit_move_focus(if delta > 0 {
+            gtk4::DirectionType::Down
+        } else {
+            gtk4::DirectionType::Up
+        });
+    }
+
+    /// Remember where this row sits in its list; see `focus_neighbor`.
+    pub fn set_list_position(&self, position: u32) {
+        self.imp().list_position.set(position);
     }
 
     /// Create a post overflow menu button with View Post, Save, Report, etc.
@@ -3421,5 +3518,51 @@ mod tests {
             Some(true),
             "the stored post must flip too, or the next click saves again"
         );
+    }
+
+    /// The post shortcuts drive the row's own controls: L rides the like
+    /// button's full path and O opens the thread. The row is a keyboard
+    /// stop so the bindings have somewhere to live.
+    #[test]
+    fn the_post_shortcuts_drive_the_row() {
+        crate::ui::with_gtk(the_post_shortcuts_drive_the_row_body);
+    }
+
+    fn the_post_shortcuts_drive_the_row_body() {
+        use std::cell::RefCell as StdRefCell;
+        use std::rc::Rc;
+
+        let row = PostRow::new();
+        assert!(row.is_focusable(), "the shortcuts need a focused row");
+
+        row.bind(&post_with(
+            None,
+            "at://did:plc:test/app.bsky.feed.post/keys",
+        ));
+
+        let liked: Rc<StdRefCell<u32>> = Rc::default();
+        let sink = Rc::clone(&liked);
+        row.connect_like_clicked(move |_, _, _| {
+            *sink.borrow_mut() += 1;
+        });
+        assert!(row.activate_action("post.like", None).is_ok());
+        assert_eq!(*liked.borrow(), 1, "L is the like button");
+
+        let opened: Rc<StdRefCell<Vec<String>>> = Rc::default();
+        let sink = Rc::clone(&opened);
+        row.set_post_clicked_callback(move |post| {
+            sink.borrow_mut().push(post.uri);
+        });
+        assert!(row.activate_action("post.open", None).is_ok());
+        assert_eq!(
+            opened.borrow().as_slice(),
+            ["at://did:plc:test/app.bsky.feed.post/keys"],
+            "O opens the thread"
+        );
+
+        // The thread page's own subject stays put, same as a body click.
+        row.imp().is_focused_post.set(true);
+        assert!(row.activate_action("post.open", None).is_ok());
+        assert_eq!(opened.borrow().len(), 1, "the focused post does not reopen");
     }
 }
