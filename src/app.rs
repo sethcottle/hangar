@@ -127,6 +127,8 @@ mod imp {
         pub search_people_loading_more: RefCell<bool>,
         /// Which query the in-flight search fetches belong to
         pub(crate) search_generation: Generation,
+        /// Same idea for the New Message picker's typeahead.
+        pub(crate) message_target_generation: Generation,
         /// Whether new posts polling has been started
         pub polling_started: RefCell<bool>,
         /// Whether an unread-badge fetch is already in flight
@@ -258,7 +260,17 @@ mod imp {
 
             let app_clone = app.clone();
             window.set_message_callback(move |profile, btn_weak| {
-                app_clone.open_direct_message(profile, btn_weak);
+                app_clone.open_direct_message(profile, Some(btn_weak));
+            });
+
+            let app_clone = app.clone();
+            window.set_new_message_query_callback(move |query| {
+                app_clone.search_message_targets(query);
+            });
+
+            let app_clone = app.clone();
+            window.set_new_message_chosen_callback(move |profile| {
+                app_clone.open_direct_message(profile, None);
             });
 
             let app_clone = app.clone();
@@ -2775,10 +2787,12 @@ impl HangarApplication {
     }
 
     /// Open a conversation in the message view, pushed onto the chat stack.
-    /// Message from a profile. The server decides whether messaging is
-    /// allowed; DMs off, blocks, and account restrictions all come back as
-    /// a plain no, so the toast says so without guessing the reason.
-    fn open_direct_message(&self, profile: Profile, btn_weak: glib::WeakRef<gtk4::Button>) {
+    /// Message someone, from a profile button or the New Message picker.
+    /// The server decides whether messaging is allowed; DMs off, blocks,
+    /// and account restrictions all come back as a plain no, so the toast
+    /// says so without guessing the reason. The button, when there is one,
+    /// is already locked by the click.
+    fn open_direct_message(&self, profile: Profile, btn_weak: Option<glib::WeakRef<gtk4::Button>>) {
         let (tx, rx) = std::sync::mpsc::channel::<Result<Option<Conversation>, String>>();
         let client = self.client();
         let did = profile.did.clone();
@@ -2790,9 +2804,10 @@ impl HangarApplication {
 
         let app = self.clone();
         glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            let btn = btn_weak.as_ref().and_then(|weak| weak.upgrade());
             match rx.try_recv() {
                 Ok(Ok(Some(conversation))) => {
-                    if let Some(btn) = btn_weak.upgrade() {
+                    if let Some(btn) = btn {
                         btn.set_sensitive(true);
                     }
                     if let Some(window) = app.imp().window.borrow().as_ref() {
@@ -2806,7 +2821,7 @@ impl HangarApplication {
                 }
                 Ok(Ok(None)) => {
                     // Stays locked: asking again will not change the answer.
-                    if let Some(btn) = btn_weak.upgrade() {
+                    if let Some(btn) = btn {
                         btn.set_tooltip_text(Some("This account can't receive your messages"));
                     }
                     if let Some(window) = app.imp().window.borrow().as_ref() {
@@ -2817,12 +2832,55 @@ impl HangarApplication {
                 Ok(Err(e)) => {
                     eprintln!("Failed to check messaging: {}", e);
                     app.report_session_expiry();
-                    if let Some(btn) = btn_weak.upgrade() {
+                    if let Some(btn) = btn {
                         btn.set_sensitive(true);
                     }
                     if let Some(window) = app.imp().window.borrow().as_ref() {
                         window.show_toast("Couldn't open messaging");
                     }
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+            }
+        });
+    }
+
+    /// Typeahead for the New Message picker. The generation strands slow
+    /// answers so a fast typist never sees results for an older query.
+    fn search_message_targets(&self, query: String) {
+        self.imp().message_target_generation.bump();
+        let generation = self.imp().message_target_generation.token();
+
+        if query.trim().is_empty() {
+            if let Some(window) = self.imp().window.borrow().as_ref() {
+                window.set_new_message_results(vec![]);
+            }
+            return;
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<Profile>, String>>();
+        let client = self.client();
+        thread::spawn(move || {
+            let result =
+                runtime::block_on(async { client.search_actors_typeahead(&query, 8).await });
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+
+        let app = self.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            if !app.imp().message_target_generation.is_current(generation) {
+                return glib::ControlFlow::Break;
+            }
+            match rx.try_recv() {
+                Ok(Ok(profiles)) => {
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.set_new_message_results(profiles);
+                    }
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(e)) => {
+                    eprintln!("Failed to search people: {}", e);
                     glib::ControlFlow::Break
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
@@ -3992,9 +4050,14 @@ impl HangarApplication {
             match rx.try_recv() {
                 Ok(Ok((profiles, next_cursor))) => {
                     app.imp().search_people_cursor.replace(next_cursor);
+                    let nobody = profiles.is_empty();
                     if let Some(window) = app.imp().window.borrow().as_ref() {
                         window.set_search_people_loading(false);
                         window.set_search_people_results(profiles);
+                    }
+                    // A dead end gets suggestions instead of a shrug.
+                    if nobody {
+                        app.fetch_search_suggestions(generation);
                     }
                     glib::ControlFlow::Break
                 }
@@ -4018,6 +4081,41 @@ impl HangarApplication {
     }
 
     /// Fetch more people results for infinite scroll
+    /// Suggested accounts for an empty people search. The generation token
+    /// belongs to the search that came up dry; a newer search drops these.
+    fn fetch_search_suggestions(&self, generation: u64) {
+        let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<Profile>, String>>();
+        let client = self.client();
+
+        thread::spawn(move || {
+            let result = runtime::block_on(async { client.get_suggestions(8).await });
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+
+        let app = self.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            if !app.imp().search_generation.is_current(generation) {
+                return glib::ControlFlow::Break;
+            }
+            match rx.try_recv() {
+                Ok(Ok(profiles)) => {
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.set_search_suggestions(profiles);
+                    }
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(e)) => {
+                    // The no-results page stands on its own; suggestions
+                    // failing to load is not worth a toast.
+                    eprintln!("Failed to fetch suggestions: {}", e);
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+            }
+        });
+    }
+
     fn fetch_search_people_more(&self) {
         if *self.imp().search_people_loading_more.borrow() {
             return;

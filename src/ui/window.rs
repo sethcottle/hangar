@@ -185,6 +185,12 @@ mod imp {
         pub likes_empty_state: RefCell<Option<adw::StatusPage>>,
         pub search_empty_state: RefCell<Option<adw::StatusPage>>,
         pub search_people_empty_state: RefCell<Option<adw::StatusPage>>,
+        pub search_suggestions_box: RefCell<Option<gtk4::Box>>,
+        // New Message picker
+        pub new_message_dialog: RefCell<Option<adw::Dialog>>,
+        pub new_message_results_box: RefCell<Option<gtk4::Box>>,
+        pub new_message_query_callback: RefCell<Option<Box<dyn Fn(String) + 'static>>>,
+        pub new_message_chosen_callback: RefCell<Option<Box<dyn Fn(Profile) + 'static>>>,
         pub new_posts_banner: RefCell<Option<gtk4::Button>>,
         pub new_posts_callback: RefCell<Option<Box<dyn Fn() + 'static>>>,
         pub scrolled_window: RefCell<Option<gtk4::ScrolledWindow>>,
@@ -2839,6 +2845,19 @@ impl HangarWindow {
         title.add_css_class("title");
         header.set_title_widget(Some(&title));
 
+        // Start a conversation without hunting down a profile first.
+        let new_message_btn = gtk4::Button::from_icon_name("list-add-symbolic");
+        new_message_btn.add_css_class("flat");
+        new_message_btn.set_tooltip_text(Some("New Message"));
+        new_message_btn.update_property(&[gtk4::accessible::Property::Label("New Message")]);
+        let win = self.downgrade();
+        new_message_btn.connect_clicked(move |_| {
+            if let Some(win) = win.upgrade() {
+                win.present_new_message_dialog();
+            }
+        });
+        header.pack_start(&new_message_btn);
+
         // Add window controls (close, minimize, maximize) to the end
         let window_controls = gtk4::WindowControls::new(gtk4::PackType::End);
         header.pack_end(&window_controls);
@@ -4661,10 +4680,26 @@ impl HangarWindow {
             "No people found",
             "Nothing matched this search. Try a name or handle.",
         );
+
+        // Suggestions fill the dead end when the network has some.
+        let suggestions_column = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+        suggestions_column.set_visible(false);
+        let suggestions_title = gtk4::Label::new(Some("Suggested accounts"));
+        suggestions_title.add_css_class("heading");
+        suggestions_title.set_halign(gtk4::Align::Start);
+        suggestions_title.set_margin_bottom(4);
+        suggestions_column.append(&suggestions_title);
+        let suggestions_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        suggestions_column.append(&suggestions_box);
+        empty_state.set_child(Some(&suggestions_column));
+
         overlay.add_overlay(&empty_state);
         self.imp()
             .search_people_empty_state
             .replace(Some(empty_state));
+        self.imp()
+            .search_suggestions_box
+            .replace(Some(suggestions_box));
 
         results_stack.add_titled_with_icon(
             &overlay,
@@ -4777,6 +4812,129 @@ impl HangarWindow {
         }
         if let Some(page) = self.imp().search_people_empty_state.borrow().as_ref() {
             page.set_visible(false);
+        }
+        self.set_search_suggestions(vec![]);
+    }
+
+    /// The New Message picker: type a name, pick a person, chat.
+    fn build_new_message_dialog(&self) -> adw::Dialog {
+        let content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+
+        let header = adw::HeaderBar::new();
+        let title = gtk4::Label::new(Some("New Message"));
+        title.add_css_class("title");
+        header.set_title_widget(Some(&title));
+        content.append(&header);
+
+        let entry = gtk4::SearchEntry::new();
+        entry.set_placeholder_text(Some("Search people"));
+        entry.set_margin_start(12);
+        entry.set_margin_end(12);
+        entry.set_margin_top(8);
+        entry.set_margin_bottom(8);
+        let win = self.downgrade();
+        entry.connect_search_changed(move |entry| {
+            let Some(win) = win.upgrade() else {
+                return;
+            };
+            if let Some(cb) = win.imp().new_message_query_callback.borrow().as_ref() {
+                cb(entry.text().to_string());
+            }
+        });
+        content.append(&entry);
+
+        let results = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        let scrolled = gtk4::ScrolledWindow::new();
+        scrolled.set_vexpand(true);
+        scrolled.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
+        scrolled.set_child(Some(&results));
+        content.append(&scrolled);
+
+        self.imp().new_message_results_box.replace(Some(results));
+
+        let dialog = adw::Dialog::builder()
+            .title("New Message")
+            .content_width(420)
+            .content_height(480)
+            .child(&content)
+            .build();
+        // Stale state from the last opening would flash otherwise.
+        self.imp().new_message_dialog.replace(Some(dialog.clone()));
+        dialog
+    }
+
+    pub fn present_new_message_dialog(&self) {
+        let dialog = self.build_new_message_dialog();
+        dialog.present(Some(self));
+    }
+
+    /// People matching the picker's query; a row click hands the person to
+    /// the chosen callback and the dialog steps aside.
+    pub fn set_new_message_results(&self, profiles: Vec<Profile>) {
+        let Some(rows) = self.imp().new_message_results_box.borrow().clone() else {
+            return;
+        };
+        while let Some(child) = rows.first_child() {
+            rows.remove(&child);
+        }
+        let win = self.downgrade();
+        for profile in profiles {
+            let row = ActorRow::new();
+            row.bind(&profile);
+            let w = win.clone();
+            row.set_activated_callback(move |profile| {
+                let Some(w) = w.upgrade() else {
+                    return;
+                };
+                if let Some(dialog) = w.imp().new_message_dialog.borrow().as_ref() {
+                    dialog.close();
+                }
+                if let Some(cb) = w.imp().new_message_chosen_callback.borrow().as_ref() {
+                    cb(profile);
+                }
+            });
+            rows.append(&row);
+        }
+    }
+
+    pub fn set_new_message_query_callback<F: Fn(String) + 'static>(&self, callback: F) {
+        self.imp()
+            .new_message_query_callback
+            .replace(Some(Box::new(callback)));
+    }
+
+    pub fn set_new_message_chosen_callback<F: Fn(Profile) + 'static>(&self, callback: F) {
+        self.imp()
+            .new_message_chosen_callback
+            .replace(Some(Box::new(callback)));
+    }
+
+    /// Fill the empty people search with suggested accounts. An empty list
+    /// clears them, leaving the plain no-results page.
+    pub fn set_search_suggestions(&self, profiles: Vec<Profile>) {
+        let Some(rows) = self.imp().search_suggestions_box.borrow().clone() else {
+            return;
+        };
+        while let Some(child) = rows.first_child() {
+            rows.remove(&child);
+        }
+        if let Some(column) = rows.parent() {
+            column.set_visible(!profiles.is_empty());
+        }
+        let win = self.downgrade();
+        for profile in profiles {
+            let row = ActorRow::new();
+            row.bind(&profile);
+            let w = win.clone();
+            row.set_activated_callback(move |profile| {
+                let Some(w) = w.upgrade() else {
+                    return;
+                };
+                if let Some(cb) = w.imp().profile_clicked_callback.borrow().as_ref() {
+                    cb(profile);
+                }
+            });
+            rows.append(&row);
         }
     }
 
@@ -7524,6 +7682,87 @@ mod tests {
                 .is_some_and(|l| l.text() == "following"),
             "a missing count leaves the word as the whole stat"
         );
+
+        window.destroy();
+    }
+
+    /// A dead-end people search fills with suggested accounts, and a fresh
+    /// search clears them with the rest of the verdict.
+    #[test]
+    fn an_empty_people_search_offers_suggestions() {
+        crate::ui::with_gtk(an_empty_people_search_offers_suggestions_body);
+    }
+
+    fn an_empty_people_search_offers_suggestions_body() {
+        let window: HangarWindow = glib::Object::builder().build();
+        let imp = window.imp();
+
+        window.set_search_people_results(vec![]);
+        let rows = imp.search_suggestions_box.borrow().clone().unwrap();
+        assert!(rows.first_child().is_none(), "nothing suggested yet");
+
+        window.set_search_suggestions(vec![Profile::minimal(
+            "did:plc:suggested".into(),
+            "suggested.bsky.social".into(),
+            None,
+            None,
+        )]);
+        assert!(rows.first_child().and_downcast::<ActorRow>().is_some());
+        assert!(
+            rows.parent().unwrap().get_visible(),
+            "the suggestions column shows with content"
+        );
+
+        window.clear_search_results();
+        assert!(rows.first_child().is_none(), "a fresh search starts clean");
+        assert!(!rows.parent().unwrap().get_visible());
+
+        window.destroy();
+    }
+
+    /// The New Message picker reports what is typed and lists the people
+    /// handed back.
+    #[test]
+    fn the_new_message_picker_searches_and_lists() {
+        crate::ui::with_gtk(the_new_message_picker_searches_and_lists_body);
+    }
+
+    fn the_new_message_picker_searches_and_lists_body() {
+        let window: HangarWindow = glib::Object::builder().build();
+
+        let queries: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(vec![]));
+        let sink = queries.clone();
+        window.set_new_message_query_callback(move |q| {
+            sink.borrow_mut().push(q);
+        });
+
+        let dialog = window.build_new_message_dialog();
+        // The dialog parents its child at present time; walk the content.
+        let content = dialog.child().expect("the picker has content");
+        let mut widgets = Vec::new();
+        walk(&content, 0, &mut widgets);
+        let entry = widgets
+            .iter()
+            .find_map(|(_, w)| w.downcast_ref::<gtk4::SearchEntry>().cloned())
+            .expect("the picker has a search entry");
+
+        entry.set_text("pete");
+        entry.emit_by_name::<()>("search-changed", &[]);
+        assert_eq!(queries.borrow().as_slice(), ["pete"]);
+
+        window.set_new_message_results(vec![Profile::minimal(
+            "did:plc:pete".into(),
+            "pete.bsky.social".into(),
+            None,
+            None,
+        )]);
+        let rows = window
+            .imp()
+            .new_message_results_box
+            .borrow()
+            .clone()
+            .unwrap();
+        assert!(rows.first_child().and_downcast::<ActorRow>().is_some());
 
         window.destroy();
     }

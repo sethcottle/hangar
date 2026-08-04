@@ -2847,6 +2847,30 @@ impl HangarClient {
         })
     }
 
+    /// Accounts the network suggests for the signed-in user, for filling
+    /// an empty people search with something better than a shrug.
+    #[allow(clippy::await_holding_lock)]
+    pub async fn get_suggestions(&self, limit: u8) -> Result<Vec<Profile>, ClientError> {
+        with_agent!(self, agent => {
+
+        let params = atrium_api::app::bsky::actor::get_suggestions::ParametersData {
+            cursor: None,
+            limit: atrium_api::types::LimitedNonZeroU8::try_from(limit).ok(),
+        };
+
+        let output = agent
+            .api
+            .app
+            .bsky
+            .actor
+            .get_suggestions(params.into())
+            .await
+            .map_err(|e| self.xrpc_error(e))?;
+
+        Ok(output.data.actors.iter().map(Self::profile_from_view).collect())
+        })
+    }
+
     /// Follow a user. Returns the follow record's URI, which unfollow needs.
     #[allow(clippy::await_holding_lock)]
     pub async fn follow(&self, subject_did: &str) -> Result<String, ClientError> {

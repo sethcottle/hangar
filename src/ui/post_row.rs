@@ -666,6 +666,28 @@ impl PostRow {
         )
     }
 
+    /// Engagement counts for the screen reader label. Counts read out
+    /// only when they say something; nobody needs three zeroes per post.
+    fn counts_readout(post: &Post) -> String {
+        let mut counts = Vec::new();
+        for (count, one, many) in [
+            (post.reply_count, "reply", "replies"),
+            (post.repost_count, "repost", "reposts"),
+            (post.like_count, "like", "likes"),
+        ] {
+            match count {
+                Some(1) => counts.push(format!("1 {one}")),
+                Some(n) if n > 1 => counts.push(format!("{n} {many}")),
+                _ => {}
+            }
+        }
+        if counts.is_empty() {
+            String::new()
+        } else {
+            format!(". {}", counts.join(", "))
+        }
+    }
+
     /// L: the like button, optimistic path and all.
     fn key_like(&self) {
         if let Some(btn) = self.imp().like_btn.borrow().as_ref() {
@@ -1278,11 +1300,12 @@ impl PostRow {
             &post.text
         };
         let article_label = format!(
-            "Post by {} (@{}), {}: {}",
+            "Post by {} (@{}), {}: {}{}",
             display_name,
             post.author.handle,
             Self::format_timestamp(&post.indexed_at),
-            text_preview
+            text_preview,
+            Self::counts_readout(post)
         );
         self.update_property(&[
             gtk4::accessible::Property::Label(&article_label),
@@ -3517,6 +3540,28 @@ mod tests {
                 .and_then(|p| p.viewer_bookmarked),
             Some(true),
             "the stored post must flip too, or the next click saves again"
+        );
+    }
+
+    /// The screen reader readout counts only what is there: no zeroes,
+    /// singulars for one, and nothing at all on an untouched post.
+    #[test]
+    fn the_readout_counts_only_what_is_there() {
+        let quiet = post_with(None, "at://did:plc:test/app.bsky.feed.post/quiet");
+        assert_eq!(PostRow::counts_readout(&quiet), "");
+
+        let mut zeroes = quiet.clone();
+        zeroes.reply_count = Some(0);
+        zeroes.like_count = Some(0);
+        assert_eq!(PostRow::counts_readout(&zeroes), "", "zeroes stay quiet");
+
+        let mut busy = quiet.clone();
+        busy.reply_count = Some(1);
+        busy.repost_count = Some(2);
+        busy.like_count = Some(30);
+        assert_eq!(
+            PostRow::counts_readout(&busy),
+            ". 1 reply, 2 reposts, 30 likes"
         );
     }
 
