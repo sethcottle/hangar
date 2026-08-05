@@ -15,6 +15,11 @@ use std::time::Duration;
 /// and never answers, which latched the poll flags for the session and
 /// left the UI with no error to show.
 const XRPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// What the video service accepts. Checked before the file is read, so a
+/// phone's 4K capture is refused instead of being loaded into RAM.
+pub const MAX_VIDEO_BYTES: u64 = 100 * 1024 * 1024;
+/// Upload slice size. Only one of these exists at a time now.
+const UPLOAD_CHUNK: usize = 256 * 1024;
 const XRPC_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Bluesky's video processing service; uploads land here, not on the PDS.
@@ -1443,6 +1448,7 @@ impl HangarClient {
         data: Vec<u8>,
         mime_type: &str,
         sent_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
         on_event: impl Fn(VideoUploadEvent) + Send,
     ) -> Result<serde_json::Value, ClientError> {
         let did = self.current_did().await?;
@@ -1454,7 +1460,16 @@ impl HangarClient {
         let pds_did = Self::pds_did_from_doc(&doc)
             .ok_or_else(|| ClientError::InvalidResponse("no PDS in the DID document".into()))?;
 
-        let http = reqwest::Client::new();
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(ClientError::Network("upload cancelled".into()));
+        }
+        // The upload used to run on the default client, which has no
+        // timeouts at all, so a stalled peer held the file bytes for as
+        // long as the process lived.
+        let http = reqwest::Client::builder()
+            .connect_timeout(XRPC_CONNECT_TIMEOUT)
+            .build()
+            .map_err(|e| ClientError::Network(e.to_string()))?;
 
         // Ask about quota first; the refusal message beats a failed upload.
         let limits_token = self
@@ -1491,13 +1506,30 @@ impl HangarClient {
         );
         let total = data.len();
 
-        // Stream in chunks so the counter tracks bytes as they leave.
+        // Stream slices out of the one buffer. Collecting chunks into a
+        // Vec<Vec<u8>> duplicated the entire file, and since chunks()
+        // only borrows, the original stayed resident too: peak was twice
+        // the file for the whole upload.
         let counter = sent_bytes;
-        let chunks: Vec<Vec<u8>> = data.chunks(256 * 1024).map(|c| c.to_vec()).collect();
-        let stream = futures_util::stream::iter(chunks.into_iter().map(move |c| {
-            counter.fetch_add(c.len() as u64, Ordering::Relaxed);
-            Ok::<Vec<u8>, std::io::Error>(c)
-        }));
+        let cancel = cancelled.clone();
+        let stream = futures_util::stream::unfold((data, 0usize), move |(data, offset)| {
+            let counter = counter.clone();
+            let cancel = cancel.clone();
+            async move {
+                if offset >= data.len() {
+                    return None;
+                }
+                if cancel.load(Ordering::Relaxed) {
+                    // Drops `data` here, which is the point: an abandoned
+                    // upload used to hold the file until the body finished.
+                    return None;
+                }
+                let end = (offset + UPLOAD_CHUNK).min(data.len());
+                let chunk = data[offset..end].to_vec();
+                counter.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                Some((Ok::<Vec<u8>, std::io::Error>(chunk), (data, end)))
+            }
+        });
 
         let resp = http
             .post(format!("{VIDEO_SERVICE}/xrpc/app.bsky.video.uploadVideo"))
@@ -1543,6 +1575,9 @@ impl HangarClient {
             }
             if std::time::Instant::now() > deadline {
                 return Err(ClientError::Network("video processing timed out".into()));
+            }
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(ClientError::Network("upload cancelled".into()));
             }
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             let body = http

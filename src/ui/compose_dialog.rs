@@ -196,6 +196,9 @@ pub struct ComposeVideo {
     pub alt_text: String,
     pub total_bytes: u64,
     pub sent_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Set when the tile goes or the dialog closes. The upload thread
+    /// checks it and drops the file bytes it is holding.
+    pub cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub state: VideoUploadState,
     pub blob: Option<serde_json::Value>,
     pub aspect_ratio: Option<(u32, u32)>,
@@ -273,8 +276,13 @@ mod imp {
         pub video_upload_callback: RefCell<
             Option<
                 Box<
-                    dyn Fn(u64, Vec<u8>, String, std::sync::Arc<std::sync::atomic::AtomicU64>)
-                        + 'static,
+                    dyn Fn(
+                            u64,
+                            Vec<u8>,
+                            String,
+                            std::sync::Arc<std::sync::atomic::AtomicU64>,
+                            std::sync::Arc<std::sync::atomic::AtomicBool>,
+                        ) + 'static,
                 >,
             >,
         >,
@@ -337,6 +345,10 @@ mod imp {
             self.parent_constructed();
             self.require_alt_text
                 .set(crate::state::AppSettings::load().require_alt_text);
+            // A dismissed composer must not leave an upload running with
+            // the whole file still in memory.
+            self.obj()
+                .connect_closed(|dialog| dialog.cancel_all_uploads());
             let obj = self.obj();
             obj.setup_ui();
         }
@@ -1924,7 +1936,13 @@ impl ComposeDialog {
     /// The app installs the upload flow here; the dialog reports state
     /// back through the `video_*` methods, addressed by token.
     pub fn set_video_upload_callback<
-        F: Fn(u64, Vec<u8>, String, std::sync::Arc<std::sync::atomic::AtomicU64>) + 'static,
+        F: Fn(
+                u64,
+                Vec<u8>,
+                String,
+                std::sync::Arc<std::sync::atomic::AtomicU64>,
+                std::sync::Arc<std::sync::atomic::AtomicBool>,
+            ) + 'static,
     >(
         &self,
         callback: F,
@@ -1941,6 +1959,26 @@ impl ComposeDialog {
         path: &std::path::Path,
         mime: &'static str,
     ) {
+        // Stat before reading. A phone's 4K capture is gigabytes, and
+        // reading it to find that out is how the composer used to eat the
+        // machine before the service ever saw a byte.
+        let limit = crate::atproto::client::MAX_VIDEO_BYTES;
+        match std::fs::metadata(path) {
+            Ok(meta) if meta.len() > limit => {
+                self.flash_compose_error(&format!(
+                    "That video is {} MB. The limit is {} MB.",
+                    meta.len() / (1024 * 1024),
+                    limit / (1024 * 1024)
+                ));
+                return;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                self.flash_compose_error(&format!("Couldn't read the file: {e}"));
+                return;
+            }
+        }
+
         let data = match std::fs::read(path) {
             Ok(d) => d,
             Err(e) => {
@@ -1994,6 +2032,7 @@ impl ComposeDialog {
         let token = imp.video_token_counter.get();
         imp.video_token_counter.set(token + 1);
         let sent_bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let status_label = gtk4::Label::new(Some("Uploading\u{2026}"));
         status_label.add_css_class("caption");
@@ -2007,6 +2046,7 @@ impl ComposeDialog {
             alt_text: String::new(),
             total_bytes: data.len() as u64,
             sent_bytes: sent_bytes.clone(),
+            cancelled: cancelled.clone(),
             state: VideoUploadState::Uploading,
             blob: None,
             aspect_ratio: None,
@@ -2039,7 +2079,7 @@ impl ComposeDialog {
 
         // Hand the bytes to the app and follow the counter while they go.
         if let Some(cb) = imp.video_upload_callback.borrow().as_ref() {
-            cb(token, data, mime_type, sent_bytes);
+            cb(token, data, mime_type, sent_bytes, cancelled);
         }
         self.start_video_progress_timer(token);
     }
@@ -2214,6 +2254,10 @@ impl ComposeDialog {
     /// Remove the video in `slot`, upload and all. A late result for its
     /// token finds nothing and falls away.
     fn remove_video(&self, slot: Option<usize>) {
+        // Tell the upload to stop and let go of the file bytes. Without
+        // this the thread ran to completion holding them, so attaching
+        // and removing a few large videos stacked their buffers.
+        self.cancel_video_in(slot);
         let imp = self.imp();
         match slot {
             None => {
@@ -2232,6 +2276,31 @@ impl ComposeDialog {
             }
         }
         self.refresh_post_gates();
+    }
+
+    /// Flag the upload in `slot` as abandoned, if there is one.
+    fn cancel_video_in(&self, slot: Option<usize>) {
+        let imp = self.imp();
+        let flag = match slot {
+            None => imp.video.borrow().as_ref().map(|v| v.cancelled.clone()),
+            Some(i) => imp
+                .thread_posts
+                .borrow()
+                .get(i)
+                .and_then(|b| b.video.as_ref().map(|v| v.cancelled.clone())),
+        };
+        if let Some(flag) = flag {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Every upload this dialog started is abandoned when it closes.
+    pub fn cancel_all_uploads(&self) {
+        self.cancel_video_in(None);
+        let count = self.imp().thread_posts.borrow().len();
+        for i in 0..count {
+            self.cancel_video_in(Some(i));
+        }
     }
 
     /// Build the tile a strip shows for its video: the first frame when
@@ -4369,6 +4438,54 @@ mod tests {
         assert!(btn.is_sensitive(), "the gate only exists when asked for");
     }
 
+    /// Abandoning an upload releases the file bytes it was holding.
+    ///
+    /// The upload thread owns the only remaining copy once the composer
+    /// hands it over, and it used to run to completion regardless. A user
+    /// testing attachments could stack several files' worth of memory in
+    /// threads nothing could reach.
+    #[test]
+    fn abandoning_an_upload_releases_its_buffer() {
+        crate::ui::with_gtk(abandoning_an_upload_releases_its_buffer_body);
+    }
+
+    fn abandoning_an_upload_releases_its_buffer_body() {
+        use std::sync::atomic::Ordering;
+
+        let dialog = ComposeDialog::new();
+        let flags: std::rc::Rc<
+            std::cell::RefCell<Vec<std::sync::Arc<std::sync::atomic::AtomicBool>>>,
+        > = std::rc::Rc::default();
+        let sink = std::rc::Rc::clone(&flags);
+        dialog.set_video_upload_callback(move |_, _, _, _, cancelled| {
+            sink.borrow_mut().push(cancelled);
+        });
+
+        dialog.attach_video_bytes(None, vec![7; 64], "video/mp4".into(), "clip.mp4".into());
+        let flag = flags.borrow()[0].clone();
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "a live upload is not cancelled"
+        );
+
+        // Removing the tile is the common case: attach, change your mind.
+        dialog.remove_video(None);
+        assert!(
+            flag.load(Ordering::Relaxed),
+            "removing the video left its upload running with the file in memory"
+        );
+
+        // Closing the dialog covers the rest.
+        dialog.attach_video_bytes(None, vec![7; 64], "video/mp4".into(), "again.mp4".into());
+        let second = flags.borrow()[1].clone();
+        assert!(!second.load(Ordering::Relaxed));
+        dialog.cancel_all_uploads();
+        assert!(
+            second.load(Ordering::Relaxed),
+            "closing must abandon uploads"
+        );
+    }
+
     /// A video attaches, hands its bytes to the app, blocks the Post
     /// button until the service is done, and lands in the compose data.
     #[test]
@@ -4384,7 +4501,7 @@ mod tests {
         let imp = dialog.imp();
         let requests: Rc<StdRefCell<Vec<(u64, usize, String)>>> = Rc::default();
         let sink = Rc::clone(&requests);
-        dialog.set_video_upload_callback(move |token, data, mime, _sent| {
+        dialog.set_video_upload_callback(move |token, data, mime, _sent, _cancel| {
             sink.borrow_mut().push((token, data.len(), mime));
         });
 
@@ -4522,7 +4639,7 @@ mod tests {
     fn a_thread_video_rides_its_own_post_body() {
         let dialog = ComposeDialog::new();
         let imp = dialog.imp();
-        dialog.set_video_upload_callback(|_, _, _, _| {});
+        dialog.set_video_upload_callback(|_, _, _, _, _| {});
 
         let buffer = imp.text_view.borrow().as_ref().unwrap().buffer();
         buffer.set_text("first post");

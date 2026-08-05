@@ -1357,7 +1357,7 @@ impl HangarApplication {
     fn setup_video_upload(&self, dialog: &ComposeDialog) {
         let app = self.clone();
         let dialog_weak = dialog.downgrade();
-        dialog.set_video_upload_callback(move |token, data, mime, sent| {
+        dialog.set_video_upload_callback(move |token, data, mime, sent, cancelled| {
             enum Msg {
                 Event(crate::atproto::client::VideoUploadEvent),
                 Done(serde_json::Value),
@@ -1370,7 +1370,7 @@ impl HangarApplication {
             thread::spawn(move || {
                 let result = runtime::block_on(async {
                     client
-                        .upload_video(data, &mime, sent, |event| {
+                        .upload_video(data, &mime, sent, cancelled, |event| {
                             let _ = progress_tx.send(Msg::Event(event));
                         })
                         .await
