@@ -49,6 +49,13 @@ jobs:
           cp assets/icons/io.github.sethcottle.Hangar.svg AppDir/usr/share/icons/hicolor/scalable/apps/
           cp data/io.github.sethcottle.Hangar.metainfo.xml AppDir/usr/share/metainfo/
 
+          # Raster sizes for desktops whose SVG renderer cannot draw the
+          # scalable icon's filters (KDE turns them into black plates).
+          for size in 16 32 48 64 128 256; do
+            mkdir -p "AppDir/usr/share/icons/hicolor/${size}x${size}/apps"
+            cp "assets/icons/png/${size}/io.github.sethcottle.Hangar.png" "AppDir/usr/share/icons/hicolor/${size}x${size}/apps/"
+          done
+
           # Desktop file and icon symlinks at AppDir root (required by AppImage spec)
           ln -s usr/share/applications/io.github.sethcottle.Hangar.desktop AppDir/io.github.sethcottle.Hangar.desktop
           ln -s usr/share/icons/hicolor/scalable/apps/io.github.sethcottle.Hangar.svg AppDir/io.github.sethcottle.Hangar.svg

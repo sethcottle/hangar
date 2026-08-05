@@ -79,6 +79,14 @@ modules:
       - cargo --offline build --release --verbose
       - install -Dm755 target/release/hangar /app/bin/hangar
       - install -Dm644 assets/icons/io.github.sethcottle.Hangar.svg /app/share/icons/hicolor/scalable/apps/io.github.sethcottle.Hangar.svg
+      # Raster sizes for desktops whose SVG renderer cannot draw the
+      # scalable icon's filters (KDE turns them into black plates).
+      - install -Dm644 assets/icons/png/16/io.github.sethcottle.Hangar.png /app/share/icons/hicolor/16x16/apps/io.github.sethcottle.Hangar.png
+      - install -Dm644 assets/icons/png/32/io.github.sethcottle.Hangar.png /app/share/icons/hicolor/32x32/apps/io.github.sethcottle.Hangar.png
+      - install -Dm644 assets/icons/png/48/io.github.sethcottle.Hangar.png /app/share/icons/hicolor/48x48/apps/io.github.sethcottle.Hangar.png
+      - install -Dm644 assets/icons/png/64/io.github.sethcottle.Hangar.png /app/share/icons/hicolor/64x64/apps/io.github.sethcottle.Hangar.png
+      - install -Dm644 assets/icons/png/128/io.github.sethcottle.Hangar.png /app/share/icons/hicolor/128x128/apps/io.github.sethcottle.Hangar.png
+      - install -Dm644 assets/icons/png/256/io.github.sethcottle.Hangar.png /app/share/icons/hicolor/256x256/apps/io.github.sethcottle.Hangar.png
       - install -Dm644 data/io.github.sethcottle.Hangar.desktop /app/share/applications/io.github.sethcottle.Hangar.desktop
       - install -Dm644 data/io.github.sethcottle.Hangar.metainfo.xml /app/share/metainfo/io.github.sethcottle.Hangar.metainfo.xml
     sources:

@@ -50,7 +50,7 @@ jobs:
         uses: flatpak/flatpak-github-actions/flatpak-builder@v6.7
         with:
           manifest-path: io.github.sethcottle.Hangar.yml
-          bundle: hangar.flatpak
+          bundle: ${{ inputs.version != '' && 'hangar.flatpak' || 'hangar-nightly.flatpak' }}
           upload-artifact: false
           cache-key: flatpak-builder-${{ github.sha }}
 
@@ -58,7 +58,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: hangar-flatpak
-          path: hangar.flatpak
+          path: hangar*.flatpak
 
   build-appimage:
     name: Build AppImage
@@ -120,6 +120,13 @@ jobs:
           cp "data/${APP_ID}.metainfo.xml" AppDir/usr/share/metainfo/
           cp "assets/icons/${APP_ID}.svg" AppDir/usr/share/icons/hicolor/scalable/apps/
 
+          # Raster sizes for desktops whose SVG renderer cannot draw the
+          # scalable icon's filters (KDE turns them into black plates).
+          for size in 16 32 48 64 128 256; do
+            mkdir -p "AppDir/usr/share/icons/hicolor/${size}x${size}/apps"
+            cp "assets/icons/png/${size}/${APP_ID}.png" "AppDir/usr/share/icons/hicolor/${size}x${size}/apps/"
+          done
+
           # Desktop file and icon symlinks at AppDir root (required by AppImage spec)
           ln -s "usr/share/applications/${APP_ID}.desktop" "AppDir/${APP_ID}.desktop"
           ln -s "usr/share/icons/hicolor/scalable/apps/${APP_ID}.svg" "AppDir/${APP_ID}.svg"
@@ -177,8 +184,10 @@ jobs:
         run: |
           if [ -n "${{ inputs.version }}" ]; then
             echo "update_info=gh-releases-zsync|sethcottle|hangar|latest|Hangar*.AppImage.zsync" >> $GITHUB_OUTPUT
+            echo "output_name=Hangar-x86_64.AppImage" >> $GITHUB_OUTPUT
           else
             echo "update_info=gh-releases-zsync|sethcottle|hangar|nightly|Hangar*.AppImage.zsync" >> $GITHUB_OUTPUT
+            echo "output_name=Hangar-nightly-x86_64.AppImage" >> $GITHUB_OUTPUT
           fi
 
       - name: Build AppImage
@@ -189,9 +198,11 @@ jobs:
           #
           # --appimage-extract-and-run: required in CI (no FUSE available)
           # -u: update information for delta updates via zsync
+          # The output name is explicit so the nightly artifact is
+          # distinct from the release one; the zsync file inherits it.
           ARCH=x86_64 ./appimagetool --appimage-extract-and-run \
             -u "${{ steps.update-channel.outputs.update_info }}" \
-            AppDir
+            AppDir "${{ steps.update-channel.outputs.output_name }}"
 
       - name: Upload AppImage artifact
         uses: actions/upload-artifact@v7
@@ -272,7 +283,7 @@ jobs:
 
             Hangar uses OAuth for authentication. An app password fallback is also available. Create one at [bsky.app/settings/app-passwords](https://bsky.app/settings/app-passwords).
           files: |
-            hangar.flatpak
+            hangar*.flatpak
             Hangar*.AppImage
             Hangar*.AppImage.zsync
           draft: false
@@ -296,7 +307,7 @@ jobs:
 
             Hangar uses OAuth for authentication. An app password fallback is also available. Create one at [bsky.app/settings/app-passwords](https://bsky.app/settings/app-passwords).
           files: |
-            hangar.flatpak
+            hangar*.flatpak
             Hangar*.AppImage
             Hangar*.AppImage.zsync
           draft: false

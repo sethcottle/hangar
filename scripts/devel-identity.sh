@@ -44,6 +44,7 @@ sed -e "s|${STABLE}|${DEVEL}|g" \
 sed -i \
     -e "s|^app-id: ${STABLE}$|app-id: ${DEVEL}|" \
     -e "s|${STABLE}\.svg|${DEVEL}.svg|g" \
+    -e "s|${STABLE}\.png|${DEVEL}.png|g" \
     -e "s|${STABLE}\.desktop|${DEVEL}.desktop|g" \
     -e "s|${STABLE}\.metainfo\.xml|${DEVEL}.metainfo.xml|g" \
     -e 's|cargo --offline build --release --verbose|cargo --offline build --release --features devel --verbose|' \
