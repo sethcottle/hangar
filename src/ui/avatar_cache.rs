@@ -36,21 +36,27 @@ const BYTE_CACHE_BUDGET: usize = 48 * 1024 * 1024;
 /// is close enough to LRU for a scroll workload without write-locking
 /// every cache hit.
 struct ByteCache {
-    map: HashMap<String, Vec<u8>>,
+    /// Arc so a poll tick and a decode job share the buffer instead of
+    /// copying it. This is read every 16ms per pending image.
+    map: HashMap<String, Arc<[u8]>>,
     order: std::collections::VecDeque<String>,
     bytes: usize,
 }
 
 impl ByteCache {
-    fn get(&self, url: &str) -> Option<Vec<u8>> {
+    fn get(&self, url: &str) -> Option<Arc<[u8]>> {
         self.map.get(url).cloned()
     }
 
-    fn insert(&mut self, url: String, bytes: Vec<u8>) {
-        self.bytes += bytes.len();
-        if self.map.insert(url.clone(), bytes).is_none() {
-            self.order.push_back(url);
+    fn insert(&mut self, url: String, bytes: Arc<[u8]>) {
+        let len = bytes.len();
+        match self.map.insert(url.clone(), bytes) {
+            // Same defect as the texture cache: without this the count
+            // only rose and the cache starved itself.
+            Some(replaced) => self.bytes = self.bytes.saturating_sub(replaced.len()),
+            None => self.order.push_back(url),
         }
+        self.bytes += len;
         while self.bytes > BYTE_CACHE_BUDGET && self.order.len() > 1 {
             let Some(oldest) = self.order.pop_front() else {
                 break;
@@ -124,6 +130,12 @@ const AVATAR_DECODE_EDGE: i32 = 256;
 static TEXTURE_CACHE: Lazy<std::sync::Mutex<TextureCache>> =
     Lazy::new(|| std::sync::Mutex::new(TextureCache::new(TEXTURE_CACHE_BUDGET)));
 
+/// How many images may decode at once. Unbounded, every job held its own
+/// copy of the raw bytes on tokio's 512 thread blocking pool, so a feed
+/// that re-decoded on every bind could queue thousands of them. The polls
+/// retry, so a refused schedule costs a frame, not a load.
+const MAX_CONCURRENT_DECODES: usize = 8;
+
 /// Cache keys with a decode job out, so a poll storm schedules one job.
 static DECODE_IN_FLIGHT: Lazy<std::sync::Mutex<HashSet<String>>> =
     Lazy::new(|| std::sync::Mutex::new(HashSet::new()));
@@ -172,9 +184,16 @@ impl TextureCache {
     }
 
     fn insert(&mut self, key: String, texture: gdk::Texture) {
-        self.bytes += Self::cost(&texture);
         self.tick += 1;
-        self.map.insert(key, (texture, self.tick));
+        let cost = Self::cost(&texture);
+        // A replaced entry's bytes leave with it. Counting only the
+        // arrival made the total climb forever, so the cache evicted
+        // itself down to one entry and every image re-decoded on every
+        // bind, which fed an unbounded decode queue.
+        if let Some((replaced, _)) = self.map.insert(key, (texture, self.tick)) {
+            self.bytes = self.bytes.saturating_sub(Self::cost(&replaced));
+        }
+        self.bytes += cost;
         // Evict least recently used until back under budget. A texture
         // still on a widget survives the eviction; only the cache's
         // claim goes.
@@ -201,7 +220,7 @@ impl TextureCache {
 /// poll comes back for the finished texture. `max_edge` bounds the
 /// decode for widgets that render small; the key must encode it so one
 /// URL can exist at two sizes.
-fn ensure_texture(key: &str, bytes: &[u8], max_edge: Option<i32>) -> TextureState {
+fn ensure_texture(key: &str, bytes: &Arc<[u8]>, max_edge: Option<i32>) -> TextureState {
     if let Some(texture) = TEXTURE_CACHE.lock().unwrap().get(key) {
         return TextureState::Ready(texture);
     }
@@ -213,11 +232,15 @@ fn ensure_texture(key: &str, bytes: &[u8], max_edge: Option<i32>) -> TextureStat
         if in_flight.contains(key) {
             return TextureState::Pending;
         }
+        if in_flight.len() >= MAX_CONCURRENT_DECODES {
+            // At capacity. The caller's poll comes back for this.
+            return TextureState::Pending;
+        }
         in_flight.insert(key.to_string());
     }
 
     let key = key.to_string();
-    let bytes = bytes.to_vec();
+    let bytes = Arc::clone(bytes);
     IMAGE_RUNTIME.spawn_blocking(move || {
         // Off the main thread: JPEG decode is the expensive part, and a
         // fast scroll through fresh posts used to pay it per image right
@@ -262,7 +285,7 @@ fn decode_pixbuf(bytes: &[u8], max_edge: Option<i32>) -> Option<gdk::gdk_pixbuf:
 }
 
 /// Put the avatar's texture on the widget once it exists.
-fn apply_avatar_bytes(avatar: &adw::Avatar, url: &str, bytes: &[u8]) -> TextureState {
+fn apply_avatar_bytes(avatar: &adw::Avatar, url: &str, bytes: &Arc<[u8]>) -> TextureState {
     let key = format!("{url}#avatar");
     let state = ensure_texture(&key, bytes, Some(AVATAR_DECODE_EDGE));
     if let TextureState::Ready(texture) = &state {
@@ -274,7 +297,7 @@ fn apply_avatar_bytes(avatar: &adw::Avatar, url: &str, bytes: &[u8]) -> TextureS
 /// Put the picture's texture on the widget once it exists.
 ///
 /// Bytes in a format gdk-pixbuf has no loader for count as a failed load.
-fn apply_bytes_to_picture(picture: &gtk4::Picture, url: &str, bytes: &[u8]) -> TextureState {
+fn apply_bytes_to_picture(picture: &gtk4::Picture, url: &str, bytes: &Arc<[u8]>) -> TextureState {
     let state = ensure_texture(url, bytes, None);
     if let TextureState::Ready(texture) = &state {
         picture.set_paintable(Some(texture));
@@ -341,7 +364,10 @@ fn spawn_fetch_if_needed(url: &str) -> bool {
         .await;
 
         if let Some(bytes) = result {
-            cache.write().unwrap().insert(url_clone.clone(), bytes);
+            cache
+                .write()
+                .unwrap()
+                .insert(url_clone.clone(), Arc::from(bytes.into_boxed_slice()));
         }
 
         // Remove from in-flight set
@@ -356,7 +382,12 @@ fn spawn_fetch_if_needed(url: &str) -> bool {
 /// Pass the same URL given to `load_image_into_picture`: the JPEG normalisation
 /// that decides the cache key happens in here.
 pub fn cached_bytes(url: &str) -> Option<Vec<u8>> {
-    AVATAR_CACHE.read().unwrap().get(&ensure_jpeg_format(url))
+    // The one caller saves to a file, so a copy here is the cold path.
+    AVATAR_CACHE
+        .read()
+        .unwrap()
+        .get(&ensure_jpeg_format(url))
+        .map(|bytes| bytes.to_vec())
 }
 
 /// Object-data key for the widget's newest load generation.
@@ -674,7 +705,7 @@ mod tests {
     }
 
     fn a_rebind_reuses_the_decoded_texture_body() {
-        let bytes = png(64);
+        let bytes: Arc<[u8]> = Arc::from(png(64).into_boxed_slice());
 
         // First sight: the decode runs off this thread, so the answer is
         // Pending now and Ready after the loop turns.
@@ -724,7 +755,7 @@ mod tests {
     }
 
     fn undecodable_bytes_settle_as_failed_body() {
-        let garbage = vec![0u8; 32];
+        let garbage: Arc<[u8]> = Arc::from(vec![0u8; 32].into_boxed_slice());
         assert!(matches!(
             ensure_texture("test://garbage", &garbage, None),
             TextureState::Pending
@@ -742,6 +773,60 @@ mod tests {
             }
         }
         assert!(settled, "the failed decode never settled");
+    }
+
+    /// Re-inserting a key must not inflate the running total.
+    ///
+    /// This is the bug that made the caches starve themselves: only the
+    /// arriving entry was counted, never the one it replaced, so the
+    /// total climbed forever, eviction ran on every insert, and the cache
+    /// collapsed toward a single entry. Everything then re-decoded on
+    /// every bind, which fed an unbounded decode queue.
+    #[test]
+    fn re_inserting_a_key_does_not_inflate_the_budget() {
+        crate::ui::with_gtk(re_inserting_a_key_does_not_inflate_the_budget_body);
+    }
+
+    fn re_inserting_a_key_does_not_inflate_the_budget_body() {
+        let bytes = png(64);
+        let decode = || {
+            let glib_bytes = glib::Bytes::from(&bytes[..]);
+            let stream = gtk4::gio::MemoryInputStream::from_bytes(&glib_bytes);
+            let pixbuf =
+                gdk::gdk_pixbuf::Pixbuf::from_stream(&stream, gtk4::gio::Cancellable::NONE)
+                    .unwrap();
+            gdk::Texture::for_pixbuf(&pixbuf)
+        };
+
+        let mut textures = TextureCache::new(40 * 1024);
+        let one = TextureCache::cost(&decode());
+        for _ in 0..50 {
+            textures.insert("same".into(), decode());
+        }
+        assert_eq!(
+            textures.bytes, one,
+            "50 inserts of one key counted as {} bytes, not {one}",
+            textures.bytes
+        );
+        assert_eq!(textures.map.len(), 1);
+        assert!(
+            textures.get("same").is_some(),
+            "the cache evicted the only thing it holds"
+        );
+
+        // Same defect, byte side.
+        let mut raw = ByteCache {
+            map: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            bytes: 0,
+        };
+        let payload: Arc<[u8]> = Arc::from(vec![0u8; 1024].into_boxed_slice());
+        for _ in 0..50 {
+            raw.insert("same".into(), Arc::clone(&payload));
+        }
+        assert_eq!(raw.bytes, 1024, "byte total inflated to {}", raw.bytes);
+        assert_eq!(raw.order.len(), 1, "the eviction order grew duplicates");
+        assert!(raw.get("same").is_some());
     }
 
     /// Over budget, the least recently used entry goes; entries still in
