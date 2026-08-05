@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-License-Identifier: MPL-2.0 -->
+<!-- Symbolic icons ride inside the binary so no desktop's icon theme can
+     come up empty; see docs/icons.md for why and how to add one. -->
+<gresources>
+  <gresource prefix="/io/github/sethcottle/Hangar/icons">
+    <file preprocess="xml-stripblanks" alias="scalable/actions/action-unavailable-symbolic.svg">icons/symbolic/action-unavailable-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="scalable/actions/audio-volume-high-symbolic.svg">icons/symbolic/audio-volume-high-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="scalable/actions/audio-volume-low-symbolic.svg">icons/symbolic/audio-volume-low-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="scalable/actions/audio-volume-medium-symbolic.svg">icons/symbolic/audio-volume-medium-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="scalable/actions/audio-volume-muted-symbolic.svg">icons/symbolic/audio-volume-muted-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="scalable/actions/avatar-default-symbolic.svg">icons/symbolic/avatar-default-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="scalable/actions/bookmark-new-symbolic.svg">icons/symbolic/bookmark-new-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="scalable/actions/chat-message-new-symbolic.svg">icons/symbolic/chat-message-new-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="scalable/actions/dialog-information-symbolic.svg">icons/symbolic/dialog-information-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="scalable/actions/dialog-warning-symbolic.svg">icons/symbolic/dialog-warning-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="scalable/actions/document-edit-symbolic.svg">icons/symbolic/document-edit-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="scalable/actions/document-save-symbolic.svg">icons/symbolic/document-save-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="scalable/actions/edit-copy-symbolic.svg">icons/symbolic/edit-copy-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="scalable/actions/emblem-system-symbolic.svg">icons/symbolic/emblem-system-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="scalable/actions/emote-love-symbolic.svg">icons/symbolic/emote-love-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="scalable/actions/go-home-symbolic.svg">icons/symbolic/go-home-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="scalable/actions/go-next-symbolic.svg">icons/symbolic/go-next-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="scalable/actions/go-previous-symbolic.svg">icons/symbolic/go-previous-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="scalable/actions/go-up-symbolic.svg">icons/symbolic/go-up-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="scalable/actions/help-about-symbolic.svg">icons/symbolic/help-about-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="scalable/actions/image-x-generic-symbolic.svg">icons/symbolic/image-x-generic-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="scalable/actions/list-add-symbolic.svg">icons/symbolic/list-add-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="scalable/actions/mail-forward-symbolic.svg">icons/symbolic/mail-forward-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="scalable/actions/mail-reply-sender-symbolic.svg">icons/symbolic/mail-reply-sender-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="scalable/actions/media-playback-pause-symbolic.svg">icons/symbolic/media-playback-pause-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="scalable/actions/media-playback-start-symbolic.svg">icons/symbolic/media-playback-start-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="scalable/actions/media-playlist-repeat-symbolic.svg">icons/symbolic/media-playlist-repeat-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="scalable/actions/object-select-symbolic.svg">icons/symbolic/object-select-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="scalable/actions/pan-down-symbolic.svg">icons/symbolic/pan-down-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="scalable/actions/preferences-desktop-accessibility-symbolic.svg">icons/symbolic/preferences-desktop-accessibility-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="scalable/actions/preferences-desktop-appearance-symbolic.svg">icons/symbolic/preferences-desktop-appearance-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="scalable/actions/preferences-system-notifications-symbolic.svg">icons/symbolic/preferences-system-notifications-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="scalable/actions/system-log-out-symbolic.svg">icons/symbolic/system-log-out-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="scalable/actions/system-search-symbolic.svg">icons/symbolic/system-search-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="scalable/actions/system-users-symbolic.svg">icons/symbolic/system-users-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="scalable/actions/user-bookmarks-symbolic.svg">icons/symbolic/user-bookmarks-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="scalable/actions/user-trash-symbolic.svg">icons/symbolic/user-trash-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="scalable/actions/video-x-generic-symbolic.svg">icons/symbolic/video-x-generic-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="scalable/actions/view-fullscreen-symbolic.svg">icons/symbolic/view-fullscreen-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="scalable/actions/view-list-symbolic.svg">icons/symbolic/view-list-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="scalable/actions/view-more-symbolic.svg">icons/symbolic/view-more-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="scalable/actions/view-refresh-symbolic.svg">icons/symbolic/view-refresh-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="scalable/actions/view-reveal-symbolic.svg">icons/symbolic/view-reveal-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="scalable/actions/web-browser-symbolic.svg">icons/symbolic/web-browser-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="scalable/actions/window-close-symbolic.svg">icons/symbolic/window-close-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="scalable/actions/window-new-symbolic.svg">icons/symbolic/window-new-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="scalable/actions/zoom-fit-best-symbolic.svg">icons/symbolic/zoom-fit-best-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="scalable/actions/zoom-in-symbolic.svg">icons/symbolic/zoom-in-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="scalable/actions/zoom-out-symbolic.svg">icons/symbolic/zoom-out-symbolic.svg</file>
+  </gresource>
+</gresources>

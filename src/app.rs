@@ -198,6 +198,8 @@ mod imp {
         fn activate(&self) {
             let app = self.obj();
 
+            crate::ui::ensure_bundled_icons();
+
             // Create main window
             let window = HangarWindow::new(app.upcast_ref::<adw::Application>());
             if config::IS_DEVEL {

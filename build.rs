@@ -16,4 +16,12 @@ fn main() {
     let distribution =
         std::env::var("HANGAR_DISTRIBUTION").unwrap_or_else(|_| "independent".to_string());
     println!("cargo:rustc-env=HANGAR_DISTRIBUTION={distribution}");
+
+    // The bundled symbolic icons, so no desktop's icon theme can come up
+    // empty (KDE's Breeze lacks several GNOME names).
+    glib_build_tools::compile_resources(
+        &["assets"],
+        "assets/hangar.gresource.xml",
+        "hangar.gresource",
+    );
 }

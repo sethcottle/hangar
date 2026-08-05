@@ -61,7 +61,12 @@ pub(crate) fn with_gtk<F: FnOnce() + Send + 'static>(body: F) {
         let pool = gtk4::glib::ThreadPool::exclusive(1).ok()?;
         let (tx, rx) = mpsc::sync_channel(1);
         pool.push(move || {
-            let _ = tx.send(gtk4::init().is_ok() && libadwaita::init().is_ok());
+            let ready = gtk4::init().is_ok() && libadwaita::init().is_ok();
+            if ready {
+                // Tests see the same icon set the app registers.
+                ensure_bundled_icons();
+            }
+            let _ = tx.send(ready);
         })
         .ok()?;
         rx.recv().ok()?.then_some(pool)
@@ -87,6 +92,26 @@ pub(crate) fn with_gtk<F: FnOnce() + Send + 'static>(body: F) {
     }
 }
 
+/// Register the bundled symbolic icons with GTK, once.
+///
+/// The icons ride inside the binary as a gresource so no desktop's icon
+/// theme can come up empty: KDE's Breeze lacks several of the GNOME
+/// names this app uses and drew red placeholders in their place. The
+/// active theme still wins where it has a name; the bundle only fills
+/// the gaps.
+pub fn ensure_bundled_icons() {
+    use std::sync::OnceLock;
+    static REGISTERED: OnceLock<()> = OnceLock::new();
+    REGISTERED.get_or_init(|| {
+        gtk4::gio::resources_register_include!("hangar.gresource")
+            .expect("the icon bundle is compiled into the binary");
+        if let Some(display) = gtk4::gdk::Display::default() {
+            gtk4::IconTheme::for_display(&display)
+                .add_resource_path("/io/github/sethcottle/Hangar/icons");
+        }
+    });
+}
+
 /// Stable replacement for the nightly-only `str::floor_char_boundary`.
 pub fn floor_char_boundary(s: &str, index: usize) -> usize {
     if index >= s.len() {
@@ -97,5 +122,57 @@ pub fn floor_char_boundary(s: &str, index: usize) -> usize {
             i -= 1;
         }
         i
+    }
+}
+
+#[cfg(test)]
+mod icon_tests {
+    /// Every bundled icon resolves from the bundle alone, the way it must
+    /// on a desktop whose theme has never heard of these names. The
+    /// system theme is cut out of the lookup entirely.
+    #[test]
+    fn bundled_icons_resolve_without_any_system_theme() {
+        crate::ui::with_gtk(bundled_icons_resolve_without_any_system_theme_body);
+    }
+
+    fn bundled_icons_resolve_without_any_system_theme_body() {
+        let bundled = gtk4::gio::resources_enumerate_children(
+            "/io/github/sethcottle/Hangar/icons/scalable/actions",
+            gtk4::gio::ResourceLookupFlags::NONE,
+        )
+        .expect("the icon bundle is registered");
+        assert!(
+            bundled.len() >= 40,
+            "the bundle looks gutted: {} entries",
+            bundled.len()
+        );
+
+        let theme = gtk4::IconTheme::new();
+        theme.set_search_path(&[] as &[&std::path::Path]);
+        theme.add_resource_path("/io/github/sethcottle/Hangar/icons");
+
+        for file in &bundled {
+            let name = file.trim_end_matches(".svg");
+            assert!(
+                theme.has_icon(name),
+                "{name} does not resolve from the bundle"
+            );
+        }
+
+        // The names KDE actually broke on stay in the bundle by name, so
+        // an icon rename cannot quietly reopen the hole.
+        for name in [
+            "chat-message-new-symbolic",
+            "emote-love-symbolic",
+            "preferences-system-notifications-symbolic",
+            "media-playlist-repeat-symbolic",
+            "mail-reply-sender-symbolic",
+            "view-reveal-symbolic",
+        ] {
+            assert!(
+                bundled.iter().any(|f| f.trim_end_matches(".svg") == name),
+                "{name} left the bundle"
+            );
+        }
     }
 }
