@@ -257,6 +257,14 @@ impl PostRow {
             .build()
     }
 
+    /// Build the row's widgets.
+    ///
+    /// Every closure attached to a descendant holds this row WEAKLY. A
+    /// strong clone here is a reference cycle (row owns child owns closure
+    /// owns row) that GObject cannot collect, and it pins the row's
+    /// decoded textures too, since a texture on a live widget outlives
+    /// cache eviction. Pooled rows hide it; unvirtualized pages like the
+    /// thread view leak one subtree per post.
     fn setup_ui(&self) {
         self.set_margin_start(12);
         self.set_margin_end(16);
@@ -289,8 +297,11 @@ impl PostRow {
         avatar_column.append(&avatar_btn);
 
         // Connect avatar click to profile navigation
-        let post_row = self.clone();
+        let post_row = self.downgrade();
         avatar_btn.connect_clicked(move |_| {
+            let Some(post_row) = post_row.upgrade() else {
+                return;
+            };
             let imp = post_row.imp();
             if let Some(post) = imp.post.borrow().as_ref() {
                 if let Some(cb) = imp.profile_clicked_callback.borrow().as_ref() {
@@ -434,8 +445,11 @@ impl PostRow {
         content.set_use_markup(true); // Enable markup for clickable links
 
         // Handle link clicks (URLs, @mentions, #hashtags)
-        let post_row_for_links = self.clone();
+        let post_row_for_links = self.downgrade();
         content.connect_activate_link(move |label, uri| {
+            let Some(post_row_for_links) = post_row_for_links.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
             if uri.starts_with("bsky-mention://") {
                 // An @mention click navigates to the profile
                 let handle = uri.strip_prefix("bsky-mention://").unwrap_or("");
@@ -646,8 +660,11 @@ impl PostRow {
 
         // Add click gesture to main_box for opening thread
         let gesture = gtk4::GestureClick::new();
-        let post_row = self.clone();
+        let post_row = self.downgrade();
         gesture.connect_released(move |_, _, _, _| {
+            let Some(post_row) = post_row.upgrade() else {
+                return;
+            };
             let imp = post_row.imp();
             // Already the subject of this page; navigating would push an
             // identical one.
@@ -1060,8 +1077,11 @@ impl PostRow {
         }
         if let Some(btn) = imp.like_btn.borrow().as_ref() {
             // Toggle visual state optimistically when clicked
-            let post_row = self.clone();
+            let post_row = self.downgrade();
             let id = btn.connect_clicked(move |_| {
+                let Some(post_row) = post_row.upgrade() else {
+                    return;
+                };
                 // Capture current state BEFORE toggling
                 let was_liked = post_row.is_liked();
                 let like_uri = post_row.viewer_like_uri();
@@ -1137,8 +1157,11 @@ impl PostRow {
             // Close popover when clicked
             let menu_btn = imp.repost_btn.borrow();
             let popover = menu_btn.as_ref().and_then(|m| m.popover());
-            let post_row = self.clone();
+            let post_row = self.downgrade();
             let id = btn.connect_clicked(move |_| {
+                let Some(post_row) = post_row.upgrade() else {
+                    return;
+                };
                 if let Some(p) = &popover {
                     p.popdown();
                 }
@@ -2034,8 +2057,11 @@ impl PostRow {
         let gif = gif.clone();
         let alt = Self::gif_alt(ext);
         let link = ext.uri.clone();
-        let post_row = self.clone();
+        let post_row = self.downgrade();
         play_btn.connect_clicked(move |btn| {
+            let Some(post_row) = post_row.upgrade() else {
+                return;
+            };
             // The post on the web, else the GIF's own page. Never the
             // re-encoded MP4.
             let fallback = post_row
@@ -3683,6 +3709,61 @@ mod tests {
 
         // Other tests bind posts authored by did:plc:test; leave nothing set.
         super::set_current_user_did(None);
+    }
+
+    /// A row must die when its owner lets go.
+    ///
+    /// Every closure on a descendant widget holds the row weakly. A strong
+    /// capture makes row -> child -> closure -> row, which GObject cannot
+    /// collect, so the row, its whole widget subtree and its decoded
+    /// textures live until the process exits. Pooled lists hide it because
+    /// the pool is bounded; the thread page appends one row per post and
+    /// never reuses them, so a browsing session leaked a subtree per post
+    /// it ever showed.
+    #[test]
+    fn a_dropped_row_is_actually_freed() {
+        crate::ui::with_gtk(a_dropped_row_is_actually_freed_body);
+    }
+
+    fn a_dropped_row_is_actually_freed_body() {
+        // Bound and wired the way a real page builds one, so every
+        // closure that could capture the row has been attached.
+        let row = PostRow::new();
+        row.bind(&post_with(
+            None,
+            "at://did:plc:test/app.bsky.feed.post/leak",
+        ));
+        let weak = row.downgrade();
+        assert!(weak.upgrade().is_some(), "the row is alive while held");
+
+        drop(row);
+        assert!(
+            weak.upgrade().is_none(),
+            "the row outlived its last owner: a closure on one of its own \
+             children is holding it strongly"
+        );
+
+        // The unvirtualized case the leak actually bit: a page that builds
+        // a row per post and is then dropped whole.
+        let mut weaks = Vec::new();
+        {
+            let page = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+            for i in 0..20 {
+                let row = PostRow::new();
+                row.bind(&post_with(
+                    None,
+                    &format!("at://did:plc:test/app.bsky.feed.post/t{i}"),
+                ));
+                weaks.push(row.downgrade());
+                page.append(&row);
+            }
+            assert!(weaks.iter().all(|w| w.upgrade().is_some()));
+            while let Some(child) = page.first_child() {
+                page.remove(&child);
+            }
+        }
+        let survivors = weaks.iter().filter(|w| w.upgrade().is_some()).count();
+        assert_eq!(survivors, 0, "{survivors} of 20 thread rows leaked");
     }
 
     /// Feed-level moderation: the section hides on own posts, and Mute and

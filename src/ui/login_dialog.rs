@@ -367,9 +367,13 @@ impl LoginDialog {
     /// Connect callback for OAuth login (handle only).
     pub fn connect_oauth_login<F: Fn(&Self) + 'static>(&self, f: F) {
         if let Some(button) = self.imp().oauth_button.borrow().as_ref() {
-            let dialog = self.clone();
+            let dialog = self.downgrade();
             button.connect_clicked(move |_| {
-                f(&dialog);
+                // Weak: the button is this dialog's own child, so a strong
+                // capture would be a cycle GObject cannot collect.
+                if let Some(dialog) = dialog.upgrade() {
+                    f(&dialog);
+                }
             });
         }
     }
@@ -377,9 +381,13 @@ impl LoginDialog {
     /// Connect callback for cancelling an in-progress OAuth flow.
     pub fn connect_oauth_cancel<F: Fn(&Self) + 'static>(&self, f: F) {
         if let Some(button) = self.imp().oauth_cancel_button.borrow().as_ref() {
-            let dialog = self.clone();
+            let dialog = self.downgrade();
             button.connect_clicked(move |_| {
-                f(&dialog);
+                // Weak: the button is this dialog's own child, so a strong
+                // capture would be a cycle GObject cannot collect.
+                if let Some(dialog) = dialog.upgrade() {
+                    f(&dialog);
+                }
             });
         }
     }
@@ -387,9 +395,13 @@ impl LoginDialog {
     /// Connect callback for app-password login (handle + password).
     pub fn connect_login<F: Fn(&Self) + 'static>(&self, f: F) {
         if let Some(button) = self.imp().login_button.borrow().as_ref() {
-            let dialog = self.clone();
+            let dialog = self.downgrade();
             button.connect_clicked(move |_| {
-                f(&dialog);
+                // Weak: the button is this dialog's own child, so a strong
+                // capture would be a cycle GObject cannot collect.
+                if let Some(dialog) = dialog.upgrade() {
+                    f(&dialog);
+                }
             });
         }
     }
