@@ -34,6 +34,18 @@ jobs:
         if: inputs.version == ''
         run: ./scripts/devel-identity.sh
 
+      - name: Stamp the build version
+        run: |
+          # Same HANGAR_VERSION as the AppImage, threaded through the
+          # manifest's env block so the About dialog matches the release.
+          if [ -n "${{ inputs.version }}" ]; then
+            V="${{ inputs.version }}"
+          else
+            V="nightly-$(date +%Y%m%d)-${GITHUB_SHA::7}"
+          fi
+          sed -i "s/^    RUST_BACKTRACE: '1'$/    RUST_BACKTRACE: '1'\n    HANGAR_VERSION: '${V}'/" io.github.sethcottle.Hangar.yml
+          grep -q "HANGAR_VERSION" io.github.sethcottle.Hangar.yml || { echo "version stamp missed the manifest" >&2; exit 1; }
+
       - name: Build Flatpak
         uses: flatpak/flatpak-github-actions/flatpak-builder@v6.7
         with:
