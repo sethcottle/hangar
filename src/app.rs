@@ -706,6 +706,9 @@ impl HangarApplication {
                         app.fetch_saved_feeds();
                         app.fetch_timeline();
                     }
+                    // After the restore resolved, so the account in use is
+                    // known and cannot be swept.
+                    Self::sweep_stale_credentials(Some(session.did.clone()));
                     glib::ControlFlow::Break
                 }
                 Ok(Err(failure)) => {
@@ -734,15 +737,56 @@ impl HangarApplication {
                     if let Some(window) = app.imp().window.borrow().as_ref() {
                         app.show_login_dialog_with_notice(window, notice);
                     }
+                    // Nothing restored, so nothing stored is in use.
+                    Self::sweep_stale_credentials(None);
                     glib::ControlFlow::Break
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     if let Some(window) = app.imp().window.borrow().as_ref() {
                         app.show_login_dialog(window);
                     }
+                    Self::sweep_stale_credentials(None);
                     glib::ControlFlow::Break
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+            }
+        });
+    }
+
+    /// Drop any stored credential that is not the account in use.
+    ///
+    /// Sign out only started revoking and deleting in 0.8.2, so anyone who
+    /// signed out before that still has a live refresh token and its
+    /// signing key on disk. Nothing would ever remove it: sign out is the
+    /// only path that touches the file, and they have already taken it.
+    /// Sweeping at startup means the fix reaches those installs without
+    /// asking anyone to go delete a file by hand.
+    ///
+    /// `keep` is the account that just restored, if any. With nobody
+    /// signed in, every row is a leftover.
+    fn sweep_stale_credentials(keep: Option<String>) {
+        let store = crate::state::session_store::FileSessionStore::new();
+        let stored = match store.stored_dids() {
+            Ok(dids) => dids,
+            Err(e) => {
+                eprintln!("Could not read stored credentials: {e}");
+                return;
+            }
+        };
+
+        let stale: Vec<_> = stored
+            .into_iter()
+            .filter(|did| keep.as_deref() != Some(did.as_str()))
+            .collect();
+        if stale.is_empty() {
+            return;
+        }
+
+        // Off the main thread: each one is a network round trip.
+        thread::spawn(move || {
+            for did in stale {
+                eprintln!("Dropping a credential left by an earlier sign out");
+                Self::revoke_and_forget(did.as_str());
             }
         });
     }

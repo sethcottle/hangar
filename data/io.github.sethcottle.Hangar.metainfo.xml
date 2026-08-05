@@ -53,6 +53,30 @@
   </supports>
 
   <releases>
+    <release version="0.8.2" date="2026-08-05">
+      <description>
+        <p>What a full audit turned up.</p>
+        <ul>
+          <li>Fixed a hang that could freeze the whole window until the app was killed</li>
+          <li>Fixed two ways memory could run away, one of them without any user action</li>
+          <li>Direct messages, notifications, activity and people lists are reachable by keyboard and screen reader</li>
+          <li>Sign out revokes the session and removes the stored credential</li>
+          <li>New posts no longer rebuild the feed while you are reading it</li>
+          <li>Window size and position persist, which no packaged build managed before</li>
+          <li>Faster feed refreshes, non-blocking link opening, and the screen stays awake during video</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.8.1" date="2026-08-05">
+      <description>
+        <p>KDE fixes and a memory hunt.</p>
+        <ul>
+          <li>Icons render on KDE, and the app icon no longer sits on a black plate</li>
+          <li>Video stops decoding the moment it scrolls off screen, and frames stay on the GPU</li>
+          <li>Nightly downloads carry names of their own</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.8.0" date="2026-08-04">
       <description>
         <p>Video uploads, real conversations, and the social layer.</p>

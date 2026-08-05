@@ -133,6 +133,16 @@ impl FileSessionStore {
         }
     }
 
+    /// Every DID this file still holds a credential for.
+    ///
+    /// Hangar signs into one account at a time, so anything here that is
+    /// not the current account is a leftover from a sign-out that
+    /// predates the app deleting them, and it is still live.
+    pub fn stored_dids(&self) -> Result<Vec<Did>, StoreError> {
+        let guard = self.inner.lock().map_err(|_| StoreError::Lock)?;
+        Ok(guard.keys().cloned().collect())
+    }
+
     /// Forget one DID's row, whatever else is going on.
     ///
     /// Sign out used to clear the keyring and stop, but for an OAuth login
@@ -393,6 +403,62 @@ mod tests {
             !on_disk.contains("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"),
             "the credential survived sign out: {on_disk}"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The startup sweep must drop leftovers and never the account in
+    /// use. Getting this backwards would sign the user out of their own
+    /// session and revoke a grant they are still holding, so the
+    /// selection is pinned here rather than trusted to a filter.
+    #[test]
+    fn the_sweep_keeps_the_account_in_use() {
+        let dir = std::env::temp_dir().join(format!("hangar-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = FileSessionStore {
+            inner: std::sync::Arc::new(Mutex::new(HashMap::new())),
+            path: dir.join("oauth-sessions.json"),
+            pending_redirect_uri: None,
+            pending_scopes: None,
+        };
+
+        let row: StoredSession = serde_json::from_str(LEGACY_ROW).unwrap();
+        let in_use: Did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".parse().unwrap();
+        let leftover: Did = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb".parse().unwrap();
+        {
+            let mut guard = store.inner.lock().unwrap();
+            guard.insert(in_use.clone(), row.clone());
+            guard.insert(leftover.clone(), row);
+        }
+
+        // What the app computes at startup: keep the restored account.
+        let keep = Some(in_use.to_string());
+        let stale: Vec<Did> = store
+            .stored_dids()
+            .unwrap()
+            .into_iter()
+            .filter(|did| keep.as_deref() != Some(did.as_str()))
+            .collect();
+        assert_eq!(stale, vec![leftover.clone()], "swept the wrong account");
+
+        for did in stale {
+            store.forget(&did).unwrap();
+        }
+        assert!(
+            store.stored_dids().unwrap() == vec![in_use],
+            "the account in use lost its credential"
+        );
+
+        // Signed out entirely: every row is a leftover.
+        let none: Option<String> = None;
+        let all_stale: Vec<Did> = store
+            .stored_dids()
+            .unwrap()
+            .into_iter()
+            .filter(|did| none.as_deref() != Some(did.as_str()))
+            .collect();
+        assert_eq!(all_stale.len(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
