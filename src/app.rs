@@ -214,6 +214,15 @@ mod imp {
             });
             app.set_network_available(monitor.is_network_available());
 
+            // The update nudge, only on builds no store keeps current, a
+            // little after launch so startup owns the first seconds.
+            if crate::update::check_enabled() {
+                let app_clone = app.clone();
+                glib::timeout_add_seconds_local_once(15, move || {
+                    app_clone.check_for_updates();
+                });
+            }
+
             let app_clone = app.clone();
             window.set_load_more_callback(move || {
                 app_clone.fetch_timeline_more();
@@ -4060,6 +4069,51 @@ impl HangarApplication {
                     ctx.fetching.set(false);
                     glib::ControlFlow::Break
                 }
+            }
+        });
+    }
+
+    /// Ask GitHub for the latest release and offer it in a toast when it
+    /// beats the running build. Quiet on every failure; an update nudge
+    /// that can error is worse than none.
+    fn check_for_updates(&self) {
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(String, String), String>>();
+        thread::spawn(move || {
+            let result = runtime::block_on(crate::update::fetch_latest());
+            let _ = tx.send(result);
+        });
+
+        let app = self.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
+            match rx.try_recv() {
+                Ok(Ok((tag, url))) => {
+                    if crate::update::newer_available(env!("HANGAR_VERSION"), &tag)
+                        && let Some(window) = app.imp().window.borrow().as_ref()
+                    {
+                        let version = tag.trim_start_matches('v').to_string();
+                        let window_weak = window.downgrade();
+                        window.show_toast_with_action(
+                            &format!("Hangar {version} is available"),
+                            "Get It",
+                            move || {
+                                if let Some(window) = window_weak.upgrade() {
+                                    crate::ui::external::open_url(
+                                        &window,
+                                        &url,
+                                        "the release page",
+                                    );
+                                }
+                            },
+                        );
+                    }
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(e)) => {
+                    eprintln!("Update check failed: {}", e);
+                    glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
             }
         });
     }

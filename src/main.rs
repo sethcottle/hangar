@@ -8,6 +8,7 @@ mod media;
 mod runtime;
 mod state;
 mod ui;
+mod update;
 
 use gtk4::prelude::*;
 

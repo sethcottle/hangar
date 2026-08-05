@@ -110,6 +110,14 @@ The AppImage supports delta updates via zsync and is also available through the 
 am -i hangar
 ```
 
+#### Updating
+
+Hangar checks for new releases at launch and offers them in a toast. To
+update in place with a delta download instead, point
+[AppImageUpdate](https://github.com/AppImage/AppImageUpdate) or
+[Gear Lever](https://flathub.org/apps/it.mijorus.gearlever) at the file;
+the update information is embedded. AM users can run `am -u hangar`.
+
 ### Flatpak (sideload)
 
 Download the `.flatpak` bundle from the [Releases](https://github.com/sethcottle/hangar/releases) page and install:
@@ -123,7 +131,11 @@ installs alongside `org.gnome.Platform` by default. The base runtime's
 libavcodec has no H.264 decoder, so a runtime installed with `--no-related`
 plays audio and shows nothing.
 
-Flathub submission is planned but not yet available.
+Bundle installs have no update remote, so `flatpak update` cannot find new
+versions. Hangar checks for new releases at launch and offers them in a
+toast; installing the new bundle over the old one keeps your data. Flathub
+submission is planned, and once it lands updates become automatic through
+the store.
 
 ### Build from Source
 
