@@ -36,6 +36,12 @@
             # Build: gstreamer-video-1.0.pc and gstreamer-gl-1.0.pc.
             # Runtime: playbin3, glsinkbin
             gst_all_1.gst-plugins-base
+            # Build: egl.pc, which gstreamer-gl-egl-1.0.pc requires. The
+            # sink's GL features pull that module in, and its own .pc ships
+            # with gst-plugins-base while egl.pc does not. x11-xcb and
+            # wayland-egl, wanted by the other two GL platform modules,
+            # already arrive with libx11 and wayland.
+            libGL
             # Runtime only: souphttpsrc, hlsdemux2
             gst_all_1.gst-plugins-good
             # Runtime only: hlsdemux, tsdemux, openh264dec, vah264dec
