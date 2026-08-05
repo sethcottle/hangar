@@ -481,6 +481,10 @@ impl VideoDirector {
     }
 
     pub fn register(self: &Rc<Self>, slot: &Rc<VideoSlot>) {
+        // Prune here, not only in elections: with autoplay off elections
+        // never run, and a night of feed churn built a registry of dead
+        // weaks, each pinning its slot's allocation.
+        self.prune();
         self.slots.borrow_mut().push((slot.id, Rc::downgrade(slot)));
         // So the first screen after login autoplays without a scroll.
         self.schedule_election();
