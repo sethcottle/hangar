@@ -947,7 +947,12 @@ impl HangarWindow {
                 let upper = adj.upper();
                 let page_size = adj.page_size();
 
-                // This fires per scroll frame, so only re-arm the debounce here.
+                // This fires per scroll frame. Starting a video waits for
+                // the debounce; stopping one that scrolled away does not,
+                // or it would decode through the whole scroll.
+                if let Some(director) = win.imp().video_director.borrow().as_ref() {
+                    director.release_scrolled_away();
+                }
                 win.schedule_video_election();
 
                 // Auto-hide "new posts" banner when user scrolls to top

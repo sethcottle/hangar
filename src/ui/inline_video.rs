@@ -676,6 +676,22 @@ impl VideoDirector {
         });
     }
 
+    /// The per-scroll-frame check: a playing video that has left the
+    /// viewport stops now rather than after the debounce settles.
+    /// Continuous scrolling re-arms the debounced election every frame,
+    /// so without this a video kept decoding through the whole scroll
+    /// and the UI paid for every frame it painted off screen.
+    pub fn release_scrolled_away(&self) {
+        let Some(slot) = self.current_slot() else {
+            return;
+        };
+        if let Some(fraction) = self.visible_fraction_of(&slot)
+            && fraction < RELEASE_FRACTION
+        {
+            self.release_current();
+        }
+    }
+
     /// Re-arm the one election source. Every trigger comes through here.
     pub fn schedule_election(self: &Rc<Self>) {
         // Autoplay off and nothing playing: arm nothing.
@@ -940,6 +956,39 @@ mod tests {
             media::live_pipelines()
         );
         assert_eq!(peak, 1);
+        assert_eq!(media::live_pipelines(), 0);
+    }
+
+    /// The scroll-frame release acts only on a video it can measure as
+    /// gone. Nothing playing is a no-op, and a slot the timeline cannot
+    /// measure (thread and profile pages) must be left alone; the
+    /// threshold math itself is visible_fraction's, tested above.
+    #[test]
+    fn scroll_release_spares_what_it_cannot_measure() {
+        with_gtk(scroll_release_spares_what_it_cannot_measure_body);
+    }
+
+    fn scroll_release_spares_what_it_cannot_measure_body() {
+        let director = VideoDirector::new(&crate::state::AppSettings::default());
+        set_director(&director);
+
+        // Idle: nothing to do, nothing to break.
+        director.release_scrolled_away();
+        assert_eq!(director.current_id(), None);
+
+        // A manual video on widgets the timeline cannot measure, which is
+        // what a thread or profile page's player looks like from here.
+        let slot = new_slot(0);
+        director.arm(&slot, Intent::Manual);
+        assert_eq!(media::live_pipelines(), 1);
+        director.release_scrolled_away();
+        assert_eq!(
+            director.current_id(),
+            Some(slot.id()),
+            "an unmeasurable video must not be torn down by a timeline scroll"
+        );
+
+        slot.release();
         assert_eq!(media::live_pipelines(), 0);
     }
 
