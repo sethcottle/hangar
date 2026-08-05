@@ -88,6 +88,18 @@ static IMAGE_RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
 static DOWNLOAD_SEMAPHORE: Lazy<Arc<tokio::sync::Semaphore>> =
     Lazy::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT)));
 
+/// One HTTP client for every image fetch, with timeouts. `reqwest::get`
+/// built a throwaway client per image and never timed out, so one
+/// stalled connection parked its URL in the in-flight set forever and
+/// every widget poll waiting on it spun for the rest of the session.
+static IMAGE_HTTP: Lazy<reqwest::Client> = Lazy::new(|| {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("image http client")
+});
+
 /// Reference to cache database (for API compatibility)
 static CACHE_DB: Lazy<RwLock<Option<Arc<CacheDb>>>> = Lazy::new(|| RwLock::new(None));
 
@@ -319,7 +331,7 @@ fn spawn_fetch_if_needed(url: &str) -> bool {
         };
 
         let result: Option<Vec<u8>> = async {
-            let response = reqwest::get(&url_clone).await.ok()?;
+            let response = IMAGE_HTTP.get(&url_clone).send().await.ok()?;
             if !response.status().is_success() {
                 return None;
             }
