@@ -699,6 +699,34 @@ impl HangarApplication {
         });
     }
 
+    /// Tell the authorization server the grant is over, then drop the
+    /// local credential.
+    ///
+    /// The delete runs whatever the revoke did: an offline sign-out must
+    /// still leave nothing usable on disk, and a revoke that failed is not
+    /// a reason to keep the key.
+    fn revoke_and_forget(did_str: &str) {
+        let Ok(did) = did_str.parse::<atrium_api::types::string::Did>() else {
+            eprintln!("Sign out: unparseable DID, leaving the session file alone");
+            return;
+        };
+        let store = crate::state::session_store::FileSessionStore::new();
+
+        match OAuthManager::build_restore_client(store.clone(), &did) {
+            Ok(client) => {
+                if let Err(e) = runtime::block_on(client.revoke(&did)) {
+                    // Expected offline, or when the grant is already gone.
+                    eprintln!("Sign out: the server did not confirm the revoke: {e}");
+                }
+            }
+            Err(e) => eprintln!("Sign out: no client to revoke with: {e}"),
+        }
+
+        if let Err(e) = store.forget(&did) {
+            eprintln!("Sign out: failed to drop the stored credential: {e}");
+        }
+    }
+
     /// Sign out: clear session, close window, and restart fresh
     fn sign_out(&self) {
         // Drop the live agent first; closing the window does not. The client
@@ -706,6 +734,10 @@ impl HangarApplication {
         // account's agent would keep refreshing tokens and writing its own row
         // over the session file the new sign-in is writing into.
         self.client().sign_out();
+
+        // Read before the per-account state below clears it; the revoke
+        // and the file row are both keyed by DID.
+        let did_for_revoke = self.imp().user_did.borrow().clone();
 
         // Per-account state that outlives the window. The poll checks
         // `newest_post_uri` before doing anything, so clearing it quiets it.
@@ -719,9 +751,19 @@ impl HangarApplication {
         crate::ui::post_row::set_current_user_did(None);
         crate::ui::actor_row::set_viewer_did(None);
 
-        // Clear the stored session
+        // Clear the stored session: the keyring row, the server-side
+        // grant, and the OAuth credential file. The keyring alone is not
+        // enough. For an OAuth login it carries only the DID and handle
+        // while the DPoP key and refresh token live in oauth-sessions.json,
+        // so stopping there left a working credential on disk.
+        let signed_out_did = did_for_revoke;
         thread::spawn(move || {
-            let _ = runtime::block_on(SessionManager::clear());
+            if let Err(e) = runtime::block_on(SessionManager::clear()) {
+                eprintln!("Failed to clear the keyring entry: {e}");
+            }
+            if let Some(did) = signed_out_did {
+                Self::revoke_and_forget(&did);
+            }
         });
 
         // Closing the current window drops all UI state.

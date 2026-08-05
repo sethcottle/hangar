@@ -11,6 +11,8 @@ use atrium_oauth::Scope;
 use atrium_oauth::store::session::{Session, SessionStore};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::Write;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -103,7 +105,13 @@ impl FileSessionStore {
         let config_dir = dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join(crate::config::APP_ID);
-        let _ = std::fs::create_dir_all(&config_dir);
+        // 0700: this directory holds the DPoP private key and the refresh
+        // token, so nothing else running as this user should be able to
+        // list it, let alone read it.
+        let _ = std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&config_dir);
         config_dir.join("oauth-sessions.json")
     }
 
@@ -123,6 +131,18 @@ impl FileSessionStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
             Err(e) => Err(StoreError::Io(e)),
         }
+    }
+
+    /// Forget one DID's row, whatever else is going on.
+    ///
+    /// Sign out used to clear the keyring and stop, but for an OAuth login
+    /// the keyring holds only the handle and DID; the credential itself
+    /// lives here. Leaving it meant a live refresh token and DPoP key sat
+    /// on disk after the one action a user takes to end their session.
+    pub fn forget(&self, did: &Did) -> Result<(), StoreError> {
+        let mut guard = self.inner.lock().map_err(|_| StoreError::Lock)?;
+        guard.remove(did);
+        self.save_to_disk(&guard)
     }
 
     /// Backdate a stored session's expiry so the next refresh actually runs.
@@ -177,9 +197,23 @@ impl FileSessionStore {
             std::fs::create_dir_all(parent)?;
         }
 
-        // Write atomically via temp file
+        // Write atomically via temp file, created 0600 before a byte of
+        // key material reaches it. The rename replaces the target inode,
+        // so the mode has to be set here on every write or a hardened
+        // file loosens itself on the next token refresh.
         let tmp_path = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp_path, json)?;
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp_path)?;
+            file.write_all(json.as_bytes())?;
+            // The credential surviving a crash matters more than the
+            // microseconds; a torn file costs a re-auth.
+            file.sync_all()?;
+        }
         std::fs::rename(&tmp_path, &self.path)?;
         Ok(())
     }
@@ -320,6 +354,46 @@ mod tests {
         assert!(store.path.exists(), "the session row landed on disk");
 
         drop(guard);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The credential file is 0600 and its directory 0700, on the first
+    /// write and on every rewrite, since the rename replaces the inode.
+    #[test]
+    fn the_credential_file_is_not_readable_by_anyone_else() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("hangar-perms-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = FileSessionStore {
+            inner: std::sync::Arc::new(Mutex::new(HashMap::new())),
+            path: dir.join("oauth-sessions.json"),
+            pending_redirect_uri: None,
+            pending_scopes: None,
+        };
+
+        let row: StoredSession = serde_json::from_str(LEGACY_ROW).unwrap();
+        let did: Did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".parse().unwrap();
+        store.inner.lock().unwrap().insert(did.clone(), row);
+
+        for pass in ["first write", "rewrite"] {
+            let guard = store.inner.lock().unwrap();
+            store.save_to_disk(&guard).expect("saves");
+            drop(guard);
+            let mode = std::fs::metadata(&store.path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{pass}: mode is {mode:o}, not 0600");
+        }
+
+        // Sign out drops the row rather than leaving a live credential.
+        store.forget(&did).expect("forgets");
+        assert!(store.inner.lock().unwrap().is_empty());
+        let on_disk = std::fs::read_to_string(&store.path).unwrap();
+        assert!(
+            !on_disk.contains("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"),
+            "the credential survived sign out: {on_disk}"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -8,6 +8,14 @@ use crate::atproto::types::{
     ReplyContext, RepostReason, SavedFeed, Session, ThreadgateConfig, ThreadgateRule, VideoEmbed,
 };
 use crate::config::DEFAULT_PDS;
+use std::time::Duration;
+
+/// How long an XRPC call may take before it is a failure rather than a
+/// wait. Untimed calls hung forever on a peer that keeps the socket open
+/// and never answers, which latched the poll flags for the session and
+/// left the UI with no error to show.
+const XRPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const XRPC_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Bluesky's video processing service; uploads land here, not on the PDS.
 const VIDEO_SERVICE: &str = "https://video.bsky.app";
@@ -19,8 +27,8 @@ use atrium_api::types::Unknown;
 use atrium_api::types::string::RecordKey;
 use atrium_xrpc_client::reqwest::ReqwestClient;
 use std::collections::HashMap;
-use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -115,8 +123,14 @@ impl UnreadCounts {
 /// Supports both credential-based (app password) and OAuth authentication.
 /// Only one of `credential_agent` or `oauth_agent` is set at a time.
 pub struct HangarClient {
-    credential_agent: RwLock<Option<CredentialAgent>>,
-    oauth_agent: RwLock<Option<OAuthAgentType>>,
+    // Arc, so a caller clones the agent out under a guard held for the
+    // clone alone. Holding a read guard across the await made two things
+    // possible: a recursive read from a nested call (create_post ->
+    // create_threadgate) deadlocking behind a queued writer, since std's
+    // RwLock is write-preferring, and sign_out's write() blocking the GTK
+    // main thread for the length of a network round trip.
+    credential_agent: RwLock<Option<Arc<CredentialAgent>>>,
+    oauth_agent: RwLock<Option<Arc<OAuthAgentType>>>,
     service_url: String,
     /// Set once the server rejects our credentials after atrium has already
     /// tried to refresh them. Latched, because a dead session fails every
@@ -130,14 +144,15 @@ pub struct HangarClient {
 /// monomorphizes the API calls for each concrete agent type.
 macro_rules! with_agent {
     ($self:expr, $agent:ident => $body:expr) => {{
-        // Try credential agent first (more common), then OAuth
-        let cred_guard = $self.credential_agent.read().unwrap();
-        if let Some($agent) = cred_guard.as_ref() {
+        // Try credential agent first (more common), then OAuth. Each
+        // clone drops its guard on the same statement, so `$body` and its
+        // awaits run with no lock held.
+        let cred = $self.credential_agent.read().unwrap().clone();
+        if let Some($agent) = cred.as_deref() {
             $body
         } else {
-            drop(cred_guard);
-            let oauth_guard = $self.oauth_agent.read().unwrap();
-            let $agent = oauth_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
+            let oauth = $self.oauth_agent.read().unwrap().clone();
+            let $agent = oauth.as_deref().ok_or(ClientError::NotAuthenticated)?;
             $body
         }
     }};
@@ -147,8 +162,8 @@ macro_rules! with_agent {
 /// Use for methods that create/delete records (which need `repo: did`).
 macro_rules! with_agent_and_did {
     ($self:expr, $agent:ident, $did:ident => $body:expr) => {{
-        let cred_guard = $self.credential_agent.read().unwrap();
-        if let Some($agent) = cred_guard.as_ref() {
+        let cred = $self.credential_agent.read().unwrap().clone();
+        if let Some($agent) = cred.as_deref() {
             let $did = $agent
                 .get_session()
                 .await
@@ -158,9 +173,8 @@ macro_rules! with_agent_and_did {
                 .clone();
             $body
         } else {
-            drop(cred_guard);
-            let oauth_guard = $self.oauth_agent.read().unwrap();
-            let $agent = oauth_guard.as_ref().ok_or(ClientError::NotAuthenticated)?;
+            let oauth = $self.oauth_agent.read().unwrap().clone();
+            let $agent = oauth.as_deref().ok_or(ClientError::NotAuthenticated)?;
             let $did = $agent.did().await.ok_or(ClientError::NotAuthenticated)?;
             $body
         }
@@ -168,6 +182,25 @@ macro_rules! with_agent_and_did {
 }
 
 impl HangarClient {
+    /// An XRPC transport that gives up rather than hanging forever.
+    fn xrpc_client(service_url: &str) -> ReqwestClient {
+        match reqwest::Client::builder()
+            .connect_timeout(XRPC_CONNECT_TIMEOUT)
+            .timeout(XRPC_TIMEOUT)
+            .build()
+        {
+            Ok(http) => atrium_xrpc_client::reqwest::ReqwestClientBuilder::new(service_url)
+                .client(http)
+                .build(),
+            // A builder failure means no TLS backend; the untimed default
+            // is still better than refusing to start.
+            Err(e) => {
+                eprintln!("Falling back to an untimed HTTP client: {e}");
+                ReqwestClient::new(service_url)
+            }
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             credential_agent: RwLock::new(None),
@@ -228,7 +261,7 @@ impl HangarClient {
     }
 
     pub async fn login(&self, handle: &str, password: &str) -> Result<Session, ClientError> {
-        let client = ReqwestClient::new(&self.service_url);
+        let client = Self::xrpc_client(&self.service_url);
         let agent = AtpAgent::new(client, MemorySessionStore::default());
 
         let result = agent
@@ -247,7 +280,7 @@ impl HangarClient {
 
         // Clear any existing OAuth agent
         *self.oauth_agent.write().unwrap() = None;
-        *self.credential_agent.write().unwrap() = Some(agent);
+        *self.credential_agent.write().unwrap() = Some(Arc::new(agent));
         self.session_expired.store(false, Ordering::Relaxed);
 
         Ok(session)
@@ -279,7 +312,7 @@ impl HangarClient {
 
         // Clear any existing credential agent
         *self.credential_agent.write().unwrap() = None;
-        *self.oauth_agent.write().unwrap() = Some(agent);
+        *self.oauth_agent.write().unwrap() = Some(Arc::new(agent));
 
         Session {
             did: did_str,
@@ -304,7 +337,7 @@ impl HangarClient {
             AuthMethod::OAuth => unreachable!("handled above"),
         };
 
-        let client = ReqwestClient::new(&self.service_url);
+        let client = Self::xrpc_client(&self.service_url);
         let agent = AtpAgent::new(client, MemorySessionStore::default());
 
         let atrium_session = atrium_api::com::atproto::server::create_session::Output::from(
@@ -335,7 +368,7 @@ impl HangarClient {
 
         // Clear any existing OAuth agent
         *self.oauth_agent.write().unwrap() = None;
-        *self.credential_agent.write().unwrap() = Some(agent);
+        *self.credential_agent.write().unwrap() = Some(Arc::new(agent));
 
         Ok(())
     }
@@ -438,7 +471,6 @@ impl HangarClient {
         *self.oauth_agent.write().unwrap() = None;
     }
 
-    #[allow(clippy::await_holding_lock)]
     pub async fn get_timeline(
         &self,
         cursor: Option<&str>,
@@ -915,7 +947,6 @@ impl HangarClient {
         })
     }
 
-    #[allow(clippy::await_holding_lock)]
     pub async fn get_profile(&self, actor: &str) -> Result<Profile, ClientError> {
         with_agent!(self, agent => {
 
@@ -984,7 +1015,6 @@ impl HangarClient {
     }
 
     /// Fetch multiple profiles in a single batch request (up to 25 at a time)
-    #[allow(clippy::await_holding_lock)]
     pub async fn get_profiles(&self, actors: &[String]) -> Result<Vec<Profile>, ClientError> {
         if actors.is_empty() {
             return Ok(vec![]);
@@ -1053,7 +1083,6 @@ impl HangarClient {
     }
 
     /// Like a post and return the URI of the created like record
-    #[allow(clippy::await_holding_lock)]
     pub async fn like(&self, uri: &str, cid: &str) -> Result<String, ClientError> {
         with_agent_and_did!(self, agent, did => {
         // DID available as `did`
@@ -1092,7 +1121,6 @@ impl HangarClient {
     }
 
     /// Repost a post and return the URI of the created repost record
-    #[allow(clippy::await_holding_lock)]
     pub async fn repost(&self, uri: &str, cid: &str) -> Result<String, ClientError> {
         with_agent_and_did!(self, agent, did => {
         // DID available as `did`
@@ -1132,27 +1160,23 @@ impl HangarClient {
 
     /// Unlike a post by deleting the like record
     /// `like_uri` is the AT-URI of the like record (from viewer_like)
-    #[allow(clippy::await_holding_lock)]
     pub async fn unlike(&self, like_uri: &str) -> Result<(), ClientError> {
         self.delete_record(like_uri, "app.bsky.feed.like").await
     }
 
     /// Delete a repost by deleting the repost record
     /// `repost_uri` is the AT-URI of the repost record (from viewer_repost)
-    #[allow(clippy::await_holding_lock)]
     pub async fn delete_repost(&self, repost_uri: &str) -> Result<(), ClientError> {
         self.delete_record(repost_uri, "app.bsky.feed.repost").await
     }
 
     /// Delete one of the user's own posts
     /// `post_uri` is the AT-URI of the post record
-    #[allow(clippy::await_holding_lock)]
     pub async fn delete_post(&self, post_uri: &str) -> Result<(), ClientError> {
         self.delete_record(post_uri, "app.bsky.feed.post").await
     }
 
     /// Generic delete record helper
-    #[allow(clippy::await_holding_lock)]
     async fn delete_record(&self, record_uri: &str, collection: &str) -> Result<(), ClientError> {
         with_agent!(self, agent => {
 
@@ -1186,7 +1210,6 @@ impl HangarClient {
     }
 
     /// Resolve an AT Protocol handle to a DID.
-    #[allow(clippy::await_holding_lock)]
     pub async fn resolve_handle(&self, handle: &str) -> Result<String, ClientError> {
         with_agent!(self, agent => {
 
@@ -1227,12 +1250,10 @@ impl HangarClient {
         (raw_facets, resolved_dids)
     }
 
-    #[allow(clippy::await_holding_lock)]
     pub async fn create_post(&self, text: &str) -> Result<(), ClientError> {
         self.create_post_internal(text, None).await
     }
 
-    #[allow(clippy::await_holding_lock)]
     pub async fn create_reply(
         &self,
         text: &str,
@@ -1269,7 +1290,6 @@ impl HangarClient {
     }
 
     /// Upload a blob (image/video) to the PDS and return the blob ref as JSON.
-    #[allow(clippy::await_holding_lock)]
     pub async fn upload_blob(
         &self,
         data: Vec<u8>,
@@ -1304,7 +1324,6 @@ impl HangarClient {
 
     /// Mint a service auth token from the PDS, bound to one method on one
     /// audience, expiring `exp_in` seconds out.
-    #[allow(clippy::await_holding_lock)]
     async fn service_auth_token(
         &self,
         aud: &str,
@@ -1334,7 +1353,6 @@ impl HangarClient {
     }
 
     /// The signed-in user's DID document, straight from the server.
-    #[allow(clippy::await_holding_lock)]
     async fn describe_repo_did_doc(&self, did: &str) -> Result<serde_json::Value, ClientError> {
         with_agent!(self, agent => {
         let repo = did
@@ -1542,14 +1560,12 @@ impl HangarClient {
     }
 
     /// The signed-in DID, from whichever agent is active.
-    #[allow(clippy::await_holding_lock)]
     async fn current_did(&self) -> Result<String, ClientError> {
         with_agent_and_did!(self, _agent, did => Ok(did.to_string()))
     }
 
     /// Create a post with full compose data (images, language, CW, threadgate, etc.)
     /// Returns `(uri, cid)` of the created post.
-    #[allow(clippy::await_holding_lock)]
     pub async fn create_post_with_data(
         &self,
         data: &ComposeData,
@@ -1739,7 +1755,6 @@ impl HangarClient {
     }
 
     /// Create a threadgate record controlling who can reply to a post.
-    #[allow(clippy::await_holding_lock)]
     async fn create_threadgate(
         &self,
         post_uri: &str,
@@ -1809,7 +1824,6 @@ impl HangarClient {
     }
 
     /// Create a postgate record controlling quoting of a post.
-    #[allow(clippy::await_holding_lock)]
     async fn create_postgate(
         &self,
         post_uri: &str,
@@ -1901,7 +1915,6 @@ impl HangarClient {
         Ok(results)
     }
 
-    #[allow(clippy::await_holding_lock)]
     async fn create_post_internal(
         &self,
         text: &str,
@@ -1939,7 +1952,6 @@ impl HangarClient {
     }
 
     /// Get the user's saved/pinned feeds from preferences
-    #[allow(clippy::await_holding_lock)]
     pub async fn get_saved_feeds(&self) -> Result<Vec<SavedFeed>, ClientError> {
         with_agent!(self, agent => {
 
@@ -2041,7 +2053,6 @@ impl HangarClient {
     }
 
     /// Fetch a custom feed by its AT-URI
-    #[allow(clippy::await_holding_lock)]
     pub async fn get_feed(
         &self,
         feed_uri: &str,
@@ -2078,7 +2089,6 @@ impl HangarClient {
     }
 
     /// Get a post thread (the main post and its replies)
-    #[allow(clippy::await_holding_lock)]
     pub async fn get_thread(&self, post_uri: &str) -> Result<Vec<Post>, ClientError> {
         with_agent!(self, agent => {
 
@@ -2241,7 +2251,6 @@ impl HangarClient {
     }
 
     /// Get an author's feed (posts by a specific user)
-    #[allow(clippy::await_holding_lock)]
     /// `filter` is a lexicon value: posts_and_author_threads,
     /// posts_with_replies, posts_with_media, posts_with_video. None leaves
     /// the server's default, which includes replies.
@@ -2284,7 +2293,6 @@ impl HangarClient {
     }
 
     /// Get posts liked by a specific user
-    #[allow(clippy::await_holding_lock)]
     pub async fn get_actor_likes(
         &self,
         actor: &str,
@@ -2322,7 +2330,6 @@ impl HangarClient {
 
     /// Get notifications (mentions, replies, quotes, likes, reposts, follows)
     /// If `mentions_only` is true, filters to just mentions, replies, and quotes
-    #[allow(clippy::await_holding_lock)]
     pub async fn get_notifications(
         &self,
         cursor: Option<&str>,
@@ -2445,7 +2452,6 @@ impl HangarClient {
     }
 
     /// Get list of direct message conversations
-    #[allow(clippy::await_holding_lock)]
     pub async fn get_conversations(
         &self,
         cursor: Option<&str>,
@@ -2490,7 +2496,6 @@ impl HangarClient {
     ///
     /// One page of each, notifications capped at 100. A very busy account can
     /// undercount, but the badge display caps at 99+ anyway.
-    #[allow(clippy::await_holding_lock)]
     pub async fn get_unread_counts(&self) -> Result<UnreadCounts, ClientError> {
         use atrium_api::agent::bluesky::{AtprotoServiceType, BSKY_CHAT_DID};
 
@@ -2552,7 +2557,6 @@ impl HangarClient {
     ///
     /// `seenAt` is account-wide. The server cannot mark only mentions seen,
     /// so the Mentions and Activity badges clear together.
-    #[allow(clippy::await_holding_lock)]
     pub async fn update_notifications_seen(&self) -> Result<(), ClientError> {
         with_agent!(self, agent => {
 
@@ -2576,7 +2580,6 @@ impl HangarClient {
     /// Mark a conversation read up to its latest message.
     ///
     /// The chat badge follows the server's word on the next poll.
-    #[allow(clippy::await_holding_lock)]
     pub async fn mark_convo_read(&self, convo_id: &str) -> Result<(), ClientError> {
         use atrium_api::agent::bluesky::{AtprotoServiceType, BSKY_CHAT_DID};
 
@@ -2605,7 +2608,6 @@ impl HangarClient {
     }
 
     /// Get messages for a specific conversation
-    #[allow(clippy::await_holding_lock)]
     pub async fn get_messages(
         &self,
         convo_id: &str,
@@ -2740,7 +2742,6 @@ impl HangarClient {
     ///
     /// The server answers with the message it stored, so the open view can
     /// append the real thing rather than a local copy.
-    #[allow(clippy::await_holding_lock)]
     pub async fn send_chat_message(
         &self,
         convo_id: &str,
@@ -2784,7 +2785,6 @@ impl HangarClient {
     /// account restriction. The server does not say which. When chat is
     /// allowed but no conversation exists yet, get_convo_for_members
     /// mints an empty one.
-    #[allow(clippy::await_holding_lock)]
     pub async fn start_conversation(&self, did: &str) -> Result<Option<Conversation>, ClientError> {
         use atrium_api::agent::bluesky::{AtprotoServiceType, BSKY_CHAT_DID};
 
@@ -2834,7 +2834,6 @@ impl HangarClient {
 
     /// Add an emoji reaction to a message. The server answers with the
     /// updated message, so the open view can refresh the row from truth.
-    #[allow(clippy::await_holding_lock)]
     pub async fn add_chat_reaction(
         &self,
         convo_id: &str,
@@ -2869,7 +2868,6 @@ impl HangarClient {
     }
 
     /// Take a reaction back off a message. Same answer shape as adding.
-    #[allow(clippy::await_holding_lock)]
     pub async fn remove_chat_reaction(
         &self,
         convo_id: &str,
@@ -2905,7 +2903,6 @@ impl HangarClient {
 
     /// Delete a message from this account's view of the conversation. The
     /// other side keeps their copy; there is no delete-for-everyone.
-    #[allow(clippy::await_holding_lock)]
     pub async fn delete_chat_message(
         &self,
         convo_id: &str,
@@ -2938,7 +2935,6 @@ impl HangarClient {
     }
 
     /// Search posts by query string
-    #[allow(clippy::await_holding_lock)]
     pub async fn search_posts(
         &self,
         query: &str,
@@ -2983,7 +2979,6 @@ impl HangarClient {
 
     /// Fast typeahead search for actors (used by mention autocomplete).
     /// Returns a lightweight list of matching profiles.
-    #[allow(clippy::await_holding_lock)]
     pub async fn search_actors_typeahead(
         &self,
         query: &str,
@@ -3041,7 +3036,6 @@ impl HangarClient {
     }
 
     /// Search actors (users) by query string, with cursor pagination
-    #[allow(clippy::await_holding_lock)]
     pub async fn search_actors(
         &self,
         query: &str,
@@ -3099,7 +3093,6 @@ impl HangarClient {
     }
 
     /// Fetch one page of the accounts following `actor`
-    #[allow(clippy::await_holding_lock)]
     pub async fn get_followers(
         &self,
         actor: &str,
@@ -3131,7 +3124,6 @@ impl HangarClient {
     }
 
     /// Fetch one page of the accounts `actor` follows
-    #[allow(clippy::await_holding_lock)]
     pub async fn get_follows(
         &self,
         actor: &str,
@@ -3206,7 +3198,6 @@ impl HangarClient {
     /// avatar and banner only when a new image was picked. The write swaps
     /// against the record CID that was read, so a concurrent edit fails
     /// loudly instead of being clobbered.
-    #[allow(clippy::await_holding_lock)]
     pub async fn update_profile(
         &self,
         display_name: &str,
@@ -3303,7 +3294,6 @@ impl HangarClient {
 
     /// Accounts the network suggests for the signed-in user, for filling
     /// an empty people search with something better than a shrug.
-    #[allow(clippy::await_holding_lock)]
     pub async fn get_suggestions(&self, limit: u8) -> Result<Vec<Profile>, ClientError> {
         with_agent!(self, agent => {
 
@@ -3326,7 +3316,6 @@ impl HangarClient {
     }
 
     /// Follow a user. Returns the follow record's URI, which unfollow needs.
-    #[allow(clippy::await_holding_lock)]
     pub async fn follow(&self, subject_did: &str) -> Result<String, ClientError> {
         with_agent_and_did!(self, agent, did => {
 
@@ -3365,7 +3354,6 @@ impl HangarClient {
 
     /// Unfollow by deleting the follow record
     /// `follow_uri` is the AT-URI of the follow record (from viewer_following)
-    #[allow(clippy::await_holding_lock)]
     pub async fn unfollow(&self, follow_uri: &str) -> Result<(), ClientError> {
         self.delete_record(follow_uri, "app.bsky.graph.follow")
             .await
@@ -3373,7 +3361,6 @@ impl HangarClient {
 
     /// Block an account. A record like follow; the URI comes back for
     /// unblocking later.
-    #[allow(clippy::await_holding_lock)]
     pub async fn block(&self, subject_did: &str) -> Result<String, ClientError> {
         with_agent_and_did!(self, agent, did => {
 
@@ -3411,14 +3398,12 @@ impl HangarClient {
     }
 
     /// Unblock by deleting the block record
-    #[allow(clippy::await_holding_lock)]
     pub async fn unblock(&self, block_uri: &str) -> Result<(), ClientError> {
         self.delete_record(block_uri, "app.bsky.graph.block").await
     }
 
     /// Mute an account. Server-side state, no record; feeds stop carrying
     /// the account on their next fetch.
-    #[allow(clippy::await_holding_lock)]
     pub async fn mute_actor(&self, did: &str) -> Result<(), ClientError> {
         with_agent!(self, agent => {
 
@@ -3440,7 +3425,6 @@ impl HangarClient {
     }
 
     /// Take a mute back off an account
-    #[allow(clippy::await_holding_lock)]
     pub async fn unmute_actor(&self, did: &str) -> Result<(), ClientError> {
         with_agent!(self, agent => {
 
@@ -3462,7 +3446,6 @@ impl HangarClient {
     }
 
     /// File a moderation report on an account or a post.
-    #[allow(clippy::await_holding_lock)]
     pub async fn create_report(
         &self,
         reason_type: &str,
@@ -3523,7 +3506,6 @@ impl HangarClient {
     /// Save a post to the signed-in user's bookmarks. Bookmarks are private
     /// server-side state, not repo records, so there is nothing to delete by
     /// URI later; the post URI itself is the key.
-    #[allow(clippy::await_holding_lock)]
     pub async fn create_bookmark(&self, uri: &str, cid: &str) -> Result<(), ClientError> {
         with_agent!(self, agent => {
 
@@ -3548,7 +3530,6 @@ impl HangarClient {
     }
 
     /// Take a post out of the signed-in user's bookmarks
-    #[allow(clippy::await_holding_lock)]
     pub async fn delete_bookmark(&self, uri: &str) -> Result<(), ClientError> {
         with_agent!(self, agent => {
 
@@ -3570,7 +3551,6 @@ impl HangarClient {
     }
 
     /// Fetch one page of the signed-in user's saved posts
-    #[allow(clippy::await_holding_lock)]
     pub async fn get_bookmarks(
         &self,
         cursor: Option<&str>,
