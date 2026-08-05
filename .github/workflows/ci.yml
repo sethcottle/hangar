@@ -52,10 +52,12 @@ jobs:
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@v22
 
-      # Free, zero-config binary cache. Without it every run rebuilds the
-      # whole GTK4 closure from source.
-      - name: Set up Nix cache
-        uses: DeterminateSystems/magic-nix-cache-action@v14
+      # No CI-level binary cache. magic-nix-cache is deprecated and now
+      # fails with GitHub rate-limit errors mid-build, and its successor
+      # wants a FlakeHub account this project does not need. System
+      # dependencies still come prebuilt from cache.nixos.org; what this
+      # costs is recompiling the crate graph each run, which is slower
+      # but cannot fail for a reason that is not ours.
 
       # flake.nix maintains its own dependency list separate from the apt
       # packages the cargo job installs, so it drifts silently unless
