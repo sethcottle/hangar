@@ -612,6 +612,7 @@ fn recycled_rows_in_a_virtualized_list_keep_their_media_body() {
     }
 
     let adjustment = scrolled.vadjustment();
+    let rss_before = rss_bytes();
     let mut census = Census::default();
     let mut recycled_seen = 0u32;
     let mut fresh_skipped = 0u32;
@@ -686,6 +687,32 @@ fn recycled_rows_in_a_virtualized_list_keep_their_media_body() {
         bad, 0,
         "{bad} of {total} recycled-row observations had no media under the band"
     );
+
+    // The memory canary: hundreds of rebinds over a 5000 post feed must
+    // not grow the process by whole gigabytes. The ceiling is generous
+    // because the allocator keeps freed pages; this catches the class of
+    // bug where every bind retains something, not fine-grained waste.
+    if let (Some(before), Some(after)) = (rss_before, rss_bytes()) {
+        let grew = after.saturating_sub(before);
+        eprintln!(
+            "rss: {:.1} MB before, {:.1} MB after, {:.1} MB grown",
+            before as f64 / 1048576.0,
+            after as f64 / 1048576.0,
+            grew as f64 / 1048576.0,
+        );
+        assert!(
+            grew < 256 * 1024 * 1024,
+            "the sweep grew the process by {:.1} MB; something retains per bind",
+            grew as f64 / 1048576.0,
+        );
+    }
+}
+
+/// Resident set size in bytes, from procfs; None off Linux.
+fn rss_bytes() -> Option<usize> {
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let resident_pages: usize = statm.split_whitespace().nth(1)?.parse().ok()?;
+    Some(resident_pages * 4096)
 }
 
 /// The rows a list has realized.
