@@ -21,11 +21,15 @@ gstreamer = "0.25"
 # install gstreamer1.0-gtk4 separately. gtk_v4_14 replaces the crate's
 # gtk_v4_10 default to match this crate's own gtk4 feature.
 #
-# The GL features (waylandegl/x11egl/x11glx) and dmabuf are deliberately left
-# off: they add pkg-config modules to every packaging target, and dmabuf would
-# raise the runtime GStreamer floor from 1.20 to 1.24. The sink falls back to a
-# videoconvert path, which renders correctly.
-gst-plugin-gtk4 = { version = "0.15", default-features = false, features = ["gtk_v4_14"] }
+# The GL platform features let the sink negotiate GL memory, so frames
+# reach GTK as GPU textures instead of per-frame CPU uploads; on NVIDIA
+# the upload path stalls the frame clock and scrolling next to a playing
+# video janks. The needed pkg-config modules ship in the same dev
+# packages every build environment already installs, and the sink still
+# falls back to the videoconvert path where GL negotiation fails.
+# dmabuf stays off: it raises the runtime GStreamer floor from 1.20 to
+# 1.24, which the AppImage's host promise does not allow.
+gst-plugin-gtk4 = { version = "0.15", default-features = false, features = ["gtk_v4_14", "waylandegl", "x11egl", "x11glx"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 atrium-api = { version = "0.25", features = ["agent", "namespace-chatbsky"] }
 atrium-common = "0.1"

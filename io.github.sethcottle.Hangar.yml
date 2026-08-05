@@ -75,6 +75,9 @@ modules:
       - 'pkg-config --atleast-version=1.18 gstreamer-base-1.0 || { echo "hangar: gstreamer-base-1.0 >= 1.18 is required" >&2; exit 1; }'
       - 'pkg-config --atleast-version=1.18 gstreamer-video-1.0 || { echo "hangar: gstreamer-video-1.0 >= 1.18 is required" >&2; exit 1; }'
       - 'pkg-config --atleast-version=1.18 gstreamer-gl-1.0 || { echo "hangar: gstreamer-gl-1.0 >= 1.18 is required" >&2; exit 1; }'
+      - 'pkg-config --exists gstreamer-gl-egl-1.0 || { echo "hangar: gstreamer-gl-egl-1.0 is required" >&2; exit 1; }'
+      - 'pkg-config --exists gstreamer-gl-wayland-1.0 || { echo "hangar: gstreamer-gl-wayland-1.0 is required" >&2; exit 1; }'
+      - 'pkg-config --exists gstreamer-gl-x11-1.0 || { echo "hangar: gstreamer-gl-x11-1.0 is required" >&2; exit 1; }'
       - cargo --offline fetch --manifest-path Cargo.toml --verbose
       - cargo --offline build --release --verbose
       - install -Dm755 target/release/hangar /app/bin/hangar

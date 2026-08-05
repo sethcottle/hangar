@@ -1088,6 +1088,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "gdk4-wayland"
+version = "0.11.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32d95828dadc0357dee236cc6a5712808bd894d3217159982592ce24f2b8aaf7"
+dependencies = [
+ "gdk4",
+ "gdk4-wayland-sys",
+ "gio",
+ "glib",
+ "libc",
+]
+
+[[package]]
+name = "gdk4-wayland-sys"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "653cafb8715f2ac1c56edaf8060d9360ae3acbe3c6fb61b676a2917d42b668cf"
+dependencies = [
+ "glib-sys",
+ "libc",
+ "system-deps",
+]
+
+[[package]]
 name = "gdk4-win32"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1108,6 +1132,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2ca92d792abe5433bad3fd8fc2e234864d5e37268f6600a29350d174a30a942"
 dependencies = [
  "cairo-sys-rs",
+ "gdk4-sys",
+ "glib-sys",
+ "libc",
+ "system-deps",
+]
+
+[[package]]
+name = "gdk4-x11"
+version = "0.11.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9d892b4cf5a07e90e1390e93cd792975746c68b59f790a2de9e96ce77211ea9a"
+dependencies = [
+ "gdk4",
+ "gdk4-x11-sys",
+ "gio",
+ "glib",
+ "libc",
+]
+
+[[package]]
+name = "gdk4-x11-sys"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "24d41f2e28f62378b081288914325d73bddbb6ccbbadb41aa6392afc71d27002"
+dependencies = [
  "gdk4-sys",
  "glib-sys",
  "libc",
@@ -1322,11 +1371,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9d22a27972c25e706b428e78356458446314c70eb31aef07d4a32b843a6dea94"
 dependencies = [
  "async-channel",
+ "gdk4-wayland",
  "gdk4-win32",
+ "gdk4-x11",
  "gst-plugin-version-helper",
  "gstreamer",
  "gstreamer-base",
  "gstreamer-gl",
+ "gstreamer-gl-egl",
+ "gstreamer-gl-wayland",
+ "gstreamer-gl-x11",
  "gstreamer-video",
  "gtk4",
  "windows-sys 0.61.2",
@@ -1409,6 +1463,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "gstreamer-gl-egl"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ff3c29e6d4b92ef22b0bacc2cff02902d40516942fead63c656d7fccc75221e8"
+dependencies = [
+ "glib",
+ "gstreamer",
+ "gstreamer-gl",
+ "gstreamer-gl-egl-sys",
+ "libc",
+]
+
+[[package]]
+name = "gstreamer-gl-egl-sys"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e7294007aa6c0c6082d4835c391ab4094ef09ef581cde4c67edad2c1befcfd84"
+dependencies = [
+ "glib-sys",
+ "gstreamer-gl-sys",
+ "libc",
+ "system-deps",
+]
+
+[[package]]
 name = "gstreamer-gl-sys"
 version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1419,6 +1498,56 @@ dependencies = [
  "gstreamer-base-sys",
  "gstreamer-sys",
  "gstreamer-video-sys",
+ "libc",
+ "system-deps",
+]
+
+[[package]]
+name = "gstreamer-gl-wayland"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9a83ca3d2030846f01be738b8b867ecb4b95269497bcfa459b8fc1ce897ad9f4"
+dependencies = [
+ "glib",
+ "gstreamer",
+ "gstreamer-gl",
+ "gstreamer-gl-wayland-sys",
+ "libc",
+]
+
+[[package]]
+name = "gstreamer-gl-wayland-sys"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ccd79a57650954ced0a0c8fcb38c561a83c1cb6515f1e318bbb6631ce287590"
+dependencies = [
+ "glib-sys",
+ "gstreamer-gl-sys",
+ "libc",
+ "system-deps",
+]
+
+[[package]]
+name = "gstreamer-gl-x11"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "642d86fed827466e2d1ff4f430313fdab5d113bc2bf1e9c9736a873e8832c6ca"
+dependencies = [
+ "glib",
+ "gstreamer",
+ "gstreamer-gl",
+ "gstreamer-gl-x11-sys",
+ "libc",
+]
+
+[[package]]
+name = "gstreamer-gl-x11-sys"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1391e727c873085ce4f8b2deb7fc4dcb15098ef75433777510860b0d983ff39f"
+dependencies = [
+ "glib-sys",
+ "gstreamer-gl-sys",
  "libc",
  "system-deps",
 ]
