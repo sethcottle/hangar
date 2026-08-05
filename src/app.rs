@@ -216,6 +216,16 @@ mod imp {
             });
             app.set_network_available(monitor.is_network_available());
 
+            // The poll skips while the window is backgrounded; a regained
+            // focus catches the feed up right away instead of waiting out
+            // the timer.
+            let app_clone = app.clone();
+            window.connect_is_active_notify(move |window| {
+                if window.is_active() {
+                    app_clone.check_for_new_posts();
+                }
+            });
+
             // The update nudge, only on builds no store keeps current, a
             // little after launch so startup owns the first seconds.
             if crate::update::check_enabled() {
@@ -1950,6 +1960,20 @@ impl HangarApplication {
 
         // Offline says why every request would fail; the banner covers it.
         if *self.imp().offline.borrow() {
+            return;
+        }
+
+        // A backgrounded window would prepend into a feed nobody is
+        // reading, every 30 seconds, for as long as it sits there; the
+        // model and the image caches grow with every pass and the kernel
+        // eventually ends it. Catch up on focus instead.
+        let window_active = self
+            .imp()
+            .window
+            .borrow()
+            .as_ref()
+            .is_some_and(|w| w.is_active());
+        if !window_active {
             return;
         }
 
