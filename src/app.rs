@@ -2068,8 +2068,6 @@ impl HangarApplication {
                         window.refresh_timestamps();
 
                         if !new_posts.is_empty() {
-                            let count = new_posts.len();
-
                             // Update anchor to newest post
                             if let Some(newest) = new_posts.first() {
                                 app.imp().newest_post_uri.replace(Some(newest.uri.clone()));
@@ -2077,10 +2075,13 @@ impl HangarApplication {
 
                             // Insert new posts at the top of the timeline
                             // User can scroll up to see them
-                            window.insert_posts_at_top(new_posts);
+                            let inserted = window.insert_posts_at_top(new_posts);
 
-                            // Show banner to let user know there are new posts above
-                            window.show_new_posts_banner(count);
+                            // Count what actually landed: a reordered feed
+                            // re-serves posts already on screen.
+                            if inserted > 0 {
+                                window.show_new_posts_banner(inserted);
+                            }
                         }
                     }
                     glib::ControlFlow::Break

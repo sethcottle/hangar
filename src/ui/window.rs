@@ -1656,24 +1656,43 @@ impl HangarWindow {
 
     /// Insert new posts at the top of the timeline without disrupting the current view.
     /// Rebuilds the model with new posts prepended, then restores scroll position.
-    pub fn insert_posts_at_top(&self, posts: Vec<Post>) {
+    /// Put fresh posts at the head of the timeline.
+    ///
+    /// Returns how many were actually inserted, which is what the banner
+    /// should count: a reordered feed re-serves posts already on screen.
+    pub fn insert_posts_at_top(&self, posts: Vec<Post>) -> usize {
         let posts = Self::filter_feed_posts(posts);
         let Some(model) = self.imp().timeline_model.borrow().as_ref().cloned() else {
-            return;
+            return 0;
         };
         if self.imp().timeline_list_view.borrow().is_none() {
-            return;
+            return 0;
         }
         let Some(scrolled) = self.imp().scrolled_window.borrow().as_ref().cloned() else {
-            return;
+            return 0;
         };
 
-        let new_count = posts.len();
-        if new_count == 0 {
-            return;
+        // An algorithmically reordered feed serves posts we are already
+        // showing; appending them again would duplicate rows.
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..model.n_items() {
+            if let Some(post) = model
+                .item(i)
+                .and_downcast::<PostObject>()
+                .and_then(|o| o.post())
+            {
+                seen.insert(post.uri);
+            }
+        }
+        let fresh: Vec<PostObject> = posts
+            .into_iter()
+            .filter(|p| seen.insert(p.uri.clone()))
+            .map(PostObject::new)
+            .collect();
+        if fresh.is_empty() {
+            return 0;
         }
 
-        // Capture scroll state BEFORE modifying the model
         let adj = scrolled.vadjustment();
         let current_scroll = adj.value();
         let old_upper = adj.upper();
@@ -1681,42 +1700,27 @@ impl HangarWindow {
         // the old position would shove the reader down past them.
         let at_top = current_scroll < 50.0;
 
-        // Collect all existing posts
-        let existing_count = model.n_items();
-        let mut all_posts: Vec<Post> = posts;
-        for i in 0..existing_count {
-            if let Some(obj) = model.item(i) {
-                if let Ok(post_obj) = obj.downcast::<PostObject>() {
-                    if let Some(post) = post_obj.post() {
-                        all_posts.push(post);
-                    }
+        // Splice at the head rather than rebuilding. Clearing the model
+        // emptied the list, which collapsed the adjustment to zero and
+        // fired the scroll handler, and that handler hides the new-posts
+        // banner near the top: the banner the poll had just raised
+        // vanished a frame later. It also unbound every realized row,
+        // tearing down any playing video, and deep-cloned every post in
+        // the model on every pass.
+        let inserted = fresh.len();
+        model.splice(0, 0, &fresh);
+
+        // Content grew above the viewport, so hold the reader on what
+        // they were reading.
+        if !at_top {
+            glib::idle_add_local_once(move || {
+                let height_added = adj.upper() - old_upper;
+                if height_added > 0.0 {
+                    adj.set_value(current_scroll + height_added);
                 }
-            }
+            });
         }
-
-        // Clear and rebuild model
-        model.remove_all();
-        for post in all_posts {
-            let post_object = PostObject::new(post);
-            model.append(&post_object);
-        }
-
-        // Restore scroll position after GTK recalculates layout.
-        // The new content adds height at the top, so we add that difference
-        // to the current scroll to keep viewing the same content.
-        glib::idle_add_local_once(move || {
-            if at_top {
-                return;
-            }
-            let new_upper = adj.upper();
-            let height_added = new_upper - old_upper;
-
-            if height_added > 0.0 {
-                // Add the height of new posts to maintain position
-                let new_scroll = current_scroll + height_added;
-                adj.set_value(new_scroll);
-            }
-        });
+        inserted
     }
 
     /// Whether the timeline is scrolled to (or near) the top, where new
@@ -8692,6 +8696,63 @@ mod tests {
             1,
             "profile tabs bypass the timeline's reply filter"
         );
+
+        window.destroy();
+    }
+
+    /// A poll that finds new posts must not disturb the reader.
+    ///
+    /// The old path cleared the model and re-appended everything, which
+    /// emptied the list for an instant. That collapsed the scroll
+    /// adjustment to zero, and the scroll handler hides the new-posts
+    /// banner near the top, so the banner raised by the same poll
+    /// vanished a frame later and the whole feed visibly flashed.
+    #[test]
+    fn a_poll_inserts_without_clearing_the_feed() {
+        crate::ui::with_gtk(a_poll_inserts_without_clearing_the_feed_body);
+    }
+
+    fn a_poll_inserts_without_clearing_the_feed_body() {
+        let window: HangarWindow = glib::Object::builder().build();
+        window.set_posts((0..30).map(|i| a_post(&format!("p{i}"))).collect());
+        let model = window.imp().timeline_model.borrow().clone().unwrap();
+        assert_eq!(model.n_items(), 30);
+
+        // Watch for the model ever going empty, which is what fired the
+        // spurious scroll event.
+        let emptied = std::rc::Rc::new(std::cell::Cell::new(false));
+        let saw = emptied.clone();
+        model.connect_items_changed(move |m, _, _, _| {
+            if m.n_items() == 0 {
+                saw.set(true);
+            }
+        });
+
+        let inserted = window.insert_posts_at_top(vec![a_post("new1"), a_post("new2")]);
+        assert_eq!(inserted, 2);
+        assert_eq!(
+            model.n_items(),
+            32,
+            "the new posts joined the existing ones"
+        );
+        assert!(
+            !emptied.get(),
+            "the model went empty mid-insert, which collapses the scroll \
+             adjustment, fires the scroll handler and hides the banner"
+        );
+
+        // The newest post is at the head.
+        let first = model
+            .item(0)
+            .and_downcast::<PostObject>()
+            .and_then(|o| o.post())
+            .unwrap();
+        assert!(first.uri.ends_with("new1"));
+
+        // A reordered feed re-serving what is already shown adds nothing.
+        let again = window.insert_posts_at_top(vec![a_post("new1"), a_post("p3")]);
+        assert_eq!(again, 0, "duplicates must not be inserted");
+        assert_eq!(model.n_items(), 32);
 
         window.destroy();
     }
