@@ -96,8 +96,9 @@ chmod +x Hangar-x86_64.AppImage
 ./Hangar-x86_64.AppImage
 ```
 
-The AppImage bundles no libraries. Besides GTK 4.12+ and libadwaita 1.5+, it
-now needs the host's GStreamer 1.20+: `libgstreamer1.0-0`,
+The AppImage bundles no libraries, so the host supplies everything: GTK 4.14+,
+libadwaita 1.5+ and glibc 2.39+, which means GNOME 46+ (Fedora 40+, Ubuntu
+24.04+). It also needs the host's GStreamer 1.20+: `libgstreamer1.0-0`,
 `libgstreamer-plugins-base1.0-0` and `libgstreamer-gl1.0-0` on Debian/Ubuntu,
 `gstreamer1` and `gstreamer1-plugins-base` on Fedora, plus the playback
 plugins listed under [Dependencies](#dependencies) for video. These are linked
@@ -142,9 +143,11 @@ the store.
 #### Dependencies
 
 Building requires **GTK 4.14+** and **libadwaita 1.5+** (GNOME 46+, Fedora 40+,
-Ubuntu 24.04+). The resulting binary runs against **GTK 4.12+** and
-**libadwaita 1.5+** (GNOME 45+), so release builds target an older floor than
-the build host requires.
+Ubuntu 24.04+), and the resulting binary needs the same versions at runtime.
+It links `gtk_graphics_offload` and the `AdwDialog` family directly, so there
+is no older floor to fall back to. A build also imposes its own glibc on
+whoever runs the binary; the released AppImage is built on Ubuntu 24.04 and
+therefore needs glibc 2.39+.
 
 **Fedora/RHEL:**
 ```bash
@@ -225,7 +228,7 @@ GTK runs on the main thread. Network I/O runs on background threads with a share
 | Language | [Rust](https://www.rust-lang.org/) (2024 edition) |
 | UI Toolkit | [GTK4](https://gtk.org/) + [Libadwaita](https://gnome.pages.gitlab.gnome.org/libadwaita/) |
 | AT Protocol | [atrium-api](https://github.com/sugyan/atrium) + [atrium-oauth](https://github.com/sugyan/atrium) |
-| HTTP Client | [reqwest](https://github.com/seanmonstar/reqwest) (rustls-tls) |
+| HTTP Client | [reqwest](https://github.com/seanmonstar/reqwest) (native-tls, so OpenSSL) |
 | Async Runtime | [Tokio](https://tokio.rs/) |
 | Cache | [rusqlite](https://github.com/rusqlite/rusqlite) (SQLite, bundled) |
 | Media | [gstreamer-rs](https://gitlab.freedesktop.org/gstreamer/gstreamer-rs) + [gst-plugin-gtk4](https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs) (`playbin3`, `gtk4paintablesink` registered statically) |

@@ -12,16 +12,17 @@
   <description>
     <p>
       Hangar is a desktop Bluesky client designed specifically for Linux and the
-      GNOME desktop environment. No Electron, no web views, no hybrid UI—just
+      GNOME desktop environment. No Electron, no web views, no hybrid UI, just
       native GTK4 with Libadwaita for a fast, integrated experience.
     </p>
     <p>
       This is a technical preview. The app is functional but incomplete.
-      Development follows a slice-by-slice methodology—one feature at a time.
+      Development follows a slice-by-slice methodology, one feature at a time.
     </p>
   </description>
 
   <launchable type="desktop-id">io.github.sethcottle.Hangar.desktop</launchable>
+
 
   <url type="homepage">https://hangar.blue</url>
   <url type="bugtracker">https://github.com/sethcottle/hangar/issues</url>
@@ -52,6 +53,35 @@
   </supports>
 
   <releases>
+    <release version="0.8.0" date="2026-08-04">
+      <description>
+        <p>Video uploads, real conversations, and the social layer.</p>
+        <ul>
+          <li>Video and GIF upload with live progress, alt text, and a Post button that waits for processing</li>
+          <li>Video plays inline in the feed and in a dedicated player, with autoplay and volume preferences</li>
+          <li>Chat conversations: open a thread, send messages, and react with emoji</li>
+          <li>Follow and unfollow anywhere, follower lists, and people search</li>
+          <li>Full profile pages with Posts, Replies, Media, and Videos tabs, plus in-app profile editing</li>
+          <li>Moderation: mute, block, and report accounts and posts</li>
+          <li>Keyboard shortcuts throughout, offline handling, empty states, and loading skeletons</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.7.3" date="2026-08-04">
+      <description>
+        <p>Manual Flatpak builds stamp their version too.</p>
+      </description>
+    </release>
+    <release version="0.7.2" date="2026-08-04">
+      <description>
+        <p>Flatpak release builds stamp their version.</p>
+      </description>
+    </release>
+    <release version="0.7.1" date="2026-08-04">
+      <description>
+        <p>Release builds report their real version in the About dialog.</p>
+      </description>
+    </release>
     <release version="0.7.0" date="2026-04-02">
       <description>
         <p>OAuth authentication, direct messages, and quality improvements.</p>

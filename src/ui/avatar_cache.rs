@@ -519,9 +519,10 @@ pub fn load_image_into_picture(picture: gtk4::Picture, url: String) {
 
 /// Load an image into a Picture widget, keeping hold of the load.
 ///
-/// `on_done` is called exactly once unless the returned handle is dropped
-/// first. It runs inline when the decoded texture is already cached, so a
-/// caller must have the widget in the state it wants before it calls this.
+/// `on_done` is called exactly once unless the returned handle is dropped or
+/// the widget goes away first. It runs inline when the decoded texture is
+/// already cached, so a caller must have the widget in the state it wants
+/// before it calls this.
 pub fn load_image_into_picture_tracked(
     picture: gtk4::Picture,
     url: String,
@@ -567,12 +568,22 @@ fn start_picture_load(
     // Kick off a fetch if not already in progress (deduplicates)
     spawn_fetch_if_needed(&url);
 
-    // Poll the cache on the GTK main thread until the image arrives
+    // Poll the cache on the GTK main thread until the image arrives. The poll
+    // holds the widget weakly, same as `load_avatar`: a poll whose Picture is
+    // gone has nothing left to put a texture on, and a strong capture kept
+    // every scrolled-past row's image alive until its fetch resolved.
     let poll_state = Rc::clone(&state);
+    let weak = picture.downgrade();
     let id = glib::timeout_add_local(POLL_INTERVAL, move || {
         if poll_state.cancelled.get() {
             return glib::ControlFlow::Break;
         }
+        let Some(picture) = weak.upgrade() else {
+            // Retire the source first, for the same reason as the settled path
+            // below: the handle may outlive the widget.
+            poll_state.source.borrow_mut().take();
+            return glib::ControlFlow::Break;
+        };
 
         let cached = AVATAR_CACHE.read().unwrap().get(&url);
         let result = match cached {
@@ -885,5 +896,68 @@ mod tests {
             weak.upgrade().is_none(),
             "the pending load held a strong reference to the widget"
         );
+    }
+
+    /// Same for a `Picture`. A scroll burst discards hundreds of rows with an
+    /// image still out; each poll that captured its widget strongly kept the
+    /// whole recycled row alive and paid a decode for pixels nobody sees.
+    #[test]
+    fn a_pending_picture_load_does_not_keep_the_widget_alive() {
+        crate::ui::with_gtk(a_pending_picture_load_does_not_keep_the_widget_alive_body);
+    }
+
+    fn a_pending_picture_load_does_not_keep_the_widget_alive_body() {
+        let port = start_server();
+        let slow = format!("http://127.0.0.1:{port}/slow.png?picture-lifetime");
+
+        let picture = gtk4::Picture::new();
+        let weak = picture.downgrade();
+        load_image_into_picture(picture, slow);
+
+        pump(100);
+        assert!(
+            weak.upgrade().is_none(),
+            "the pending load held a strong reference to the picture"
+        );
+    }
+
+    /// Dropping the handle stops the load even while the widget is alive and
+    /// the bytes are on their way.
+    #[test]
+    fn dropping_the_handle_stops_a_load_in_flight() {
+        crate::ui::with_gtk(dropping_the_handle_stops_a_load_in_flight_body);
+    }
+
+    fn dropping_the_handle_stops_a_load_in_flight_body() {
+        let port = start_server();
+        let slow = format!("http://127.0.0.1:{port}/slow.png?handle-drop");
+
+        let cancelled = gtk4::Picture::new();
+        let kept = gtk4::Picture::new();
+        let finished = Rc::new(Cell::new(false));
+
+        let doomed = {
+            let finished = Rc::clone(&finished);
+            load_image_into_picture_tracked(cancelled.clone(), slow.clone(), move |_| {
+                finished.set(true)
+            })
+        };
+        // The control shares the URL, so one fetch settles both questions and
+        // a server that never answered cannot pass this test.
+        let control = load_image_into_picture_tracked(kept.clone(), slow, |_| {});
+
+        drop(doomed);
+        pump(1500);
+
+        assert!(
+            kept.paintable().is_some(),
+            "the fetch never landed, so this test proved nothing"
+        );
+        assert!(
+            cancelled.paintable().is_none(),
+            "the dropped handle's poll still put the image on its widget"
+        );
+        assert!(!finished.get(), "the dropped handle's callback still ran");
+        drop(control);
     }
 }

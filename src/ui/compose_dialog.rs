@@ -18,6 +18,10 @@ use unicode_segmentation::UnicodeSegmentation;
 /// Maximum images per post
 const MAX_IMAGES: usize = 4;
 
+/// Largest edge the strip's preview textures decode to. The tiles are
+/// 80x80, so this still covers a 3x scale factor.
+const THUMBNAIL_DECODE_EDGE: i32 = 240;
+
 /// Common languages for the language picker (code, English name, native name).
 const LANGUAGES: &[(&str, &str, &str)] = &[
     ("en", "English", "English"),
@@ -158,9 +162,54 @@ pub struct ComposeImage {
     pub data: Vec<u8>,
     pub mime_type: String,
     pub alt_text: String,
+    /// The source's pixel size, which the embed's aspect ratio needs.
+    /// The texture is a thumbnail, so it cannot answer this.
     pub width: u32,
     pub height: u32,
+    /// Strip preview only, decoded small. See `decode_thumbnail`.
     pub texture: gdk::Texture,
+}
+
+/// Decode `data` down to a strip thumbnail and report the source's
+/// pixel size alongside it.
+///
+/// The bytes are what gets uploaded; the texture never draws larger than
+/// 80x80, and a 12 MP photo decoded at native size is ~49 MB of RGBA plus
+/// a GPU copy, times up to 40 attachments across a thread. The native
+/// size still has to reach the embed's aspectRatio, so it is read in
+/// size_prepared before the loader is told to shrink.
+///
+/// set_size only ever scales down, the same technique as
+/// avatar_cache::decode_pixbuf; from_stream_at_scale would enlarge a
+/// small image to the cap.
+fn decode_thumbnail(data: &[u8]) -> Option<(gdk::Texture, u32, u32)> {
+    let native = std::rc::Rc::new(std::cell::Cell::new((0i32, 0i32)));
+    let loader = gdk::gdk_pixbuf::PixbufLoader::new();
+    let seen = std::rc::Rc::clone(&native);
+    loader.connect_size_prepared(move |loader, width, height| {
+        seen.set((width, height));
+        let largest = width.max(height);
+        if largest > THUMBNAIL_DECODE_EDGE {
+            let scale = f64::from(THUMBNAIL_DECODE_EDGE) / f64::from(largest);
+            loader.set_size(
+                ((f64::from(width) * scale).round() as i32).max(1),
+                ((f64::from(height) * scale).round() as i32).max(1),
+            );
+        }
+    });
+    // Close whatever the write did: an open loader holds its buffers.
+    let written = loader.write(data).is_ok();
+    let closed = loader.close().is_ok();
+    if !written || !closed {
+        return None;
+    }
+    let pixbuf = loader.pixbuf()?;
+    let (width, height) = native.get();
+    Some((
+        gdk::Texture::for_pixbuf(&pixbuf),
+        width.max(1) as u32,
+        height.max(1) as u32,
+    ))
 }
 
 /// Where a composed video stands. The post waits for Ready.
@@ -1539,19 +1588,10 @@ impl ComposeDialog {
             _ => "image/jpeg".to_string(),
         };
 
-        // Get image dimensions using the image crate
-        let (width, height) = match image::image_dimensions(path) {
-            Ok((w, h)) => (w, h),
-            Err(_) => (1, 1), // fallback
-        };
-
-        // Create GDK texture for preview
-        let texture = match gdk::Texture::from_filename(path) {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("Failed to create texture: {}", e);
-                return;
-            }
+        // The preview decodes small; `data` above is what gets uploaded.
+        let Some((texture, width, height)) = decode_thumbnail(&data) else {
+            eprintln!("Failed to decode image: {}", path.display());
+            return;
         };
 
         let compose_image = ComposeImage {
@@ -3499,11 +3539,10 @@ impl ComposeDialog {
             _ => "image/jpeg".to_string(),
         };
 
-        let (width, height) = image::image_dimensions(path).unwrap_or((1, 1));
-
-        let texture = match gdk::Texture::from_filename(path) {
-            Ok(t) => t,
-            Err(_) => return,
+        // Same as the main post: thumbnail for the strip, bytes for the
+        // upload, source size for the aspect ratio.
+        let Some((texture, width, height)) = decode_thumbnail(&data) else {
+            return;
         };
 
         let compose_image = ComposeImage {
@@ -4405,6 +4444,73 @@ mod tests {
             height: 1,
             texture: texture.upcast(),
         }
+    }
+
+    /// A solid PNG of a given pixel size, on disk. The attach path takes
+    /// a file, so the test hands it one.
+    fn png_file(name: &str, width: i32, height: i32) -> std::path::PathBuf {
+        let pixbuf =
+            gdk::gdk_pixbuf::Pixbuf::new(gdk::gdk_pixbuf::Colorspace::Rgb, false, 8, width, height)
+                .expect("allocate pixbuf");
+        pixbuf.fill(0x00_88_44_ff);
+        let bytes = pixbuf.save_to_bufferv("png", &[]).expect("encode png");
+        let path =
+            std::env::temp_dir().join(format!("hangar-compose-{}-{name}.png", std::process::id()));
+        std::fs::write(&path, &bytes).expect("write the test image");
+        path
+    }
+
+    /// An attachment keeps its file bytes for the upload and a thumbnail
+    /// for the tile, never a texture at the camera's resolution.
+    ///
+    /// A 12 MP photo is ~49 MB decoded, and the composer allows 40 of
+    /// them across a thread, all to draw 80x80 squares.
+    #[test]
+    fn an_attached_image_keeps_a_thumbnail_not_the_source() {
+        crate::ui::with_gtk(an_attached_image_keeps_a_thumbnail_not_the_source_body);
+    }
+
+    fn an_attached_image_keeps_a_thumbnail_not_the_source_body() {
+        let big = png_file("big", 1600, 1200);
+        let file_bytes = std::fs::read(&big).expect("read back the test image");
+
+        let dialog = ComposeDialog::new();
+        let imp = dialog.imp();
+        // The prompt would open a dialog this test has no window for.
+        imp.require_alt_text.set(false);
+        dialog.load_image_from_path(&big);
+
+        {
+            let images = imp.images.borrow();
+            let img = images.first().expect("the image attached");
+            assert!(
+                img.texture.width() <= THUMBNAIL_DECODE_EDGE
+                    && img.texture.height() <= THUMBNAIL_DECODE_EDGE,
+                "the strip retained a {}x{} texture for an 80x80 tile",
+                img.texture.width(),
+                img.texture.height()
+            );
+            assert_eq!(
+                (img.width, img.height),
+                (1600, 1200),
+                "the embed's aspect ratio still describes the source"
+            );
+            assert_eq!(img.data, file_bytes, "the upload lost the full-size file");
+        }
+
+        // Small images are left alone: scaling up would blur a tile and
+        // waste memory doing it.
+        let small = png_file("small", 8, 8);
+        dialog.load_image_from_path(&small);
+        {
+            let images = imp.images.borrow();
+            let img = images.get(1).expect("the second image attached");
+            assert_eq!(img.texture.width(), 8, "an 8px image was enlarged");
+            assert_eq!((img.width, img.height), (8, 8));
+        }
+
+        let _ = std::fs::remove_file(&big);
+        let _ = std::fs::remove_file(&small);
     }
 
     /// With the setting on, the Post button waits for every image to be

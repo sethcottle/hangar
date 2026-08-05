@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: MPL-2.0
 
-/// SQL schema for the cache database
-pub const SCHEMA: &str = r#"
--- Database version for migrations
-PRAGMA user_version = 2;
+/// Schema version this build understands. Every change to `SCHEMA` needs a
+/// matching step in `CacheDb::migrate` and a bump here.
+pub const SCHEMA_VERSION: i64 = 3;
 
+/// SQL schema for the cache database, applied to a fresh file. Existing files
+/// are brought forward by the ladder in `CacheDb::migrate` instead.
+pub const SCHEMA: &str = r#"
 -- profiles: DID-keyed, minimal vs full
 CREATE TABLE IF NOT EXISTS profiles (
     did TEXT PRIMARY KEY,
@@ -70,33 +72,12 @@ CREATE TABLE IF NOT EXISTS feed_state (
     newest_sort_timestamp TEXT,
     last_refresh_at INTEGER
 );
+"#;
 
--- notifications: Cached notifications
-CREATE TABLE IF NOT EXISTS notifications (
-    uri TEXT PRIMARY KEY,
-    cid TEXT NOT NULL,
-    author_did TEXT NOT NULL,
-    reason TEXT NOT NULL,
-    indexed_at TEXT NOT NULL,
-    is_read INTEGER NOT NULL DEFAULT 0,
-    post_json TEXT,
-    fetched_at INTEGER NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_notifications_indexed ON notifications(indexed_at DESC);
-CREATE INDEX IF NOT EXISTS idx_notifications_reason ON notifications(reason);
-
--- images: Cached image blobs (avatars, thumbnails, etc.)
--- Using BLOB storage directly in SQLite for simplicity and atomicity
-CREATE TABLE IF NOT EXISTS images (
-    url TEXT PRIMARY KEY,
-    data BLOB NOT NULL,
-    content_type TEXT,
-    size INTEGER NOT NULL,
-    fetched_at INTEGER NOT NULL,
-    last_accessed_at INTEGER NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_images_last_accessed ON images(last_accessed_at);
-CREATE INDEX IF NOT EXISTS idx_images_size ON images(size);
+/// Version 3 drops the notifications and images tables. Neither was ever read
+/// or written: notifications come straight from the API and the image cache
+/// lives in memory.
+pub const MIGRATION_3: &str = r#"
+DROP TABLE IF EXISTS notifications;
+DROP TABLE IF EXISTS images;
 "#;

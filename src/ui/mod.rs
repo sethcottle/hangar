@@ -25,7 +25,7 @@ pub use follow_list_page::{FollowListKind, FollowListPage};
 pub use login_dialog::LoginDialog;
 pub use message_page::{MessagePage, MessagePush};
 pub use sidebar::NavItem;
-pub use window::{FollowListPush, HangarWindow, ProfileFeedCtx};
+pub use window::{CacheClearOutcome, FollowListPush, HangarWindow, ProfileFeedCtx};
 
 /// Run a test body on the one GTK thread, or skip if there is no display.
 ///

@@ -59,6 +59,35 @@ mod post_object {
 
 use post_object::PostObject;
 
+/// Marker rows for the chrome a thread page carries between its posts. They
+/// ride in the same flattened list as the posts so the page virtualizes as
+/// one; see `build_thread_page`.
+const THREAD_POSTED_MARKER: &str = "thread-posted";
+const THREAD_REPLIES_MARKER: &str = "thread-replies";
+const THREAD_SPACER_MARKER: &str = "thread-spacer";
+
+/// How deep one section's navigation stack may get.
+///
+/// Each of the eight sections keeps its own stack, and every page under the
+/// visible one stays alive with its model, its list and its realized rows.
+/// A reading session drills post to thread to profile to thread without ever
+/// popping, so past this the oldest drilled-in page is dropped. The root page
+/// is never one of them: `pop_to_root` and every section switch pop to it.
+const NAV_STACK_LIMIT: usize = 10;
+
+/// What a Clear Cache click actually achieved.
+///
+/// The button used to say "Cleared" before doing any work and never looked
+/// at the result, so a failed delete and a signed-out window both reported
+/// success. It reports this instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheClearOutcome {
+    Cleared,
+    /// Nobody is signed in, so there is no per-account cache to delete.
+    NothingToClear,
+    Failed,
+}
+
 /// What `push_follow_list_page` did with the request.
 pub enum FollowListPush {
     /// A new page went onto the stack and needs wiring and a first fetch.
@@ -278,6 +307,12 @@ mod imp {
         pub block_callback:
             RefCell<Option<Box<dyn Fn(Profile, Rc<RefCell<Option<String>>>) + 'static>>>,
         pub report_account_callback: RefCell<Option<Box<dyn Fn(Profile) + 'static>>>,
+        /// Deletes the signed-in account's cache directory and reports what
+        /// happened. The window cannot do this itself: the app holds an open
+        /// `CacheDb` connection over `cache.db` and has to drop it before the
+        /// delete and reopen after, or SQLite keeps serving the unlinked
+        /// inode and every write fails read-only.
+        pub clear_cache_callback: RefCell<Option<Box<dyn Fn() -> CacheClearOutcome + 'static>>>,
         pub nav_changed_callback:
             RefCell<Option<Box<dyn Fn(crate::ui::sidebar::NavItem) + 'static>>>,
         // Mentions page state
@@ -819,7 +854,7 @@ impl HangarWindow {
         // A GtkBox or GtkOverlay in between has no such properties to bind, so
         // GLib warns, `upper` stays 0 and the page stops scrolling. Hence the
         // spinner overlays outside the scroller, and the plain AdwClamp on the
-        // thread page and the settings sidebar, whose children are boxes.
+        // settings sidebar, whose child is a box.
         let clamp = adw::ClampScrollable::new();
         clamp.set_maximum_size(800);
         clamp.set_tightening_threshold(600);
@@ -1919,7 +1954,7 @@ impl HangarWindow {
 
         let page = self.build_thread_page(post, thread_posts);
         page.set_tag(Some(&tag));
-        nav_view.push(&page);
+        Self::push_capped(&nav_view, &page);
     }
 
     /// Push a profile view page onto the current section's navigation stack
@@ -1948,7 +1983,7 @@ impl HangarWindow {
 
         let page = self.build_profile_page(profile, posts, feed_cursor);
         page.set_tag(Some(&tag));
-        nav_view.push(&page);
+        Self::push_capped(&nav_view, &page);
     }
 
     /// Push a followers or following list onto the current section's stack.
@@ -2015,7 +2050,7 @@ impl HangarWindow {
 
         let page = adw::NavigationPage::new(&content_box, &title_text);
         page.set_tag(Some(&tag));
-        nav_view.push(&page);
+        Self::push_capped(&nav_view, &page);
 
         Some(FollowListPush::Pushed(list))
     }
@@ -2129,6 +2164,29 @@ impl HangarWindow {
         }
     }
 
+    /// Push onto a section's stack, dropping the oldest pages past
+    /// [`NAV_STACK_LIMIT`] first.
+    ///
+    /// `AdwNavigationView::remove` would not do: on a page that is still in
+    /// the stack it only marks it for removal once popped, which is exactly
+    /// the pop that never comes. `replace` swaps the stack in one go and
+    /// drops the pages it leaves out, since every page pushed here was
+    /// auto-added. It does not animate, and the visible page stays last, so
+    /// nothing moves on screen. The root page is always kept.
+    fn push_capped(nav_view: &adw::NavigationView, page: &adw::NavigationPage) {
+        let stack = nav_view.navigation_stack();
+        let depth = stack.n_items();
+        if depth as usize >= NAV_STACK_LIMIT {
+            let dropped = depth as usize - NAV_STACK_LIMIT + 1;
+            let kept: Vec<adw::NavigationPage> = (0..depth)
+                .filter(|&i| i == 0 || i as usize > dropped)
+                .filter_map(|i| stack.item(i).and_downcast::<adw::NavigationPage>())
+                .collect();
+            nav_view.replace(&kept);
+        }
+        nav_view.push(page);
+    }
+
     /// Focus follows a pop: the page underneath takes the keyboard back
     /// instead of leaving focus on a widget that just left the tree.
     fn focus_after_pop(nav_view: &adw::NavigationView) {
@@ -2182,85 +2240,126 @@ impl HangarWindow {
             .cloned()
             .unwrap_or_else(|| main_post.clone());
 
-        // Scrollable content in a single Box. Multiple ListViews had height
-        // calculation issues with nested scrolling.
-        let scroll_content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-        scroll_content.add_css_class("background");
-
-        // Helper to create a PostRow with all callbacks wired up
-        // `clickable` controls whether clicking the post opens its thread
-        let create_post_row = |win: &Self, post: Post| -> PostRow {
-            let post_row = PostRow::new();
-            post_row.bind(&post);
-
-            win.wire_post_row(&post_row, &post);
-
-            post_row
-        };
-
-        // Parent posts, when present. Clicking one navigates to it.
+        // One virtualized list, like every feed. This was a GtkBox holding a
+        // realized PostRow per post, and a busy thread comes back uncapped, so
+        // the page realized the whole thread at once with every image decoded
+        // at full size. The order the box had is kept by flattening five
+        // stores: parents, the focused post, the chrome under it, the replies,
+        // and the tail spacer. Marker rows carry the chrome, the same
+        // technique `build_profile_page` uses for its header.
+        let parents_store = gio::ListStore::new::<PostObject>();
         for post in parent_posts {
-            let post_row = create_post_row(self, post);
-            scroll_content.append(&post_row);
+            parents_store.append(&PostObject::new(post));
         }
 
-        // The main post. Body click is disabled since we are already viewing it.
-        let main_row = create_post_row(self, the_main_post.clone());
-        main_row.set_not_clickable();
-        scroll_content.append(&main_row);
+        let main_store = gio::ListStore::new::<PostObject>();
+        main_store.append(&PostObject::new(the_main_post.clone()));
 
-        // Add "Posted {date}" separator
-        let posted_separator = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-        posted_separator.add_css_class("thread-separator");
-
-        // Format the date: "Posted Sat, Jan 31, 2026 at 12:50 PM"
-        let posted_text = Self::format_full_timestamp(&the_main_post.indexed_at);
-        let posted_label = gtk4::Label::new(Some(&posted_text));
-        posted_label.add_css_class("dim-label");
-        posted_label.set_hexpand(true);
-        posted_label.set_halign(gtk4::Align::Center);
-        posted_separator.append(&posted_label);
-
-        scroll_content.append(&posted_separator);
-
-        // Add "Replies" section if there are replies
+        let chrome_store = gio::ListStore::new::<gtk4::StringObject>();
+        chrome_store.append(&gtk4::StringObject::new(THREAD_POSTED_MARKER));
         if !reply_posts.is_empty() {
-            let replies_header = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-            replies_header.set_margin_start(16);
-            replies_header.set_margin_end(16);
-            replies_header.set_margin_top(16);
-            replies_header.set_margin_bottom(8);
-
-            let replies_label = gtk4::Label::new(Some("Replies"));
-            replies_label.add_css_class("title-4");
-            replies_label.set_halign(gtk4::Align::Start);
-            replies_header.append(&replies_label);
-
-            scroll_content.append(&replies_header);
-
-            for post in reply_posts {
-                let post_row = create_post_row(self, post);
-                scroll_content.append(&post_row);
-            }
+            chrome_store.append(&gtk4::StringObject::new(THREAD_REPLIES_MARKER));
         }
 
-        // Add bottom padding to ensure last post isn't clipped
-        let bottom_spacer = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-        bottom_spacer.set_height_request(24);
-        scroll_content.append(&bottom_spacer);
+        let replies_store = gio::ListStore::new::<PostObject>();
+        for post in reply_posts {
+            replies_store.append(&PostObject::new(post));
+        }
 
-        // Plain AdwClamp, where the feeds use AdwClampScrollable.
-        //
-        // `scroll_content` is a hand-built GtkBox of PostRows, so there is
-        // nothing to virtualize and no GtkScrollable to forward to.
-        // AdwClampScrollable would bind its adjustments onto a GtkBox that has
-        // no such properties and the page would stop scrolling: measured
-        // `upper` 0 against 16,720. Virtualizing a thread means converting this
-        // box to a list first.
-        let clamp = adw::Clamp::new();
+        let tail_store = gio::ListStore::new::<gtk4::StringObject>();
+        tail_store.append(&gtk4::StringObject::new(THREAD_SPACER_MARKER));
+
+        let sections = gio::ListStore::new::<gio::ListStore>();
+        sections.append(&parents_store);
+        sections.append(&main_store);
+        sections.append(&chrome_store);
+        sections.append(&replies_store);
+        sections.append(&tail_store);
+        let flattened = gtk4::FlattenListModel::new(Some(sections));
+
+        let factory = gtk4::SignalListItemFactory::new();
+
+        // Each slot can be either row: a hidden host for the chrome plus a
+        // PostRow. See `build_profile_page` for why this is a box and not a
+        // stack.
+        factory.connect_setup(|_, item| {
+            let Some(list_item) = item.downcast_ref::<gtk4::ListItem>() else {
+                return;
+            };
+            let slot = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+            let chrome_host = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+            chrome_host.set_visible(false);
+            let post_row = PostRow::new();
+            slot.append(&chrome_host);
+            slot.append(&post_row);
+            list_item.set_child(Some(&slot));
+        });
+        Self::release_video_on_unbind(&factory);
+
+        // "Posted Sat, Jan 31, 2026 at 12:50 PM", built once for the page.
+        let posted_text = Self::format_full_timestamp(&the_main_post.indexed_at);
+        let main_uri = the_main_post.uri.clone();
+        let win = self.downgrade();
+        factory.connect_bind(move |_, item| {
+            let Some(win) = win.upgrade() else {
+                return;
+            };
+            let Some(list_item) = item.downcast_ref::<gtk4::ListItem>() else {
+                return;
+            };
+            let host = list_item
+                .child()
+                .and_then(|slot| slot.first_child())
+                .and_downcast::<gtk4::Box>();
+            let Some(host) = host else { return };
+            let post_row = host.next_sibling().and_downcast::<PostRow>();
+
+            while let Some(child) = host.first_child() {
+                host.remove(&child);
+            }
+
+            // A chrome row: the separator, the Replies heading or the spacer.
+            if let Some(marker) = list_item.item().and_downcast::<gtk4::StringObject>() {
+                host.append(&Self::thread_chrome_row(
+                    marker.string().as_str(),
+                    &posted_text,
+                ));
+                host.set_visible(true);
+                if let Some(post_row) = post_row {
+                    post_row.set_visible(false);
+                }
+                return;
+            }
+
+            host.set_visible(false);
+            if let Some(post_object) = list_item.item().and_downcast::<PostObject>()
+                && let Some(post) = post_object.post()
+                && let Some(post_row) = post_row
+            {
+                post_row.set_visible(true);
+                post_row.bind(&post);
+                post_row.set_list_position(list_item.position());
+                win.wire_post_row(&post_row, &post);
+                // Already looking at it: the body click and the O key both
+                // have to stop here rather than push the same thread again.
+                if post.uri == main_uri {
+                    post_row.set_not_clickable();
+                }
+            }
+        });
+
+        let selection = gtk4::NoSelection::new(Some(flattened));
+        let list_view = gtk4::ListView::new(Some(selection), Some(factory));
+        list_view.add_css_class("background");
+
+        // Content width, and the scrollability the list needs to virtualize.
+        // See `build_timeline`. The list has to be this widget's direct child
+        // and this widget the scroller's; a box or overlay between them breaks
+        // scrolling.
+        let clamp = adw::ClampScrollable::new();
         clamp.set_maximum_size(800);
         clamp.set_tightening_threshold(600);
-        clamp.set_child(Some(&scroll_content));
+        clamp.set_child(Some(&list_view));
 
         let scrolled = gtk4::ScrolledWindow::new();
         scrolled.set_vexpand(true);
@@ -2271,6 +2370,41 @@ impl HangarWindow {
 
         // No tag. Each thread is unique and several may sit in the stack.
         adw::NavigationPage::new(&content_box, "Thread")
+    }
+
+    /// The non-post rows of a thread page: the posted-at separator, the
+    /// Replies heading, and the tail spacer that keeps the last reply clear
+    /// of the bottom edge.
+    fn thread_chrome_row(marker: &str, posted_text: &str) -> gtk4::Widget {
+        match marker {
+            THREAD_POSTED_MARKER => {
+                let separator = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+                separator.add_css_class("thread-separator");
+                let label = gtk4::Label::new(Some(posted_text));
+                label.add_css_class("dim-label");
+                label.set_hexpand(true);
+                label.set_halign(gtk4::Align::Center);
+                separator.append(&label);
+                separator.upcast()
+            }
+            THREAD_REPLIES_MARKER => {
+                let heading = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+                heading.set_margin_start(16);
+                heading.set_margin_end(16);
+                heading.set_margin_top(16);
+                heading.set_margin_bottom(8);
+                let label = gtk4::Label::new(Some("Replies"));
+                label.add_css_class("title-4");
+                label.set_halign(gtk4::Align::Start);
+                heading.append(&label);
+                heading.upcast()
+            }
+            _ => {
+                let spacer = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+                spacer.set_height_request(24);
+                spacer.upcast()
+            }
+        }
     }
 
     /// Format a timestamp as "Posted Sat, Jan 31, 2026 at 12:50 PM" in local timezone
@@ -3504,7 +3638,7 @@ impl HangarWindow {
 
         let nav_page = adw::NavigationPage::new(&content_box, &title_text);
         nav_page.set_tag(Some(&tag));
-        nav_view.push(&nav_page);
+        Self::push_capped(&nav_view, &nav_page);
 
         Some(MessagePush::Pushed(page))
     }
@@ -5326,11 +5460,10 @@ impl HangarWindow {
 
     /// Take a deleted post out of every list that is showing it.
     ///
-    /// Walks the widget tree rather than keeping a registry: a pushed profile
-    /// page builds a model nothing else holds, and a thread page holds bare
-    /// `PostRow`s in a box. A virtualized list is edited through its model
-    /// only; a `PostRow` met outside any `GtkListView` is a thread row and
-    /// comes straight out of its box.
+    /// Walks the widget tree rather than keeping a registry: a pushed thread
+    /// or profile page builds a model nothing else holds. A virtualized list
+    /// is edited through its model only; a `PostRow` met outside any
+    /// `GtkListView` is a loose row and comes straight out of its box.
     pub fn remove_post(&self, uri: &str) {
         let mut thread_rows = Vec::new();
         Self::collect_post_removals(self.upcast_ref::<gtk4::Widget>(), uri, &mut thread_rows);
@@ -5390,8 +5523,8 @@ impl HangarWindow {
                 if let Some(store) = model.downcast_ref::<gio::ListStore>() {
                     Self::remove_post_from_store(store, uri);
                 } else if let Some(flat) = model.downcast_ref::<gtk4::FlattenListModel>() {
-                    // The own profile page: a store of stores, with the posts
-                    // in one of them and the header marker in another.
+                    // The profile and thread pages: a store of stores, with
+                    // the posts in some of them and marker rows in the rest.
                     if let Some(sections) = flat.model() {
                         for i in 0..sections.n_items() {
                             if let Some(store) = sections.item(i).and_downcast::<gio::ListStore>() {
@@ -6031,19 +6164,26 @@ impl HangarWindow {
 
         let window_weak = self.downgrade();
         cache_btn.connect_clicked(move |btn| {
+            let Some(window) = window_weak.upgrade() else {
+                return;
+            };
             btn.set_sensitive(false);
-            btn.set_label("Cleared");
+            let outcome = window.clear_cache();
+            btn.set_label(match outcome {
+                CacheClearOutcome::Cleared => "Cleared",
+                CacheClearOutcome::NothingToClear => "Nothing to Clear",
+                CacheClearOutcome::Failed => "Clear Failed",
+            });
 
-            // Delete cache files from disk
-            if let Some(window) = window_weak.upgrade() {
-                if let Some(did) = window.imp().current_user_did.borrow().as_ref() {
-                    if let Some(data_dir) = dirs::data_dir() {
-                        let safe_did = did.replace(':', "_");
-                        let cache_dir = data_dir.join("hangar").join(safe_did);
-                        let _ = std::fs::remove_dir_all(&cache_dir);
-                    }
+            // The settings page is built once, so a label left here would
+            // outlive the click. Put the button back for the next attempt.
+            let btn = btn.downgrade();
+            glib::timeout_add_seconds_local_once(3, move || {
+                if let Some(btn) = btn.upgrade() {
+                    btn.set_label("Clear");
+                    btn.set_sensitive(true);
                 }
-            }
+            });
         });
 
         cache_row.add_suffix(&cache_btn);
@@ -6051,6 +6191,38 @@ impl HangarWindow {
         page.add(&data_group);
 
         page
+    }
+
+    /// Install the app's cache deleter. See `clear_cache_callback`: the app
+    /// owns the open `CacheDb` connection, so only it can close the handle,
+    /// delete the directory and reopen.
+    pub fn set_clear_cache_callback<F: Fn() -> CacheClearOutcome + 'static>(&self, callback: F) {
+        self.imp()
+            .clear_cache_callback
+            .replace(Some(Box::new(callback)));
+    }
+
+    /// Drop the cache and take what it was serving off screen.
+    ///
+    /// Reports what happened rather than assuming; the caller labels the
+    /// button from it.
+    fn clear_cache(&self) -> CacheClearOutcome {
+        if self.imp().current_user_did.borrow().is_none() {
+            return CacheClearOutcome::NothingToClear;
+        }
+
+        let outcome = match self.imp().clear_cache_callback.borrow().as_ref() {
+            Some(callback) => callback(),
+            None => CacheClearOutcome::Failed,
+        };
+
+        // The posts on screen came out of the cache that just went away, and
+        // leaving them there is how the old handler looked like it had lied.
+        if outcome == CacheClearOutcome::Cleared {
+            self.set_posts(Vec::new());
+            self.refresh_feed();
+        }
+        outcome
     }
 
     /// Show the settings page (top-level navigation, instant switch)
@@ -7626,12 +7798,9 @@ mod tests {
     /// The `AdwClamp` to `AdwClampScrollable` swaps only count at the
     /// call sites, and a clamp built inside a test says nothing about what
     /// `window.rs` uses. So this walks the trees the app constructs: eight
-    /// feeds off the window's own fields, plus the other-user profile page,
-    /// which is built per profile. Reverting any one of the nine turns this
-    /// red on that page's name.
-    ///
-    /// The pages that keep a plain `AdwClamp` are covered by
-    /// [`the_thread_page_keeps_the_viewport_its_box_of_rows_needs`].
+    /// feeds off the window's own fields, plus the other-user profile page
+    /// and the thread page, which are built on demand. Reverting any one of
+    /// the ten turns this red on that page's name.
     #[test]
     fn every_feed_the_app_builds_hands_its_list_straight_to_the_scroller() {
         crate::ui::with_gtk(every_feed_the_app_builds_hands_its_list_straight_to_the_scroller_body);
@@ -7675,10 +7844,18 @@ mod tests {
             .expect("the other-user profile page has a scroller");
         feeds.push(("other-user profile", profile_scrolled));
 
+        // Same for the thread page: built per thread, and virtualized like
+        // the rest since an uncapped thread realized every row at once.
+        let thread_page = window.build_thread_page(&a_post("main"), vec![a_post("reply")]);
+        let thread_content = thread_page.child().expect("the thread page has content");
+        let thread_scrolled =
+            find_scrolled_window(&thread_content).expect("the thread page has a scroller");
+        feeds.push(("thread", thread_scrolled));
+
         assert_eq!(
             feeds.len(),
-            9,
-            "this test is meant to cover all nine virtualized feeds"
+            10,
+            "this test is meant to cover all ten virtualized feeds"
         );
 
         for (page, scrolled) in &feeds {
@@ -7697,44 +7874,151 @@ mod tests {
         window.destroy();
     }
 
-    /// The thread page keeps its `GtkViewport`.
+    /// The thread page's list holds the thread in the order the page used to
+    /// build by hand.
     ///
-    /// Its content is a hand-built `GtkBox` of `PostRow`s, so there is nothing
-    /// to virtualize and nothing to forward adjustments to. An
-    /// `AdwClampScrollable` would bind its adjustments onto a `GtkBox` that has
-    /// no such properties and the page would stop scrolling.
-    ///
-    /// Asserted so the exception stays deliberate. If the thread page ever
-    /// becomes a list, this is the test that says so.
+    /// Parents, then the focused post, then the posted-at separator and the
+    /// Replies heading, then the replies, then the tail spacer. The shape is
+    /// what the flattened model gives, so it is asserted off the model rather
+    /// than off realized rows: nothing is realized in an unmapped window,
+    /// which is the whole point of virtualizing this page.
     #[test]
-    fn the_thread_page_keeps_the_viewport_its_box_of_rows_needs() {
-        crate::ui::with_gtk(the_thread_page_keeps_the_viewport_its_box_of_rows_needs_body);
+    fn the_thread_page_lists_parents_then_the_focused_post_then_replies() {
+        crate::ui::with_gtk(the_thread_page_lists_parents_then_the_focused_post_then_replies_body);
     }
 
-    fn the_thread_page_keeps_the_viewport_its_box_of_rows_needs_body() {
+    fn the_thread_page_lists_parents_then_the_focused_post_then_replies_body() {
         let window: HangarWindow = glib::Object::builder().build();
 
-        let page = window.build_thread_page(&a_post("main"), vec![a_post("reply")]);
+        let thread = vec![a_post("parent"), a_post("main"), a_post("reply")];
+        let page = window.build_thread_page(&a_post("main"), thread);
         let content = page.child().expect("the thread page has content");
-        let scrolled = find_scrolled_window(&content).expect("the thread page has a scroller");
-        let child = scrolled.child().expect("the thread scroller has a child");
+        let list = find_list_view(&content).expect("the thread page has a list");
+        let model = list.model().expect("the thread list has a model");
 
-        assert!(
-            child.is::<gtk4::Viewport>(),
-            "the thread page's scroller child is a {} rather than the GtkViewport \
-             its GtkBox of rows needs. An AdwClampScrollable here binds its \
-             adjustments onto a widget that has none and the page stops scrolling; \
-             if this page has become a GtkListView, this test should be replaced \
-             by an entry in the feed table above, not deleted.",
-            child.type_().name()
+        let mut rows = Vec::new();
+        for i in 0..model.n_items() {
+            let item = model.item(i).expect("the model has this row");
+            if let Some(post) = item
+                .downcast_ref::<PostObject>()
+                .and_then(|object| object.post())
+            {
+                rows.push(post.uri);
+            } else if let Some(marker) = item.downcast_ref::<gtk4::StringObject>() {
+                rows.push(marker.string().to_string());
+            } else {
+                panic!("row {i} is a {}", item.type_().name());
+            }
+        }
+
+        assert_eq!(
+            rows,
+            vec![
+                a_post("parent").uri,
+                a_post("main").uri,
+                THREAD_POSTED_MARKER.to_string(),
+                THREAD_REPLIES_MARKER.to_string(),
+                a_post("reply").uri,
+                THREAD_SPACER_MARKER.to_string(),
+            ],
+            "the thread page reordered itself when it became a list"
         );
-        assert!(
-            find_list_view(&child).is_none(),
-            "the thread page has become a GtkListView, so it should be virtualized \
-             and covered by the feed table above rather than kept on a viewport"
+
+        // A thread with no replies drops the heading and keeps the rest.
+        let page = window.build_thread_page(&a_post("main"), vec![a_post("main")]);
+        let content = page.child().expect("the thread page has content");
+        let list = find_list_view(&content).expect("the thread page has a list");
+        let model = list.model().expect("the thread list has a model");
+        let markers: Vec<String> = (0..model.n_items())
+            .filter_map(|i| model.item(i))
+            .filter_map(|item| {
+                item.downcast_ref::<gtk4::StringObject>()
+                    .map(|m| m.string())
+            })
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            markers,
+            vec![
+                THREAD_POSTED_MARKER.to_string(),
+                THREAD_SPACER_MARKER.to_string()
+            ],
+            "a thread with no replies must not show a Replies heading"
         );
 
         window.destroy();
+    }
+
+    /// The focused post keeps `set_not_clickable` under recycling.
+    ///
+    /// Its row is pooled with every other row on the page now, and `bind`
+    /// clears the flag, so the factory has to put it back on every bind or
+    /// the page navigates to the thread it is already showing. Rows only
+    /// exist on a mapped window, so this runs against a real one.
+    #[test]
+    fn the_thread_pages_focused_post_does_not_navigate_to_itself() {
+        crate::ui::with_gtk(the_thread_pages_focused_post_does_not_navigate_to_itself_body);
+    }
+
+    fn the_thread_pages_focused_post_does_not_navigate_to_itself_body() {
+        let window: HangarWindow = glib::Object::builder().build();
+
+        let thread = vec![a_post("parent"), a_post("main"), a_post("reply")];
+        let page = window.build_thread_page(&a_post("main"), thread);
+
+        let nav_view = adw::NavigationView::new();
+        nav_view.add(&page);
+        let host = adw::Window::new();
+        host.set_default_size(700, 900);
+        host.set_content(Some(&nav_view));
+        host.present();
+
+        let ctx = glib::MainContext::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(400);
+        while std::time::Instant::now() < deadline {
+            while ctx.iteration(false) {}
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        if !host.is_mapped() {
+            eprintln!("skipping: no mapped window to realize rows in");
+            host.destroy();
+            window.destroy();
+            return;
+        }
+
+        let mut widgets = Vec::new();
+        walk(&nav_view.clone().upcast::<gtk4::Widget>(), 0, &mut widgets);
+        let realized: Vec<(String, bool)> = widgets
+            .iter()
+            .filter_map(|(_, w)| w.downcast_ref::<PostRow>())
+            .filter(|row| row.is_visible())
+            .filter_map(|row| {
+                row.post_uri()
+                    .map(|uri| (uri, row.imp().is_focused_post.get()))
+            })
+            .collect();
+
+        host.destroy();
+        window.destroy();
+
+        // Nothing to judge if the list never got the space to realize a row.
+        if !realized.iter().any(|(uri, _)| uri == &a_post("main").uri) {
+            eprintln!("skipping: the thread's own row never realized");
+            return;
+        }
+
+        let focused: Vec<&String> = realized
+            .iter()
+            .filter(|(_, focused)| *focused)
+            .map(|(uri, _)| uri)
+            .collect();
+        assert_eq!(
+            focused,
+            vec![&a_post("main").uri],
+            "exactly the thread's own post must refuse to open itself; realized \
+             rows were {realized:?}"
+        );
     }
 
     /// Both profile pages linkify the bio, and hostile text in it must not
@@ -7836,6 +8120,126 @@ mod tests {
             .clone()
             .expect("the search page built a posts model");
         assert_eq!(posts_model.n_items(), 0);
+
+        window.destroy();
+    }
+
+    /// A section's stack stops growing, and never loses its root.
+    ///
+    /// Every page under the visible one keeps its model and its list alive,
+    /// and only the user pops. Past the cap the oldest drilled-in page goes;
+    /// the root has to stay, since `pop_to_root` and every section switch pop
+    /// to its tag.
+    #[test]
+    fn a_sections_navigation_stack_is_capped_and_keeps_its_root() {
+        crate::ui::with_gtk(a_sections_navigation_stack_is_capped_and_keeps_its_root_body);
+    }
+
+    fn a_sections_navigation_stack_is_capped_and_keeps_its_root_body() {
+        let window: HangarWindow = glib::Object::builder().build();
+        let nav_view = window
+            .imp()
+            .home_nav_view
+            .borrow()
+            .clone()
+            .expect("the home section has a navigation view");
+
+        let pushed = NAV_STACK_LIMIT * 2;
+        for i in 0..pushed {
+            window.push_thread_page(&a_post(&format!("t{i}")), Vec::new());
+        }
+
+        let stack = nav_view.navigation_stack();
+        assert_eq!(
+            stack.n_items() as usize,
+            NAV_STACK_LIMIT,
+            "the stack kept growing past its cap"
+        );
+
+        let bottom = stack
+            .item(0)
+            .and_downcast::<adw::NavigationPage>()
+            .expect("the stack has a bottom page");
+        assert_eq!(
+            bottom.tag().as_deref(),
+            Some("timeline"),
+            "trimming took the root page, so pop_to_root and every section \
+             switch have nothing to pop to"
+        );
+
+        let visible_tag = || nav_view.visible_page().and_then(|page| page.tag());
+        assert_eq!(
+            visible_tag().as_deref(),
+            Some(format!("thread:{}", a_post(&format!("t{}", pushed - 1)).uri).as_str()),
+            "trimming moved the page the user is looking at"
+        );
+        assert!(
+            nav_view
+                .find_page(&format!("thread:{}", a_post("t0").uri))
+                .is_none(),
+            "the oldest drilled-in page is still in the stack"
+        );
+
+        // Back still walks down to the root and stops there.
+        for _ in 0..pushed {
+            nav_view.pop();
+        }
+        assert_eq!(visible_tag().as_deref(), Some("timeline"));
+
+        window.destroy();
+    }
+
+    /// Clear Cache reports the outcome it got, not the one it hoped for.
+    #[test]
+    fn clear_cache_reports_what_actually_happened() {
+        crate::ui::with_gtk(clear_cache_reports_what_actually_happened_body);
+    }
+
+    fn clear_cache_reports_what_actually_happened_body() {
+        let window: HangarWindow = glib::Object::builder().build();
+
+        // Nobody signed in: there is no per-account cache, and the app is
+        // never asked to delete one.
+        let calls = Rc::new(Cell::new(0u32));
+        let answer = Rc::new(Cell::new(CacheClearOutcome::Cleared));
+        let counted = calls.clone();
+        let answered = answer.clone();
+        window.set_clear_cache_callback(move || {
+            counted.set(counted.get() + 1);
+            answered.get()
+        });
+        assert_eq!(window.clear_cache(), CacheClearOutcome::NothingToClear);
+        assert_eq!(calls.get(), 0, "a signed-out window asked for a delete");
+
+        window.set_current_user_did("did:plc:me");
+        window.set_posts(vec![a_post("cached")]);
+        let model = window
+            .imp()
+            .timeline_model
+            .borrow()
+            .clone()
+            .expect("the timeline has a model");
+        assert_eq!(model.n_items(), 1);
+
+        // A failed delete leaves the posts alone: they are still being served.
+        answer.set(CacheClearOutcome::Failed);
+        assert_eq!(window.clear_cache(), CacheClearOutcome::Failed);
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            model.n_items(),
+            1,
+            "a failed clear must not pretend the posts are gone"
+        );
+
+        answer.set(CacheClearOutcome::Cleared);
+        assert_eq!(window.clear_cache(), CacheClearOutcome::Cleared);
+        assert_eq!(calls.get(), 2);
+        assert_eq!(
+            model.n_items(),
+            0,
+            "the cleared posts stayed on screen, which is what made the old \
+             handler look like it had lied"
+        );
 
         window.destroy();
     }
@@ -8016,20 +8420,20 @@ mod tests {
             "deleting the root of an open thread must pop its page"
         );
 
-        // A thread rooted elsewhere stays; the deleted row leaves its box.
+        // A thread rooted elsewhere stays; the deleted post leaves its model.
+        // Off the model, not the widgets: the page virtualizes, so an unmapped
+        // window realizes no rows at all.
         let thread_page = nav_view
             .find_page(&format!("thread:{}", a_post("kept").uri))
             .expect("the surviving thread page is in the stack");
-        let mut widgets = Vec::new();
-        walk(
-            &thread_page.clone().upcast::<gtk4::Widget>(),
-            0,
-            &mut widgets,
-        );
-        let thread_uris: Vec<String> = widgets
-            .iter()
-            .filter_map(|(_, w)| w.downcast_ref::<PostRow>())
-            .filter_map(|row| row.post_uri())
+        let thread_list = find_list_view(&thread_page.clone().upcast::<gtk4::Widget>())
+            .expect("the thread page has a list");
+        let thread_model = thread_list.model().expect("the thread list has a model");
+        let thread_uris: Vec<String> = (0..thread_model.n_items())
+            .filter_map(|i| thread_model.item(i))
+            .filter_map(|item| item.downcast::<PostObject>().ok())
+            .filter_map(|object| object.post())
+            .map(|post| post.uri)
             .collect();
         assert_eq!(
             thread_uris,

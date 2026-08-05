@@ -888,7 +888,7 @@ mod tests {
         VideoSource {
             // playbin3 accepts this and never plays it. The pipeline is still
             // built and counted; no main loop runs, so the error never arrives.
-            playlist_url: format!("file:///nonexistent/hangar-test-{n}.mp4"),
+            playlist_url: format!("https://127.0.0.1:1/hangar-test-{n}.mp4"),
             alt: None,
             fallback_url: None,
             kind: MediaKind::Video,
@@ -1111,7 +1111,7 @@ mod tests {
             embed: Some(crate::atproto::Embed::Video(crate::atproto::VideoEmbed {
                 // No thumbnail: three thousand rows must not fetch three
                 // thousand images.
-                playlist: format!("file:///nonexistent/{name}.mp4"),
+                playlist: format!("https://127.0.0.1:1/{name}.mp4"),
                 thumbnail: None,
                 alt: Some("a cat".into()),
                 aspect_ratio: Some((16, 9)),

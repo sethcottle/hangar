@@ -139,6 +139,14 @@ mod imp {
         /// Set once a request dies of an expired session. Parks the polls
         /// and the toast until the next successful sign-in
         pub session_dead: RefCell<bool>,
+        /// Whether a feed fetch is already out, and which switch owns it.
+        /// The selector used to spawn a thread and a poll source per click
+        /// with nothing to stop an earlier feed landing after a later one.
+        pub feed_loading: RefCell<bool>,
+        pub(crate) feed_generation: Generation,
+        /// The connectivity handler on gio's process-wide monitor. Held so
+        /// shutdown can take it back off; the monitor outlives us.
+        pub network_handler: RefCell<Option<glib::SignalHandlerId>>,
     }
 
     #[glib::object_subclass]
@@ -162,9 +170,11 @@ mod imp {
         fn startup(&self) {
             self.parent_startup();
 
-            self.obj().setup_gactions();
+            let app = self.obj();
+            app.setup_gactions();
 
             // Register custom icons
+            crate::ui::ensure_bundled_icons();
             let display = gtk4::gdk::Display::default().expect("Could not get default display");
             let icon_theme = gtk4::IconTheme::for_display(&display);
 
@@ -193,12 +203,55 @@ mod imp {
                 &css_provider,
                 gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
             );
+
+            // Connectivity: the banner and the poll guards follow gio's
+            // monitor rather than waiting for requests to time out. The
+            // monitor is a process-wide singleton, so this connects once
+            // here instead of once per activation, and the handler holds
+            // the app weakly.
+            let monitor = gio::NetworkMonitor::default();
+            let app_weak = app.downgrade();
+            let handler = monitor.connect_network_changed(move |_, available| {
+                if let Some(app) = app_weak.upgrade() {
+                    app.set_network_available(available);
+                }
+            });
+            self.network_handler.replace(Some(handler));
+            app.set_network_available(monitor.is_network_available());
+
+            // The update nudge, only on builds no store keeps current, a
+            // little after launch so startup owns the first seconds.
+            if crate::update::check_enabled() {
+                let app_clone = app.clone();
+                glib::timeout_add_seconds_local_once(15, move || {
+                    app_clone.check_for_updates();
+                });
+            }
+
+            app.wire_global_row_handlers();
+        }
+
+        fn shutdown(&self) {
+            // The monitor is a singleton that would otherwise keep calling
+            // into a torn-down application.
+            if let Some(handler) = self.network_handler.take() {
+                gio::NetworkMonitor::default().disconnect(handler);
+            }
+
+            self.parent_shutdown();
         }
 
         fn activate(&self) {
             let app = self.obj();
 
-            crate::ui::ensure_bundled_icons();
+            // Single instance: a second launch, a gtk-launch, or a desktop
+            // file activation arrives here as another Activate. Raise what
+            // we already have rather than building a second window that
+            // every callback in this file would then talk past.
+            if let Some(existing) = app.active_window() {
+                existing.present();
+                return;
+            }
 
             // Create main window
             let window = HangarWindow::new(app.upcast_ref::<adw::Application>());
@@ -207,14 +260,9 @@ mod imp {
             }
             self.window.replace(Some(window.clone()));
 
-            // Connectivity: the banner and the poll guards follow gio's
-            // monitor rather than waiting for requests to time out.
-            let monitor = gio::NetworkMonitor::default();
-            let app_clone = app.clone();
-            monitor.connect_network_changed(move |_, available| {
-                app_clone.set_network_available(available);
-            });
-            app.set_network_available(monitor.is_network_available());
+            // The monitor was read at startup; the fresh window has not
+            // seen it yet.
+            window.set_offline(*self.offline.borrow());
 
             // The poll skips while the window is backgrounded; a regained
             // focus catches the feed up right away instead of waiting out
@@ -225,15 +273,6 @@ mod imp {
                     app_clone.check_for_new_posts();
                 }
             });
-
-            // The update nudge, only on builds no store keeps current, a
-            // little after launch so startup owns the first seconds.
-            if crate::update::check_enabled() {
-                let app_clone = app.clone();
-                glib::timeout_add_seconds_local_once(15, move || {
-                    app_clone.check_for_updates();
-                });
-            }
 
             let app_clone = app.clone();
             window.set_load_more_callback(move || {
@@ -265,27 +304,9 @@ mod imp {
                 app_clone.open_reply_dialog(post);
             });
 
-            // One handler serves every PostRow; see post_row.rs.
-            let app_clone = app.clone();
-            crate::ui::post_row::set_delete_post_handler(move |post| {
-                app_clone.confirm_delete_post(post);
-            });
-
-            // Save/unsave, dispatched the same way.
-            let app_clone = app.clone();
-            crate::ui::post_row::set_bookmark_post_handler(move |post, row_weak| {
-                app_clone.toggle_bookmark(post, row_weak);
-            });
-
             let app_clone = app.clone();
             window.set_follow_callback(move |did, uri_cell, btn_weak| {
                 app_clone.toggle_follow(did, uri_cell, btn_weak);
-            });
-
-            // Follow from people rows, one handler for every list.
-            let app_clone = app.clone();
-            crate::ui::actor_row::set_follow_handler(move |profile, row_weak| {
-                app_clone.toggle_follow_row(profile, row_weak);
             });
 
             let app_clone = app.clone();
@@ -329,22 +350,7 @@ mod imp {
             });
 
             let app_clone = app.clone();
-            crate::ui::post_row::set_report_post_handler(move |post| {
-                app_clone.open_report_for_post(post);
-            });
-
-            // Feed-level moderation starts from a clean cell: mute always
-            // mutes, block always confirms then blocks. The profile page
-            // owns the stateful undo side.
-            let app_clone = app.clone();
-            crate::ui::post_row::set_mute_account_handler(move |did| {
-                app_clone.toggle_mute(did, std::rc::Rc::new(std::cell::Cell::new(false)));
-            });
-
-            let app_clone = app.clone();
-            crate::ui::post_row::set_block_account_handler(move |profile| {
-                app_clone.toggle_block(profile, std::rc::Rc::new(RefCell::new(None)));
-            });
+            window.set_clear_cache_callback(move || app_clone.clear_cache());
 
             let app_clone = app.clone();
             window.set_compose_callback(move || {
@@ -573,6 +579,48 @@ impl HangarApplication {
         self.set_accels_for_action("app.shortcuts", &["<primary>question"]);
     }
 
+    /// The row handlers that live in statics rather than on a window.
+    ///
+    /// One handler serves every PostRow and every ActorRow, so these are
+    /// set once at startup. Wiring them per activation would replace live
+    /// handlers while a signed-out window was being torn down.
+    fn wire_global_row_handlers(&self) {
+        let app = self.clone();
+        crate::ui::post_row::set_delete_post_handler(move |post| {
+            app.confirm_delete_post(post);
+        });
+
+        // Save/unsave, dispatched the same way.
+        let app = self.clone();
+        crate::ui::post_row::set_bookmark_post_handler(move |post, row_weak| {
+            app.toggle_bookmark(post, row_weak);
+        });
+
+        // Follow from people rows, one handler for every list.
+        let app = self.clone();
+        crate::ui::actor_row::set_follow_handler(move |profile, row_weak| {
+            app.toggle_follow_row(profile, row_weak);
+        });
+
+        let app = self.clone();
+        crate::ui::post_row::set_report_post_handler(move |post| {
+            app.open_report_for_post(post);
+        });
+
+        // Feed-level moderation starts from a clean cell: mute always
+        // mutes, block always confirms then blocks. The profile page
+        // owns the stateful undo side.
+        let app = self.clone();
+        crate::ui::post_row::set_mute_account_handler(move |did| {
+            app.toggle_mute(did, Rc::new(std::cell::Cell::new(false)));
+        });
+
+        let app = self.clone();
+        crate::ui::post_row::set_block_account_handler(move |profile| {
+            app.toggle_block(profile, Rc::new(RefCell::new(None)));
+        });
+    }
+
     /// The About dialog, separate from presenting so tests can read it.
     fn build_about_dialog() -> adw::AboutDialog {
         let about = adw::AboutDialog::builder()
@@ -727,6 +775,55 @@ impl HangarApplication {
         }
     }
 
+    /// Throw the on-disk cache away and open a fresh one.
+    ///
+    /// The connection has to go first. Deleting the file under a live
+    /// rusqlite handle left it serving the unlinked inode: reads kept
+    /// returning the posts the user just cleared, and every write failed
+    /// with SQLITE_READONLY for the rest of the session.
+    fn clear_cache(&self) -> crate::ui::CacheClearOutcome {
+        use crate::ui::CacheClearOutcome;
+
+        let Some(did) = self.imp().user_did.borrow().clone() else {
+            return CacheClearOutcome::NothingToClear;
+        };
+
+        // Drop every handle before touching the file.
+        self.imp().cache.replace(None);
+
+        let path = match crate::cache::CacheDb::cache_path(&did) {
+            Ok(path) => path,
+            Err(e) => {
+                eprintln!("Clear cache: no cache path: {e}");
+                return CacheClearOutcome::Failed;
+            }
+        };
+        for suffix in ["", "-wal", "-shm"] {
+            let mut file = path.clone().into_os_string();
+            file.push(suffix);
+            match std::fs::remove_file(&file) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    eprintln!("Clear cache: {} survived: {e}", file.to_string_lossy());
+                    return CacheClearOutcome::Failed;
+                }
+            }
+        }
+
+        // Reopen so the rest of the session still caches.
+        match crate::cache::CacheDb::open(&did) {
+            Ok(db) => {
+                self.imp().cache.replace(Some(db));
+                CacheClearOutcome::Cleared
+            }
+            Err(e) => {
+                eprintln!("Clear cache: could not reopen: {e}");
+                CacheClearOutcome::Failed
+            }
+        }
+    }
+
     /// Sign out: clear session, close window, and restart fresh
     fn sign_out(&self) {
         // Drop the live agent first; closing the window does not. The client
@@ -766,9 +863,13 @@ impl HangarApplication {
             }
         });
 
-        // Closing the current window drops all UI state.
+        // Closing the current window drops all UI state. close() runs the
+        // handler that saves the geometry; destroy() is what takes the
+        // window off the application, which the guard in activate() reads,
+        // and close() alone does nothing to a window that never realized.
         if let Some(window) = self.imp().window.take() {
             window.close();
+            window.destroy();
         }
 
         // Re-activate the app, which creates a fresh window and
@@ -1219,10 +1320,41 @@ impl HangarApplication {
         });
     }
 
+    /// Undo the optimistic like flip after the server refused it.
+    ///
+    /// The pixels are the smaller half. The flip also drops the record URI,
+    /// so a row left liked with nothing to delete takes the create branch
+    /// on the next press while visually un-liking. `previous` is the URI
+    /// the post carried before the press: `None` when this was a like.
+    /// A pooled row rebound onto another post while we waited is left be.
+    fn revert_like(row: &PostRow, post_uri: &str, previous: Option<String>) {
+        if row.post_uri().as_deref() != Some(post_uri) {
+            return;
+        }
+        row.toggle_like_visual();
+        row.set_viewer_like_uri(previous);
+    }
+
+    /// The same for a repost, where getting it wrong is louder: a repost
+    /// that did not happen reads as done, and the press meant to undo it
+    /// publishes one to the user's followers.
+    fn revert_repost(row: &PostRow, post_uri: &str, previous: Option<String>) {
+        if row.post_uri().as_deref() != Some(post_uri) {
+            return;
+        }
+        row.toggle_repost_visual();
+        row.set_viewer_repost_uri(previous);
+    }
+
     fn toggle_like(&self, post: &Post, post_row_weak: glib::WeakRef<PostRow>) {
         // Result type: Ok(Some(uri)) for like success, Ok(None) for unlike success, Err for failure
         let (tx, rx) = std::sync::mpsc::channel::<Result<Option<String>, String>>();
         let client = self.client();
+
+        // What the row showed before it flipped itself, for the revert.
+        let was_liked = post.viewer_like.is_some();
+        let previous_uri = post.viewer_like.clone();
+        let post_uri = post.uri.clone();
 
         // If already liked, this press unlikes.
         if let Some(like_uri) = &post.viewer_like {
@@ -1241,18 +1373,33 @@ impl HangarApplication {
             });
         }
 
+        let app = self.clone();
         glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
             match rx.try_recv() {
                 Ok(Ok(new_like_uri)) => {
-                    // Update the PostRow's like URI state if it still exists
-                    if let Some(post_row) = post_row_weak.upgrade() {
+                    // Same guard the revert path takes: a pooled row can be
+                    // rebound onto a different post while the request is out,
+                    // and writing this URI onto that post corrupts its state.
+                    if let Some(post_row) = post_row_weak.upgrade()
+                        && post_row.post_uri().as_deref() == Some(post_uri.as_str())
+                    {
                         post_row.set_viewer_like_uri(new_like_uri);
                     }
                     glib::ControlFlow::Break
                 }
                 Ok(Err(e)) => {
                     eprintln!("Like/unlike failed: {}", e);
-                    // TODO: Revert visual state on failure
+                    if let Some(post_row) = post_row_weak.upgrade() {
+                        Self::revert_like(&post_row, &post_uri, previous_uri.clone());
+                    }
+                    app.report_session_expiry();
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.show_toast(if was_liked {
+                            "Couldn't remove your like"
+                        } else {
+                            "Couldn't like this post"
+                        });
+                    }
                     glib::ControlFlow::Break
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
@@ -1831,6 +1978,11 @@ impl HangarApplication {
         let (tx, rx) = std::sync::mpsc::channel::<Result<Option<String>, String>>();
         let client = self.client();
 
+        // What the row showed before it flipped itself, for the revert.
+        let was_reposted = post.viewer_repost.is_some();
+        let previous_uri = post.viewer_repost.clone();
+        let post_uri = post.uri.clone();
+
         // If already reposted, this press deletes the repost.
         if let Some(repost_uri) = &post.viewer_repost {
             let repost_uri = repost_uri.clone();
@@ -1848,18 +2000,33 @@ impl HangarApplication {
             });
         }
 
+        let app = self.clone();
         glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
             match rx.try_recv() {
                 Ok(Ok(new_repost_uri)) => {
-                    // Update the PostRow's repost URI state if it still exists
-                    if let Some(post_row) = post_row_weak.upgrade() {
+                    // Guarded like the revert path. Landing a cleared URI on
+                    // a rebound row is the loud failure: the next press on
+                    // that post publishes a repost instead of undoing one.
+                    if let Some(post_row) = post_row_weak.upgrade()
+                        && post_row.post_uri().as_deref() == Some(post_uri.as_str())
+                    {
                         post_row.set_viewer_repost_uri(new_repost_uri);
                     }
                     glib::ControlFlow::Break
                 }
                 Ok(Err(e)) => {
                     eprintln!("Repost/unrepost failed: {}", e);
-                    // TODO: Revert visual state on failure
+                    if let Some(post_row) = post_row_weak.upgrade() {
+                        Self::revert_repost(&post_row, &post_uri, previous_uri.clone());
+                    }
+                    app.report_session_expiry();
+                    if let Some(window) = app.imp().window.borrow().as_ref() {
+                        window.show_toast(if was_reposted {
+                            "Couldn't undo your repost"
+                        } else {
+                            "Couldn't repost"
+                        });
+                    }
                     glib::ControlFlow::Break
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
@@ -2269,6 +2436,18 @@ impl HangarApplication {
 
     /// Switch to a different feed
     fn switch_feed(&self, feed: SavedFeed) {
+        // Pressing the feed that is already loading is not a new request.
+        // Without this every press spawned its own thread and poll source.
+        let same_feed = self
+            .imp()
+            .current_feed
+            .borrow()
+            .as_ref()
+            .is_some_and(|current| current.uri == feed.uri);
+        if same_feed && *self.imp().feed_loading.borrow() {
+            return;
+        }
+
         // Update current feed
         let feed_name = feed.display_name.clone();
         let feed_uri = feed.uri.clone();
@@ -2284,12 +2463,28 @@ impl HangarApplication {
         self.imp().timeline_cursor.replace(None);
         self.imp().newest_post_uri.replace(None);
 
+        // This switch owns the feed now. The bump strands whatever the
+        // last one has out, and releasing the guard lets the new fetch
+        // start without waiting for a response nobody wants any more.
+        self.imp().feed_generation.bump();
+        self.imp().feed_loading.replace(false);
+
         // Fetch the new feed
         self.fetch_current_feed();
     }
 
-    /// Fetch posts for the current feed (home timeline or custom feed)
+    /// Fetch posts for the current feed (home timeline or custom feed).
+    ///
+    /// One fetch at a time, and it carries the switch it belongs to: a
+    /// response for a feed the user has already moved past is dropped
+    /// rather than installed over the one they are looking at.
     fn fetch_current_feed(&self) {
+        if *self.imp().feed_loading.borrow() {
+            return;
+        }
+        self.imp().feed_loading.replace(true);
+        let generation = self.imp().feed_generation.token();
+
         let current_feed = self.imp().current_feed.borrow().clone();
         let feed_key = current_feed
             .as_ref()
@@ -2347,8 +2542,15 @@ impl HangarApplication {
         let app = self.clone();
         let feed_key_for_cache = feed_key.clone();
         glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            // Another feed was picked while this one was out. Stop here
+            // rather than poll on for a response that cannot be used; the
+            // switch already handed the guard to the new fetch.
+            if !app.imp().feed_generation.is_current(generation) {
+                return glib::ControlFlow::Break;
+            }
             match rx.try_recv() {
                 Ok(Ok((posts, next_cursor))) => {
+                    app.imp().feed_loading.replace(false);
                     app.imp().timeline_cursor.replace(next_cursor.clone());
                     if let Some(first) = posts.first() {
                         app.imp().newest_post_uri.replace(Some(first.uri.clone()));
@@ -2379,12 +2581,15 @@ impl HangarApplication {
                     glib::ControlFlow::Break
                 }
                 Ok(Err(e)) => {
+                    app.imp().feed_loading.replace(false);
                     eprintln!("Failed to fetch feed: {}", e);
                     app.toast_unless_offline("Couldn't load this feed");
+                    app.report_session_expiry();
                     glib::ControlFlow::Break
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    app.imp().feed_loading.replace(false);
                     eprintln!("Failed to fetch feed: connection lost");
                     glib::ControlFlow::Break
                 }
@@ -4821,6 +5026,30 @@ mod tests {
     use super::Generation;
     use super::message_poll_allowed;
     use super::unread_poll_allowed;
+    use crate::atproto::Post;
+
+    /// A plain post at `uri`, untouched by the viewer.
+    fn test_post(uri: &str) -> Post {
+        use crate::atproto::Profile;
+
+        Post {
+            uri: uri.into(),
+            cid: "cid".into(),
+            author: Profile::minimal("did:plc:a".into(), "a.bsky.social".into(), None, None),
+            text: "words".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            indexed_at: "2026-01-01T00:00:00Z".into(),
+            like_count: None,
+            repost_count: None,
+            reply_count: None,
+            embed: None,
+            viewer_like: None,
+            viewer_repost: None,
+            viewer_bookmarked: None,
+            repost_reason: None,
+            reply_context: None,
+        }
+    }
 
     /// The badge poll must stay quiet when signed out, must not stack
     /// fetches when the network is slow, and must park for the rest of a
@@ -4939,6 +5168,97 @@ mod tests {
         assert_eq!(posts.len(), 2, "other tabs list the page as served");
         let media = super::HangarApplication::tab_posts("posts_with_media", page);
         assert_eq!(media.len(), 2);
+    }
+
+    /// A like the server refused has to leave the row exactly as it was.
+    /// Half a revert is worse than none: liked with no record URI sends
+    /// the next press down the create branch while the heart empties.
+    #[test]
+    fn a_refused_like_leaves_the_row_as_it_was() {
+        crate::ui::with_gtk(a_refused_like_leaves_the_row_as_it_was_body);
+    }
+
+    fn a_refused_like_leaves_the_row_as_it_was_body() {
+        use crate::ui::post_row::PostRow;
+
+        let uri = "at://did:plc:test/app.bsky.feed.post/like";
+        let mut liked = test_post(uri);
+        liked.like_count = Some(7);
+        liked.viewer_like = Some("at://did:plc:test/app.bsky.feed.like/rk".into());
+
+        // An unlike that failed. The press emptied the heart and dropped
+        // the record URI; both have to come back or the next press likes
+        // a post that is already liked.
+        let row = PostRow::new();
+        row.bind(&liked);
+        row.toggle_like_visual();
+        assert!(!row.is_liked());
+        super::HangarApplication::revert_like(&row, uri, liked.viewer_like.clone());
+        assert!(row.is_liked(), "the heart goes back");
+        assert_eq!(
+            row.viewer_like_uri(),
+            liked.viewer_like,
+            "without the record URI the next press cannot unlike"
+        );
+
+        // A like that failed, from the other side.
+        let unliked = test_post(uri);
+        let row = PostRow::new();
+        row.bind(&unliked);
+        row.toggle_like_visual();
+        assert!(row.is_liked());
+        super::HangarApplication::revert_like(&row, uri, None);
+        assert!(!row.is_liked());
+        assert_eq!(row.viewer_like_uri(), None);
+
+        // Recycled onto another post while the request was out, the row
+        // belongs to that post now and must not be touched.
+        let other = "at://did:plc:test/app.bsky.feed.post/other";
+        let row = PostRow::new();
+        row.bind(&liked);
+        row.toggle_like_visual();
+        row.bind(&test_post(other));
+        super::HangarApplication::revert_like(&row, uri, liked.viewer_like.clone());
+        assert!(!row.is_liked(), "the rebound post was never liked");
+        assert_eq!(row.viewer_like_uri(), None);
+    }
+
+    /// The repost revert, where the cost of skipping it is a repost
+    /// published to the user's followers by the press meant to undo one.
+    #[test]
+    fn a_refused_repost_leaves_the_row_as_it_was() {
+        crate::ui::with_gtk(a_refused_repost_leaves_the_row_as_it_was_body);
+    }
+
+    fn a_refused_repost_leaves_the_row_as_it_was_body() {
+        use crate::ui::post_row::PostRow;
+
+        let uri = "at://did:plc:test/app.bsky.feed.post/repost";
+        let plain = test_post(uri);
+
+        let row = PostRow::new();
+        row.bind(&plain);
+        row.toggle_repost_visual();
+        assert!(
+            row.is_reposted(),
+            "the press shows it as done straight away"
+        );
+        super::HangarApplication::revert_repost(&row, uri, None);
+        assert!(
+            !row.is_reposted(),
+            "a repost that was refused must not read as done"
+        );
+        assert_eq!(row.viewer_repost_uri(), None);
+
+        let mut reposted = test_post(uri);
+        reposted.repost_count = Some(3);
+        reposted.viewer_repost = Some("at://did:plc:test/app.bsky.feed.repost/rk".into());
+        let row = PostRow::new();
+        row.bind(&reposted);
+        row.toggle_repost_visual();
+        super::HangarApplication::revert_repost(&row, uri, reposted.viewer_repost.clone());
+        assert!(row.is_reposted());
+        assert_eq!(row.viewer_repost_uri(), reposted.viewer_repost);
     }
 
     /// The About dialog states the build's version: what CI exported

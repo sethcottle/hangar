@@ -15,6 +15,7 @@ use gstreamer as gst;
 use gtk4::gdk;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use url::Url;
 
 /// How many pipelines this process owns.
 ///
@@ -65,6 +66,8 @@ pub enum MediaError {
     Init(String),
     /// An element the pipeline needs is not installed on this system.
     MissingElement(&'static str),
+    /// The uri is not http or https, so it was never handed to GStreamer.
+    UnsupportedScheme(String),
     /// The pipeline posted an error on its bus.
     Pipeline {
         message: String,
@@ -80,6 +83,9 @@ impl MediaError {
             Self::MissingElement(_) => {
                 "Your system is missing the GStreamer plugins needed to play this video."
                     .to_string()
+            }
+            Self::UnsupportedScheme(_) => {
+                "This video is not at a web address, so Hangar did not play it.".to_string()
             }
             Self::Pipeline { .. } => "This video could not be played.".to_string(),
         }
@@ -100,6 +106,12 @@ impl MediaError {
                  Fedora: gstreamer1-plugins-base gstreamer1-plugins-good \
                  gstreamer1-plugins-bad-free gstreamer1-libav\n  \
                  Arch: gst-plugins-base gst-plugins-good gst-plugins-bad gst-libav"
+            ),
+            Self::UnsupportedScheme(uri) => format!(
+                "Refused to play \"{uri}\".\n\n\
+                 Only http and https are allowed. playbin3 picks its source \
+                 element from the scheme, so any other one reaches a GStreamer \
+                 uri handler with an address chosen by whoever posted the video."
             ),
             Self::Pipeline { message, debug } => match debug {
                 Some(d) => format!("{message}\n\n{d}"),
@@ -136,6 +148,11 @@ pub fn ensure_initialized() -> Result<(), MediaError> {
     .clone()
 }
 
+/// Whether a uri is one this process will let GStreamer resolve.
+fn is_web_uri(uri: &str) -> bool {
+    Url::parse(uri).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
+}
+
 fn make(name: &'static str) -> Result<gst::Element, MediaError> {
     gst::ElementFactory::make(name)
         .build()
@@ -149,6 +166,14 @@ fn make(name: &'static str) -> Result<gst::Element, MediaError> {
 ///
 /// Must be called on the GTK main thread.
 pub fn build_pipeline(uri: &str, volume: f64, muted: bool) -> Result<VideoPipeline, MediaError> {
+    // The playlist url is copied verbatim off the wire, and playbin3 chooses
+    // its source element by scheme: rtsp, udp and mms are blind requests to
+    // whatever host it names, gvfs schemes mount, and a local path just opens.
+    // Same rule crate::atproto::gif applies to the uris it builds.
+    if !is_web_uri(uri) {
+        return Err(MediaError::UnsupportedScheme(uri.to_string()));
+    }
+
     ensure_initialized()?;
 
     // No reconfigure-on-window-resize: "overlay-only" is already the default,
@@ -213,4 +238,44 @@ pub fn build_pipeline(uri: &str, volume: f64, muted: bool) -> Result<VideoPipeli
 pub fn linear_volume(slider: f64) -> f64 {
     let s = slider.clamp(0.0, 1.0);
     s * s * s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_playlist_url_off_the_wire_can_only_be_http() {
+        for hostile in [
+            "rtsp://attacker.example/stream",
+            "rtmp://attacker.example/live",
+            "udp://239.0.0.1:1234",
+            "tcp://192.168.1.1:80",
+            "mms://attacker.example/x",
+            "smb://attacker.example/share",
+            "file:///home/you/.ssh/id_rsa",
+            "/home/you/.ssh/id_rsa",
+            "",
+        ] {
+            // Refused before ensure_initialized, so GStreamer never sees it.
+            let refusal = build_pipeline(hostile, 1.0, true)
+                .err()
+                .unwrap_or_else(|| panic!("{hostile} should not have built a pipeline"));
+            match refusal {
+                MediaError::UnsupportedScheme(uri) => assert_eq!(uri, hostile),
+                other => panic!("{hostile} should be refused for its scheme, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_video_hosts_bluesky_uses_are_allowed() {
+        for ok in [
+            "https://video.bsky.app/watch/did/cid/playlist.m3u8",
+            "https://k.gifs.bsky.app/ii/hash/76/03/slug.mp4",
+            "http://example.com/v.m3u8",
+        ] {
+            assert!(is_web_uri(ok), "{ok} should be playable");
+        }
+    }
 }

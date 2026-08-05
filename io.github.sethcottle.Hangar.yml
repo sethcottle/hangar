@@ -92,6 +92,15 @@ modules:
       - install -Dm644 assets/icons/png/256/io.github.sethcottle.Hangar.png /app/share/icons/hicolor/256x256/apps/io.github.sethcottle.Hangar.png
       - install -Dm644 data/io.github.sethcottle.Hangar.desktop /app/share/applications/io.github.sethcottle.Hangar.desktop
       - install -Dm644 data/io.github.sethcottle.Hangar.metainfo.xml /app/share/metainfo/io.github.sethcottle.Hangar.metainfo.xml
+      # Window geometry lives in GSettings, and gio::Settings finds nothing
+      # without the installed schema, silently, because the lookup is
+      # guarded rather than asserted. flatpak-builder compiles the schema
+      # directory at finish time, but this compiles it here too: a missing
+      # binary fails the build, where a missed finish step would only lose
+      # geometry again. The schema id does not change between channels, so
+      # nightly installs the same file.
+      - install -Dm644 data/io.github.sethcottle.Hangar.gschema.xml /app/share/glib-2.0/schemas/io.github.sethcottle.Hangar.gschema.xml
+      - glib-compile-schemas /app/share/glib-2.0/schemas
     sources:
       - type: dir
         path: .

@@ -24,6 +24,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Check the metainfo names this release
+        if: inputs.version != ''
+        run: |
+          # Flatpak takes the ref's version from the newest <release> in the
+          # metainfo, so a stale file mislabels the bundle everywhere it is
+          # listed: flatpak info, GNOME Software, KDE Discover.
+          NEWEST=$(grep -o '<release version="[^"]*"' data/io.github.sethcottle.Hangar.metainfo.xml \
+            | head -n1 | sed 's/.*version="//; s/"$//')
+          if [ "$NEWEST" != "${{ inputs.version }}" ]; then
+            echo "metainfo's newest release is ${NEWEST:-none}, building ${{ inputs.version }}" >&2
+            echo "add the release entry to data/io.github.sethcottle.Hangar.metainfo.xml" >&2
+            exit 1
+          fi
+
       - name: Generate Cargo sources
         run: |
           pip3 install toml tomlkit aiohttp
@@ -78,7 +92,10 @@ jobs:
             librsvg2-dev \
             libfuse2 \
             libgstreamer1.0-dev \
-            libgstreamer-plugins-base1.0-dev
+            libgstreamer-plugins-base1.0-dev \
+            binutils \
+            libglib2.0-bin \
+            libssl-dev
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -90,6 +107,29 @@ jobs:
             HANGAR_VERSION="${{ inputs.version }}" cargo build --release
           else
             HANGAR_VERSION="nightly-$(date +%Y%m%d)-${GITHUB_SHA::7}"               cargo build --release --features devel
+          fi
+
+      - name: Check the glibc floor
+        run: |
+          # The AppImage bundles nothing, so the build host's glibc is the
+          # floor it imposes on users. Rust std's process spawn pulls in
+          # pidfd_spawnp (GLIBC_2.39), which no reading of the source shows,
+          # so the binary is asked directly. Moving the runner to a newer
+          # image must fail here rather than in someone's terminal.
+          set -o pipefail
+          FLOOR=2.39
+          command -v objdump >/dev/null || { echo "objdump missing; install binutils" >&2; exit 1; }
+          MAX=$(objdump -T target/release/hangar \
+            | grep -o 'GLIBC_[0-9][0-9.]*' \
+            | sed 's/^GLIBC_//' \
+            | sort -V | tail -n1)
+          # An empty MAX means the probe itself failed. Comparing it would
+          # silently pass, which is the opposite of what this guard is for.
+          [ -n "$MAX" ] || { echo "could not read any GLIBC requirement from the binary" >&2; exit 1; }
+          echo "binary requires glibc $MAX, advertised floor $FLOOR"
+          if [ "$(printf '%s\n%s\n' "$FLOOR" "$MAX" | sort -V | tail -n1)" != "$FLOOR" ]; then
+            echo "the binary requires glibc $MAX but every advertised floor says $FLOOR" >&2
+            exit 1
           fi
 
       - name: Download appimagetool
@@ -114,11 +154,19 @@ jobs:
           mkdir -p AppDir/usr/share/applications
           mkdir -p AppDir/usr/share/icons/hicolor/scalable/apps
           mkdir -p AppDir/usr/share/metainfo
+          mkdir -p AppDir/usr/share/glib-2.0/schemas
 
           cp target/release/hangar AppDir/usr/bin/
           cp "data/${APP_ID}.desktop" AppDir/usr/share/applications/
           cp "data/${APP_ID}.metainfo.xml" AppDir/usr/share/metainfo/
           cp "assets/icons/${APP_ID}.svg" AppDir/usr/share/icons/hicolor/scalable/apps/
+
+          # Window geometry lives in GSettings, and gio::Settings finds
+          # nothing unless a compiled schema sits on XDG_DATA_DIRS, which
+          # the AppRun points at this directory. The schema id does not
+          # change between channels, so both copy the stable file.
+          cp data/io.github.sethcottle.Hangar.gschema.xml AppDir/usr/share/glib-2.0/schemas/
+          glib-compile-schemas AppDir/usr/share/glib-2.0/schemas
 
           # Raster sizes for desktops whose SVG renderer cannot draw the
           # scalable icon's filters (KDE turns them into black plates).
@@ -139,8 +187,11 @@ jobs:
           printf '%s\n' '# AppRun for Hangar, a GTK4 + libadwaita app' >> AppDir/AppRun
           printf '%s\n' '#' >> AppDir/AppRun
           printf '%s\n' '# Hangar does NOT bundle GTK4/libadwaita libraries. It uses the' >> AppDir/AppRun
-          printf '%s\n' '# host system libraries. Minimum: GTK 4.12 and libadwaita 1.5,' >> AppDir/AppRun
-          printf '%s\n' '# i.e. GNOME 45+ (Fedora 39+, Ubuntu 23.10+, etc).' >> AppDir/AppRun
+          printf '%s\n' '# host system libraries. Minimum: GTK 4.14, libadwaita 1.5 and' >> AppDir/AppRun
+          printf '%s\n' '# glibc 2.39, i.e. GNOME 46+ (Fedora 40+, Ubuntu 24.04+, etc).' >> AppDir/AppRun
+          printf '%s\n' '# GTK 4.14 is gtk_graphics_offload, libadwaita 1.5 is AdwDialog,' >> AppDir/AppRun
+          printf '%s\n' '# and glibc 2.39 is the build host itself: all three are linked' >> AppDir/AppRun
+          printf '%s\n' '# non-weak, so a host below any of them cannot start the binary.' >> AppDir/AppRun
           printf '%s\n' '#' >> AppDir/AppRun
           printf '%s\n' '# This is intentional: bundling GTK4/libadwaita from the build' >> AppDir/AppRun
           printf '%s\n' '# environment (Ubuntu 24.04) causes theme/rendering failures on' >> AppDir/AppRun
@@ -176,6 +227,19 @@ jobs:
           printf '%s\n' '  exit 1' >> AppDir/AppRun
           printf '%s\n' 'fi' >> AppDir/AppRun
           printf '%s\n' '' >> AppDir/AppRun
+          printf '%s\n' '# A host below the floor cannot link. Say so before starting, using' >> AppDir/AppRun
+          printf '%s\n' '# the same cheap ldconfig probe as above, then exec: a shell left in' >> AppDir/AppRun
+          printf '%s\n' '# the middle would swallow SIGTERM and orphan the app at logout.' >> AppDir/AppRun
+          printf '%s\n' 'if [ -n "$LDCONFIG" ]; then' >> AppDir/AppRun
+          printf '%s\n' '  for lib in libadwaita-1.so.0 libgtk-4.so.1; do' >> AppDir/AppRun
+          printf '%s\n' '    if ! "$LDCONFIG" -p 2>/dev/null | grep -q "$lib"; then' >> AppDir/AppRun
+          printf '%s\n' '      echo "Hangar: $lib is missing." >&2' >> AppDir/AppRun
+          printf '%s\n' '      echo "  Hangar needs GTK 4.14, libadwaita 1.5 and glibc 2.39 or newer," >&2' >> AppDir/AppRun
+          printf '%s\n' '      echo "  which means GNOME 46 or later (Fedora 40+, Ubuntu 24.04+)." >&2' >> AppDir/AppRun
+          printf '%s\n' '      exit 1' >> AppDir/AppRun
+          printf '%s\n' '    fi' >> AppDir/AppRun
+          printf '%s\n' '  done' >> AppDir/AppRun
+          printf '%s\n' 'fi' >> AppDir/AppRun
           printf '%s\n' 'exec "${HERE}/usr/bin/hangar" "$@"' >> AppDir/AppRun
           chmod +x AppDir/AppRun
 

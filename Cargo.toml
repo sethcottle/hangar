@@ -36,6 +36,12 @@ atrium-common = "0.1"
 atrium-identity = "0.1"
 atrium-oauth = { version = "0.1", features = ["default-client"] }
 atrium-xrpc-client = { version = "0.5", features = ["reqwest"] }
+# rustls-tls is asked for here but is not what ships. atrium-oauth's
+# default-client and atrium-xrpc-client's own defaults both turn on
+# reqwest/default-tls, and reqwest picks native-tls whenever both backends
+# are enabled, so the binary links libssl and libcrypto and the rustls code
+# rides along unused. Getting to a real rustls build means an HttpClient
+# impl for atrium-oauth and rustls-tls-native-roots for private-CA PDSes.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 futures-util = { version = "0.3", default-features = false }
 tiny_http = "0.12"
@@ -61,9 +67,6 @@ glib-build-tools = "0.22"
 
 [features]
 devel = []
-
-# No build dependencies needed currently
-# Blueprint compilation handled via build.rs if blueprint-compiler is available
 
 [profile.release]
 lto = true

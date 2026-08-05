@@ -2,7 +2,8 @@
 
 use crate::config::APP_ID;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 /// Font size as a scale factor (1.0 = default)
 /// Extended range for low-vision accessibility (WCAG 1.4.4)
@@ -160,8 +161,8 @@ pub struct AppSettings {
     /// Text scale factor. `FontSize::default()` is 1.0.
     ///
     /// This was the one field without `#[serde(default)]`. [`Self::load`]
-    /// funnels parse errors into `unwrap_or_default()`, so a file missing this
-    /// key reverted every other setting.
+    /// hands back defaults for the whole session on a parse error, so a file
+    /// missing this key reverted every other setting.
     /// [`no_single_missing_field_resets_the_others`] fails if a new field
     /// forgets it.
     #[serde(default)]
@@ -216,27 +217,111 @@ impl AppSettings {
         let Some(path) = Self::settings_path() else {
             return Self::default();
         };
+        Self::load_from(&path)
+    }
 
-        match std::fs::read_to_string(&path) {
-            Ok(contents) => serde_json::from_str(&contents).unwrap_or_default(),
-            Err(_) => Self::default(),
-        }
+    /// Read the file, falling back to defaults for this session.
+    ///
+    /// The fallback is reported rather than swallowed. It used to be a bare
+    /// `unwrap_or_default()`, which is why an unreadable file looked exactly
+    /// like a fresh install.
+    fn load_from(path: &Path) -> Self {
+        Self::read_from(path).unwrap_or_else(|e| {
+            eprintln!("hangar: {e}; using default settings for this session");
+            Self::default()
+        })
+    }
+
+    /// Parse the file. Only "there is no file yet" counts as defaults; the
+    /// bytes on disk are the sole copy of these preferences, so every other
+    /// failure has to reach the caller.
+    fn read_from(path: &Path) -> Result<Self, String> {
+        let contents = match std::fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) => return Err(format!("could not read {}: {e}", path.display())),
+        };
+
+        serde_json::from_str(&contents)
+            .map_err(|e| format!("{} did not parse as settings: {e}", path.display()))
     }
 
     /// Save settings to disk
     pub fn save(&self) -> Result<(), String> {
         let path = Self::settings_path().ok_or("Could not determine config directory")?;
+        self.save_to(&path)
+    }
 
-        // Ensure parent directory exists
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create config directory: {e}"))?;
+    /// Replace the settings file atomically, the way `FileSessionStore` writes
+    /// its own.
+    ///
+    /// A plain `fs::write` truncates in place, so ENOSPC or EIO partway
+    /// through leaves a zero-length or half-written file, and since the font
+    /// slider and the video volume rewrite this on every change the odds are
+    /// not academic.
+    /// Whether a file that failed to parse still holds something worth
+    /// keeping. Empty or all-NUL is the torn-write signature: no content,
+    /// nothing to lose.
+    fn is_salvageable(path: &Path) -> bool {
+        match std::fs::read(path) {
+            Ok(bytes) => bytes.is_empty() || bytes.iter().all(|b| *b == 0),
+            // Unreadable is not the same as empty; leave it alone.
+            Err(e) => e.kind() == std::io::ErrorKind::NotFound,
         }
+    }
+
+    fn save_to(&self, path: &Path) -> Result<(), String> {
+        // There is no canonical in-memory settings object: every call site is
+        // a disk read-modify-write, so if the file did not parse then what is
+        // about to be written is defaults wearing the user's preferences.
+        // Refuse, and leave the original for them to recover.
+        //
+        // Unless there is nothing to preserve. An empty or all-NUL file is
+        // exactly what the interrupted-write failure looks like, and it
+        // holds no preferences, so refusing there would lock the user out
+        // of ever saving again with no way back.
+        if let Err(e) = Self::read_from(path) {
+            if !Self::is_salvageable(path) {
+                return Err(format!("not overwriting settings: {e}"));
+            }
+            eprintln!("hangar: settings file held nothing to preserve, rewriting it");
+        }
+
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create config directory: {e}"))?;
 
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| format!("Failed to serialize settings: {e}"))?;
 
-        std::fs::write(&path, json).map_err(|e| format!("Failed to write settings: {e}"))?;
+        // Per process, so two running copies cannot write through each other's
+        // half-finished temp file and rename the result into place.
+        let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+        let written = (|| -> std::io::Result<()> {
+            let mut file = std::fs::File::create(&tmp)?;
+            file.write_all(json.as_bytes())?;
+            // The whole point: a full disk or a bad block surfaces here, while
+            // the previous settings are still the ones on disk.
+            file.sync_all()
+        })();
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("Failed to write settings: {e}"));
+        }
+
+        std::fs::rename(&tmp, path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("Failed to replace settings: {e}")
+        })?;
+
+        // A power cut can otherwise lose the rename itself, and with it the
+        // file it pointed at.
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
 
         Ok(())
     }
@@ -244,6 +329,48 @@ impl AppSettings {
 
 #[cfg(test)]
 mod tests {
+    /// A torn write leaves an empty or NUL-filled file. That holds no
+    /// preferences, so saving over it must be allowed: refusing would
+    /// leave the user unable to change a setting ever again. A file with
+    /// real but unparseable content is still protected.
+    #[test]
+    fn a_torn_settings_file_recovers_but_real_content_is_protected() {
+        let dir = std::env::temp_dir().join(format!("hangar-torn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let settings = AppSettings::default();
+
+        // Torn: zero length, and NUL filled. Both must be rewritable.
+        for (name, body) in [("empty.json", vec![]), ("nulls.json", vec![0u8; 512])] {
+            let path = dir.join(name);
+            std::fs::write(&path, &body).unwrap();
+            settings
+                .save_to(&path)
+                .unwrap_or_else(|e| panic!("{name} should be recoverable: {e}"));
+            assert!(
+                AppSettings::read_from(&path).is_ok(),
+                "{name} did not come back readable"
+            );
+        }
+
+        // Real content that does not parse is somebody's settings after a
+        // partial write or a bad edit. Do not destroy it.
+        let precious = dir.join("garbled.json");
+        std::fs::write(&precious, b"{\"font_size\": 1.25, ").unwrap();
+        assert!(
+            settings.save_to(&precious).is_err(),
+            "unparseable but non-empty settings must not be overwritten"
+        );
+        assert_eq!(
+            std::fs::read(&precious).unwrap(),
+            b"{\"font_size\": 1.25, ",
+            "the original was modified"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     /// Both paths into `video_autoplay` agree on "off".
@@ -271,8 +398,8 @@ mod tests {
 
     /// Dropping any one key must cost only that key.
     ///
-    /// [`AppSettings::load`] funnels a parse error into `unwrap_or_default()`,
-    /// so a field without `#[serde(default)]` resets every other setting.
+    /// [`AppSettings::load`] falls back to defaults on a parse error, so a
+    /// field without `#[serde(default)]` resets every other setting.
     ///
     /// The field set comes from the serialized object, so a new field is
     /// covered the day it lands. Compared through `serde_json::Value` because
@@ -312,8 +439,8 @@ mod tests {
             let mut partial = full.clone();
             partial.remove(dropped);
 
-            // Must be `Ok`, or `AppSettings::load` swallows it and hands back
-            // defaults.
+            // Must be `Ok`, or `AppSettings::load` hands back defaults and the
+            // file becomes unwritable.
             let loaded: AppSettings = serde_json::from_value(serde_json::Value::Object(partial))
                 .unwrap_or_else(|e| {
                     panic!(
@@ -349,6 +476,64 @@ mod tests {
         let empty: AppSettings = serde_json::from_str("{}").expect("an empty settings file loads");
         assert_eq!(empty.font_size, FontSize(FontSize::DEFAULT));
         assert_eq!(empty.font_size, FontSize(1.0));
+    }
+
+    /// A file that does not parse is left exactly as it is.
+    ///
+    /// `load` used to funnel every parse error into `unwrap_or_default`, and
+    /// because every call site is a disk read-modify-write, the next
+    /// preference toggle persisted those defaults over whatever had survived.
+    /// A user with a truncated file lost their font size and reduce-motion
+    /// choice with nothing on screen to say so.
+    #[test]
+    fn a_settings_file_that_does_not_parse_survives_the_next_save() {
+        let dir = std::env::temp_dir().join(format!("hangar-settings-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+
+        // What a truncated `fs::write` leaves behind when the disk fills.
+        const CORRUPT: &str = r#"{"font_size":1.35,"reduce_mot"#;
+        std::fs::write(&path, CORRUPT).unwrap();
+
+        let loaded = AppSettings::load_from(&path);
+        assert_eq!(loaded.font_size, FontSize(FontSize::DEFAULT));
+        assert!(!loaded.reduce_motion);
+
+        let err = loaded
+            .save_to(&path)
+            .expect_err("a save of defaults over an unreadable file must be refused");
+        assert!(err.contains("not overwriting"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            CORRUPT,
+            "the unparseable original was destroyed anyway"
+        );
+
+        // A readable file lifts the refusal, and the save lands whole.
+        std::fs::write(&path, r#"{"font_size":1.35}"#).unwrap();
+        let mut loaded = AppSettings::load_from(&path);
+        assert_eq!(loaded.font_size, FontSize(1.35));
+        loaded.reduce_motion = true;
+        loaded
+            .save_to(&path)
+            .expect("a save over a readable file lands");
+
+        let reread = AppSettings::load_from(&path);
+        assert_eq!(reread.font_size, FontSize(1.35));
+        assert!(reread.reduce_motion);
+
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|name| name != "settings.json")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

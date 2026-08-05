@@ -57,8 +57,8 @@
           ];
 
           nativeBuildInputs = with pkgs; [
-            blueprint-compiler
-            desktop-file-utils
+            # glib-compile-schemas, and the setup hook that puts the
+            # installed schema where the wrapper looks for it
             glib
             pkg-config
             wrapGAppsHook4
@@ -66,6 +66,40 @@
 
           buildType = "release";
           strictDeps = true;
+
+          # The update check offers a GitHub download, which is the wrong
+          # answer for someone who installed from the flake: they update
+          # with nix. The check needs APPIMAGE or /.flatpak-info to run at
+          # all, so it is already quiet here; this labels the build honestly.
+          HANGAR_DISTRIBUTION = "nix";
+
+          # buildRustPackage installs the binary and stops there. Without
+          # the rest of this a NixOS install has no launcher entry, and a
+          # Wayland compositor cannot match the app_id to a desktop file,
+          # so the window shows a generic icon and name in alt-tab.
+          postInstall = ''
+            install -Dm644 data/io.github.sethcottle.Hangar.desktop \
+              -t $out/share/applications
+            install -Dm644 data/io.github.sethcottle.Hangar.metainfo.xml \
+              -t $out/share/metainfo
+            install -Dm644 assets/icons/io.github.sethcottle.Hangar.svg \
+              -t $out/share/icons/hicolor/scalable/apps
+
+            # Raster sizes for desktops whose SVG renderer cannot draw the
+            # scalable icon's filters (KDE turns them into black plates).
+            for size in 16 32 48 64 128 256; do
+              install -Dm644 "assets/icons/png/$size/io.github.sethcottle.Hangar.png" \
+                -t "$out/share/icons/hicolor/''${size}x''${size}/apps"
+            done
+
+            # Window geometry lives in GSettings, and gio::Settings finds
+            # nothing without the installed schema. Compiled here rather
+            # than left to glib's fixup hook, which relocates this whole
+            # directory under share/gsettings-schemas and recompiles it.
+            install -Dm644 data/io.github.sethcottle.Hangar.gschema.xml \
+              -t $out/share/glib-2.0/schemas
+            glib-compile-schemas $out/share/glib-2.0/schemas
+          '';
 
           # wrapGAppsHook4 does not carry the GStreamer plugin path, so without
           # this the app builds and starts but no pipeline can find

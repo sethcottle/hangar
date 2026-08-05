@@ -230,6 +230,11 @@ pub struct VideoPlayer {
     /// What the user last asked for. Buffering only resumes PLAYING if set, so
     /// a rebuffer never restarts a paused video.
     wants_playing: Cell<bool>,
+    /// The session idle inhibitor held while a video is playing, paired with
+    /// the application it was taken on so releasing it cannot miss.
+    ///
+    /// `None` whenever nothing is held. See [`Self::hold_idle`].
+    idle_inhibit: RefCell<Option<(gtk4::Application, u32)>>,
     duration: Cell<Option<f64>>,
     /// Resume position, used at the first duration. Seeking before the demuxer
     /// has the playlist answers "unseekable".
@@ -439,6 +444,7 @@ impl VideoPlayer {
             volume_save: RefCell::new(None),
             pending_volume: Cell::new(None),
             wants_playing: Cell::new(false),
+            idle_inhibit: RefCell::new(None),
             duration: Cell::new(None),
             pending_start: Cell::new((config.start_at > 0.0).then_some(config.start_at)),
         });
@@ -610,6 +616,7 @@ impl VideoPlayer {
     /// audio after its window is gone.
     pub fn stop(&self) {
         self.wants_playing.set(false);
+        self.release_idle();
         if let Some(id) = self.tick.borrow_mut().take() {
             id.remove();
         }
@@ -689,6 +696,7 @@ impl VideoPlayer {
         };
         self.wants_playing.set(true);
         let _ = playbin.set_state(gst::State::Playing);
+        self.hold_idle();
         self.sync_transport();
     }
 
@@ -698,7 +706,55 @@ impl VideoPlayer {
         };
         self.wants_playing.set(false);
         let _ = playbin.set_state(gst::State::Paused);
+        self.release_idle();
         self.sync_transport();
+    }
+
+    /// Keep the session from blanking while a video plays.
+    ///
+    /// Idle detection is input-event based, so a running pipeline and audio
+    /// output do not defer the screensaver on their own.
+    ///
+    /// Scoped by [`may_inhibit_idle`]: a feed GIF is muted, looping and
+    /// autoplayed, and holding the session awake for one is worse than the bug
+    /// this fixes. Idempotent.
+    ///
+    /// Outside Flatpak on KDE `gtk_application_inhibit` returns 0 and nothing
+    /// is held: there is no GNOME session manager on the bus to ask. Reaching
+    /// the portal or org.freedesktop.ScreenSaver there is follow-up work.
+    fn hold_idle(&self) {
+        if !may_inhibit_idle(self.chrome, self.source.kind) || self.idle_inhibit.borrow().is_some()
+        {
+            return;
+        }
+        let Some(app) = gtk4::gio::Application::default()
+            .and_then(|app| app.downcast::<gtk4::Application>().ok())
+        else {
+            return;
+        };
+        // The player is built before it goes into the dialog, so the first play
+        // has no toplevel to name yet. The session manager accepts none.
+        let window = self
+            .root
+            .root()
+            .and_then(|root| root.downcast::<gtk4::Window>().ok());
+        let cookie = app.inhibit(
+            window.as_ref(),
+            gtk4::ApplicationInhibitFlags::IDLE,
+            Some("Playing a video"),
+        );
+        if cookie != 0 {
+            self.idle_inhibit.replace(Some((app, cookie)));
+        }
+    }
+
+    /// Let the session blank again. Idempotent, and every way out of playing
+    /// runs it: pause, stop, the end of a video, a failure, and drop.
+    fn release_idle(&self) {
+        let held = self.idle_inhibit.borrow_mut().take();
+        if let Some((app, cookie)) = held {
+            app.uninhibit(cookie);
+        }
     }
 
     fn playbin(&self) -> Option<gst::Element> {
@@ -740,7 +796,11 @@ impl VideoPlayer {
         self.playbin.replace(Some(pipeline.playbin));
         // Taken beside the playbin in `stop`.
         self.pipeline_token.replace(Some(pipeline.token));
-        self.start_tick();
+        // A GIF has no transport bar, so nothing the tick refreshes is on
+        // screen. The bus still drives `refresh_position` for the resume seek.
+        if self.source.kind != MediaKind::Gif {
+            self.start_tick();
+        }
         self.play();
     }
 
@@ -802,6 +862,7 @@ impl VideoPlayer {
                     // Dialog: park at the start rather than loop.
                     self.wants_playing.set(false);
                     let _ = playbin.set_state(gst::State::Paused);
+                    self.release_idle();
                     self.seek_to(0.0);
                     self.sync_transport();
                 }
@@ -1190,6 +1251,15 @@ impl Drop for VideoPlayer {
     }
 }
 
+/// Whether a player is allowed to hold the session awake.
+///
+/// Only somebody sitting in front of the dialog counts. Inline autoplay is
+/// scrolled past, and a GIF is a silent loop that would hold the inhibitor
+/// until the feed moved on.
+fn may_inhibit_idle(chrome: Chrome, kind: MediaKind) -> bool {
+    chrome == Chrome::Dialog && kind == MediaKind::Video
+}
+
 fn clock_seconds(time: gst::ClockTime) -> f64 {
     time.nseconds() as f64 / 1_000_000_000.0
 }
@@ -1201,5 +1271,21 @@ fn format_clock(seconds: f64) -> String {
         format!("{hours}:{minutes:02}:{secs:02}")
     } else {
         format!("{minutes}:{secs:02}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The idle inhibitor covers a video somebody opened and nothing else. An
+    /// autoplayed muted GIF keeping the screen lit all afternoon would be
+    /// worse than the blanking this fixes.
+    #[test]
+    fn only_a_dialog_video_inhibits_idle() {
+        assert!(may_inhibit_idle(Chrome::Dialog, MediaKind::Video));
+        assert!(!may_inhibit_idle(Chrome::Dialog, MediaKind::Gif));
+        assert!(!may_inhibit_idle(Chrome::Inline, MediaKind::Video));
+        assert!(!may_inhibit_idle(Chrome::Inline, MediaKind::Gif));
     }
 }

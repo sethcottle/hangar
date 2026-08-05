@@ -191,6 +191,10 @@ mod imp {
         /// The row's video embed. Only strong ref in the process; the director
         /// holds `Weak`s.
         pub video_slot: RefCell<Option<std::rc::Rc<crate::ui::inline_video::VideoSlot>>>,
+        /// Every image the current post is still fetching. Dropped at the top
+        /// of the next [`super::PostRow::bind`], so a recycled row stops
+        /// polling for an occupant that scrolled away.
+        pub image_loads: RefCell<Vec<avatar_cache::ImageLoad>>,
     }
 
     #[glib::object_subclass]
@@ -1306,6 +1310,12 @@ impl PostRow {
         let imp = self.imp();
         imp.post.replace(Some(post.clone()));
 
+        // Whatever the last post was still loading belongs to a row the user
+        // has scrolled past. Dropping the handles stops those polls, so a
+        // scroll burst leaves no 16ms timer per image behind, each pinning a
+        // picture and decoding pixels nobody will see.
+        drop(imp.image_loads.take());
+
         // Clickable again until something says otherwise. `set_not_clickable`
         // runs after `bind` on a thread's focused post, and without this reset
         // the row that carried it would refuse to navigate ever after.
@@ -1680,6 +1690,18 @@ impl PostRow {
         drop(slot);
     }
 
+    /// Start an image load the row can call off.
+    ///
+    /// Every picture in an embed goes through here. The handle lives on the
+    /// row, so the next `bind` cancels the load and dropping the row cancels
+    /// it too; the fire and forget entry point cannot be stopped, and a scroll
+    /// burst through an image feed leaves one poll per pending image.
+    fn load_embed_image(&self, picture: &gtk4::Picture, url: &str) {
+        let handle =
+            avatar_cache::load_image_into_picture_tracked(picture.clone(), url.to_string(), |_| {});
+        self.imp().image_loads.borrow_mut().push(handle);
+    }
+
     /// Render embed content into the container
     ///
     /// `inline_allowed` is false inside a quote card: a quoted video keeps its
@@ -1740,7 +1762,7 @@ impl PostRow {
                 picture.set_content_fit(gtk4::ContentFit::Contain);
 
                 frame.set_child(Some(&picture));
-                avatar_cache::load_image_into_picture(picture.clone(), img.thumb.clone());
+                self.load_embed_image(&picture, &img.thumb);
                 let cell = Self::with_alt_badge(frame.upcast(), &picture, &img.alt);
                 Self::attach_image_click(&cell, images, 0);
                 grid_container.append(&cell);
@@ -1844,7 +1866,7 @@ impl PostRow {
         picture.set_content_fit(gtk4::ContentFit::Cover);
 
         frame.set_child(Some(&picture));
-        avatar_cache::load_image_into_picture(picture.clone(), image.thumb.clone());
+        self.load_embed_image(&picture, &image.thumb);
 
         Self::with_alt_badge(frame.upcast(), &picture, &image.alt)
     }
@@ -1909,8 +1931,8 @@ impl PostRow {
             thumb.set_vexpand(true);
             thumb.set_can_shrink(true);
             thumb.set_content_fit(gtk4::ContentFit::Cover);
-            avatar_cache::load_image_into_picture(thumb.clone(), thumb_url.clone());
             thumb_frame.set_child(Some(&thumb));
+            self.load_embed_image(&thumb, thumb_url);
             card.append(&thumb_frame);
         }
 
@@ -2030,10 +2052,10 @@ impl PostRow {
         if let Some(alt) = Self::gif_alt(ext) {
             thumb.set_alternative_text(Some(&alt));
         }
-        if let Some(thumb_url) = &ext.thumb {
-            avatar_cache::load_image_into_picture(thumb.clone(), thumb_url.clone());
-        }
         frame.set_child(Some(&thumb));
+        if let Some(thumb_url) = &ext.thumb {
+            self.load_embed_image(&thumb, thumb_url);
+        }
         overlay.set_child(Some(&frame));
 
         // The GIF badge.
@@ -2122,10 +2144,10 @@ impl PostRow {
             thumb.set_alternative_text(Some(alt));
         }
 
-        if let Some(thumb_url) = &video.thumbnail {
-            avatar_cache::load_image_into_picture(thumb.clone(), thumb_url.clone());
-        }
         frame.set_child(Some(&thumb));
+        if let Some(thumb_url) = &video.thumbnail {
+            self.load_embed_image(&thumb, thumb_url);
+        }
         overlay.set_child(Some(&frame));
 
         // Play button overlay
@@ -2844,7 +2866,7 @@ mod tests {
 
         let row = PostRow::new();
         row.bind(&post_with(
-            Some(a_video("file:///nonexistent/hangar-row-1.mp4")),
+            Some(a_video("https://127.0.0.1:1/hangar-row-1.mp4")),
             "at://did:plc:test/app.bsky.feed.post/one",
         ));
 
@@ -2876,7 +2898,7 @@ mod tests {
 
         // Door two: the factory unbinds the row while it is still playing.
         row.bind(&post_with(
-            Some(a_video("file:///nonexistent/hangar-row-2.mp4")),
+            Some(a_video("https://127.0.0.1:1/hangar-row-2.mp4")),
             "at://did:plc:test/app.bsky.feed.post/three",
         ));
         let slot = row
@@ -2900,6 +2922,116 @@ mod tests {
         assert_eq!(crate::media::live_pipelines(), 0);
     }
 
+    /// Answers every request with a small PNG after a delay, so a load is
+    /// still out when the row under test is bound again.
+    fn slow_image_server() -> u16 {
+        let pixbuf =
+            gdk::gdk_pixbuf::Pixbuf::new(gdk::gdk_pixbuf::Colorspace::Rgb, false, 8, 16, 16)
+                .expect("allocate pixbuf");
+        pixbuf.fill(0x00_88_44_ff);
+        let png = pixbuf
+            .save_to_bufferv("png", &[])
+            .expect("encode png")
+            .to_vec();
+
+        let server = tiny_http::Server::http("127.0.0.1:0").expect("bind test server");
+        let port = server
+            .server_addr()
+            .to_ip()
+            .expect("test server address")
+            .port();
+        std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                let png = png.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                    let _ = request.respond(tiny_http::Response::from_data(png));
+                });
+            }
+        });
+        port
+    }
+
+    /// The single picture in a row's embed subtree.
+    fn only_picture(row: &PostRow) -> gtk4::Picture {
+        let container = embed_container_of(row);
+        let mut widgets = Vec::new();
+        walk(container.upcast_ref(), 0, &mut widgets);
+        let mut pictures = widgets
+            .into_iter()
+            .filter_map(|(_, w)| w.downcast::<gtk4::Picture>().ok());
+        let picture = pictures.next().expect("the image embed built a picture");
+        assert!(pictures.next().is_none(), "one image, one picture");
+        picture
+    }
+
+    /// A recycled row stops loading the last post's images.
+    ///
+    /// A `GtkListView` binds one pooled row to post after post, and a load
+    /// that nothing calls off keeps a 16ms poll and one of the eight download
+    /// permits alive for a picture the user has already scrolled past, which
+    /// is how the images actually on screen ended up last in the queue.
+    ///
+    /// The abandoned picture is held here on purpose. Otherwise it would be
+    /// finalized with the old embed subtree and the poll would stop on its
+    /// own, which measures the widget going away rather than the cancel.
+    #[test]
+    fn a_rebind_cancels_the_previous_posts_image_loads() {
+        crate::ui::with_gtk(a_rebind_cancels_the_previous_posts_image_loads_body);
+    }
+
+    fn a_rebind_cancels_the_previous_posts_image_loads_body() {
+        let port = slow_image_server();
+        let url = format!("http://127.0.0.1:{port}/thumb.png?rebind");
+        let with_image = |uri: &str| {
+            post_with(
+                Some(Embed::Images(vec![ImageEmbed {
+                    thumb: url.clone(),
+                    fullsize: url.clone(),
+                    alt: String::new(),
+                    aspect_ratio: Some((1, 1)),
+                }])),
+                uri,
+            )
+        };
+
+        let recycled = PostRow::new();
+        recycled.bind(&with_image("at://did:plc:test/app.bsky.feed.post/one"));
+        let abandoned = only_picture(&recycled);
+        assert_eq!(
+            recycled.imp().image_loads.borrow().len(),
+            1,
+            "the row kept no handle for the image it just started, so nothing \
+             can call the load off"
+        );
+
+        // Same URL, so one fetch settles both rows and a server that never
+        // answered cannot pass this test.
+        let control = PostRow::new();
+        control.bind(&with_image("at://did:plc:test/app.bsky.feed.post/two"));
+        let watched = only_picture(&control);
+
+        recycled.bind(&post_with(
+            None,
+            "at://did:plc:test/app.bsky.feed.post/three",
+        ));
+        assert!(
+            recycled.imp().image_loads.borrow().is_empty(),
+            "the rebind left the previous post's loads on the row"
+        );
+
+        settle(1500);
+        assert!(
+            watched.paintable().is_some(),
+            "the fetch never landed, so this test proved nothing"
+        );
+        assert!(
+            abandoned.paintable().is_none(),
+            "the recycled row's poll was still running and painted the old \
+             post's image onto a widget the feed has taken back"
+        );
+    }
+
     /// A quoted video keeps its thumbnail and opens the viewer.
     #[test]
     fn a_quoted_video_does_not_play_inline() {
@@ -2911,7 +3043,7 @@ mod tests {
         let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         row.render_quote(
             &container,
-            &quote_with(Some(a_video("file:///nonexistent/quoted.mp4"))),
+            &quote_with(Some(a_video("https://127.0.0.1:1/quoted.mp4"))),
         );
         assert!(
             row.imp().video_slot.borrow().is_none(),
@@ -2922,7 +3054,7 @@ mod tests {
         let container = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         row.render_embed(
             &container,
-            &a_video("file:///nonexistent/standalone.mp4"),
+            &a_video("https://127.0.0.1:1/standalone.mp4"),
             true,
         );
         assert!(
@@ -3280,7 +3412,7 @@ mod tests {
             (
                 "video",
                 Some(Embed::Video(VideoEmbed {
-                    playlist: "file:///nonexistent/rebind.mp4".into(),
+                    playlist: "https://127.0.0.1:1/rebind.mp4".into(),
                     thumbnail: Some(dead_url()),
                     alt: Some("a cat".into()),
                     aspect_ratio: Some((16, 9)),
