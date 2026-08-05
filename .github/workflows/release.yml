@@ -276,7 +276,7 @@ jobs:
 
             ### Downloads
 
-            - **Flatpak**: `hangar.flatpak`. Install with `flatpak install hangar.flatpak`
+            - **Flatpak**: `hangar-nightly.flatpak`. Install with `flatpak install hangar-nightly.flatpak`
             - **AppImage**: Make executable and run
 
             ### Authentication
@@ -320,10 +320,13 @@ jobs:
         run: |
           APPIMAGE=$(ls Hangar*.AppImage)
           ZSYNC=$(ls Hangar*.AppImage.zsync)
+          # The local name is channel-dependent since the bundles went
+          # channel-distinct; the AppImage globs already cover theirs.
+          FLATPAK=$(ls hangar*.flatpak)
 
           if [ "${{ steps.release-type.outputs.is_nightly }}" == "true" ]; then
             # Nightly builds use -nightly suffix
-            aws s3 cp hangar.flatpak s3://${{ secrets.R2_BUCKET_NAME }}/hangar/releases/hangar-nightly.flatpak \
+            aws s3 cp "$FLATPAK" s3://${{ secrets.R2_BUCKET_NAME }}/hangar/releases/hangar-nightly.flatpak \
               --endpoint-url ${{ secrets.R2_ENDPOINT_URL }}
             aws s3 cp "$APPIMAGE" s3://${{ secrets.R2_BUCKET_NAME }}/hangar/releases/Hangar-nightly-x86_64.AppImage \
               --endpoint-url ${{ secrets.R2_ENDPOINT_URL }}
@@ -331,7 +334,7 @@ jobs:
               --endpoint-url ${{ secrets.R2_ENDPOINT_URL }}
           else
             # Versioned releases use standard names
-            aws s3 cp hangar.flatpak s3://${{ secrets.R2_BUCKET_NAME }}/hangar/releases/hangar.flatpak \
+            aws s3 cp "$FLATPAK" s3://${{ secrets.R2_BUCKET_NAME }}/hangar/releases/hangar.flatpak \
               --endpoint-url ${{ secrets.R2_ENDPOINT_URL }}
             aws s3 cp "$APPIMAGE" s3://${{ secrets.R2_BUCKET_NAME }}/hangar/releases/Hangar-x86_64.AppImage \
               --endpoint-url ${{ secrets.R2_ENDPOINT_URL }}
