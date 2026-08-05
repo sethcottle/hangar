@@ -109,6 +109,19 @@ mod imp {
         const NAME: &'static str = "HangarActorRow";
         type Type = super::ActorRow;
         type ParentType = gtk4::Box;
+
+        fn class_init(klass: &mut Self::Class) {
+            // A plain box announces nothing; Group carries the row's label.
+            klass.set_accessible_role(gtk4::AccessibleRole::Group);
+
+            // Open the person, live while the row itself has focus. Focus on
+            // the follow button inside keeps that button's own keys.
+            klass.install_action("actor.open", None, |row, _, _| row.activate_row());
+            let empty = gtk4::gdk::ModifierType::empty();
+            klass.add_binding_action(gtk4::gdk::Key::Return, empty, "actor.open");
+            klass.add_binding_action(gtk4::gdk::Key::KP_Enter, empty, "actor.open");
+            klass.add_binding_action(gtk4::gdk::Key::space, empty, "actor.open");
+        }
     }
 
     impl ObjectImpl for ActorRow {
@@ -142,6 +155,8 @@ impl ActorRow {
         self.set_margin_top(8);
         self.set_margin_bottom(8);
         self.set_cursor_from_name(Some("pointer"));
+        // A keyboard stop of its own, in a list view or a plain box alike.
+        self.set_focusable(true);
 
         let main_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
 
@@ -231,12 +246,7 @@ impl ActorRow {
         let row_weak = self.downgrade();
         click.connect_released(move |_, _, _, _| {
             if let Some(row) = row_weak.upgrade() {
-                let profile = row.imp().profile.borrow().clone();
-                if let Some(profile) = profile
-                    && let Some(cb) = row.imp().activated_callback.borrow().as_ref()
-                {
-                    cb(profile);
-                }
+                row.activate_row();
             }
         });
         self.add_controller(click);
@@ -359,6 +369,20 @@ impl ActorRow {
         }
     }
 
+    /// Open the person this row shows. The click gesture and the keyboard
+    /// action both land here, so neither needs pointer coordinates.
+    fn activate_row(&self) {
+        let imp = self.imp();
+        // Out of the borrow first; the callback can rebind this row.
+        let profile = imp.profile.borrow().clone();
+        let callback = imp.activated_callback.borrow();
+        if let Some(profile) = profile
+            && let Some(cb) = callback.as_ref()
+        {
+            cb(profile);
+        }
+    }
+
     /// Replace the activation callback, so a recycled row keeps exactly one.
     pub fn set_activated_callback<F: Fn(Profile) + 'static>(&self, callback: F) {
         self.imp()
@@ -421,6 +445,32 @@ mod tests {
             imp.handle_label.borrow().as_ref().unwrap().text(),
             "@second.bsky.social"
         );
+    }
+
+    /// A keyboard-only user has to be able to land on a row and open it.
+    #[test]
+    fn the_row_opens_from_the_keyboard_action() {
+        crate::ui::with_gtk(the_row_opens_from_the_keyboard_action_body);
+    }
+
+    fn the_row_opens_from_the_keyboard_action_body() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let row = ActorRow::new();
+        let opened: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(vec![]));
+        let sink = opened.clone();
+        row.set_activated_callback(move |profile| sink.borrow_mut().push(profile.did));
+
+        let person = a_profile("keyed");
+        row.bind(&person);
+
+        assert!(row.is_focusable(), "Tab has to be able to reach the row");
+        assert_eq!(row.accessible_role(), gtk4::AccessibleRole::Group);
+
+        // What Return, KP_Enter and space are bound to.
+        WidgetExt::activate_action(&row, "actor.open", None).expect("the action is installed");
+        assert_eq!(opened.borrow().as_slice(), ["did:plc:keyed"]);
     }
 
     /// The follow button reads the bound profile, reports one click with

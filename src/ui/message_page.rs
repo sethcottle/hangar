@@ -215,6 +215,28 @@ mod message_row {
             const NAME: &'static str = "HangarMessageRow";
             type Type = super::MessageRow;
             type ParentType = gtk4::Box;
+
+            fn class_init(klass: &mut Self::Class) {
+                klass.set_accessible_role(gtk4::AccessibleRole::Group);
+
+                // Message shortcuts, live while the row itself has focus.
+                // Menu and Shift+F10 are the context menu keys every GTK
+                // app answers; Ctrl+C copies with no pointer in sight.
+                klass.install_action("message.menu", None, |row, _, _| row.open_menu(None));
+                klass.install_action("message.copy", None, |row, _, _| row.copy_text());
+                let empty = gtk4::gdk::ModifierType::empty();
+                klass.add_binding_action(gtk4::gdk::Key::Menu, empty, "message.menu");
+                klass.add_binding_action(
+                    gtk4::gdk::Key::F10,
+                    gtk4::gdk::ModifierType::SHIFT_MASK,
+                    "message.menu",
+                );
+                klass.add_binding_action(
+                    gtk4::gdk::Key::c,
+                    gtk4::gdk::ModifierType::CONTROL_MASK,
+                    "message.copy",
+                );
+            }
         }
 
         impl ObjectImpl for MessageRow {
@@ -255,6 +277,8 @@ mod message_row {
 
         fn setup_ui(&self) {
             self.set_hexpand(true);
+            // A keyboard stop of its own; the message.* shortcuts act on it.
+            self.set_focusable(true);
             self.set_margin_start(12);
             self.set_margin_end(12);
             self.set_margin_top(3);
@@ -362,10 +386,8 @@ mod message_row {
                 if let Some(menu) = menu_weak.upgrade() {
                     menu.popdown();
                 }
-                if let Some(row) = row_weak.upgrade()
-                    && let Some(message) = row.imp().message.borrow().as_ref()
-                {
-                    row.clipboard().set_text(&message.text);
+                if let Some(row) = row_weak.upgrade() {
+                    row.copy_text();
                 }
             });
             menu_box.append(&copy_item);
@@ -404,24 +426,14 @@ mod message_row {
                 }
             });
 
-            let row_weak = self.downgrade();
-            let open_menu = move |x: f64, y: f64| {
-                let Some(row) = row_weak.upgrade() else {
-                    return;
-                };
-                if let Some(menu) = row.imp().context_menu.borrow().as_ref() {
-                    let rect = gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1);
-                    menu.set_pointing_to(Some(&rect));
-                    menu.popup();
-                }
-            };
-
             let right_click = gtk4::GestureClick::new();
             right_click.set_button(3);
-            let open = open_menu.clone();
+            let row_weak = self.downgrade();
             right_click.connect_released(move |gesture, _, x, y| {
                 gesture.set_state(gtk4::EventSequenceState::Claimed);
-                open(x, y);
+                if let Some(row) = row_weak.upgrade() {
+                    row.open_menu(Some((x, y)));
+                }
             });
             bubble.add_controller(right_click);
 
@@ -441,9 +453,12 @@ mod message_row {
 
             let long_press = gtk4::GestureLongPress::new();
             long_press.set_touch_only(true);
+            let row_weak = self.downgrade();
             long_press.connect_pressed(move |gesture, x, y| {
                 gesture.set_state(gtk4::EventSequenceState::Claimed);
-                open_menu(x, y);
+                if let Some(row) = row_weak.upgrade() {
+                    row.open_menu(Some((x, y)));
+                }
             });
             bubble.add_controller(long_press);
 
@@ -782,6 +797,45 @@ mod message_row {
         /// Replace the handler run when a shared post's card is activated.
         pub fn set_post_callback<F: Fn(Post) + 'static>(&self, callback: F) {
             self.imp().post_callback.replace(Some(Box::new(callback)));
+        }
+
+        /// Pop the message menu. A gesture says where the pointer was; the
+        /// keyboard passes None and the menu falls back to pointing at the
+        /// bubble it is parented to.
+        fn open_menu(&self, at: Option<(f64, f64)>) {
+            let Some(menu) = self.imp().context_menu.borrow().clone() else {
+                return;
+            };
+            // A popover needs a surface to open onto. Without this, an
+            // action fired at a row that is not on screen takes GTK
+            // through gdk_surface_new_popup with no parent and aborts.
+            if !self.is_mapped() {
+                return;
+            }
+            match at {
+                Some((x, y)) => {
+                    let rect = gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1);
+                    menu.set_pointing_to(Some(&rect));
+                }
+                // Whatever a previous right click left would still be
+                // pointed at otherwise.
+                None => menu.set_pointing_to(None),
+            }
+            menu.popup();
+        }
+
+        /// Put the bound message's text on the clipboard. Copy Text and
+        /// Ctrl+C both land here.
+        fn copy_text(&self) {
+            let text = self
+                .imp()
+                .message
+                .borrow()
+                .as_ref()
+                .map(|message| message.text.clone());
+            if let Some(text) = text {
+                self.clipboard().set_text(&text);
+            }
         }
 
         /// Heart the bound message, the double-click shortcut. Adding is
@@ -1825,6 +1879,34 @@ mod tests {
             deleted.borrow().as_slice(),
             ["m2"],
             "the menu acts on the current occupant"
+        );
+    }
+
+    /// A message has to be reachable with no pointer in the room: the row
+    /// is a focus stop, it carries a role Orca can announce, and the
+    /// actions its key bindings fire are installed.
+    #[test]
+    fn a_message_is_reachable_from_the_keyboard() {
+        crate::ui::with_gtk(a_message_is_reachable_from_the_keyboard_body);
+    }
+
+    fn a_message_is_reachable_from_the_keyboard_body() {
+        let row = MessageRow::new();
+        assert!(row.is_focusable(), "the keyboard must be able to land here");
+        assert_eq!(row.accessible_role(), gtk4::AccessibleRole::Group);
+
+        row.bind(
+            &message("m1", "did:plc:them", "copy me"),
+            false,
+            Some("did:plc:me"),
+        );
+        assert!(
+            row.activate_action("message.menu", None).is_ok(),
+            "Menu and Shift+F10 need an action to fire"
+        );
+        assert!(
+            row.activate_action("message.copy", None).is_ok(),
+            "Ctrl+C needs an action to fire"
         );
     }
 

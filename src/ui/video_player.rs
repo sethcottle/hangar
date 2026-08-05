@@ -281,6 +281,10 @@ impl VideoPlayer {
         let position = gtk4::Scale::with_range(gtk4::Orientation::Horizontal, 0.0, 1.0, 1.0);
         position.set_hexpand(true);
         position.set_draw_value(false);
+        // A slider takes no name from its contents, and it is Tab-reachable once
+        // a duration arrives, so it needs one outright. Not a tooltip: that one
+        // would sit over the scrubber through every drag.
+        position.update_property(&[gtk4::accessible::Property::Label("Seek position")]);
         // Nothing to scrub through until a duration comes back from the demuxer.
         position.set_sensitive(false);
 
@@ -1075,11 +1079,15 @@ impl VideoPlayer {
         if total > 0.0 {
             self.position.set_value(shown);
         }
-        self.time_label.set_label(&format!(
-            "{} / {}",
-            format_clock(shown),
-            format_clock(total)
-        ));
+        let at = format_clock(shown);
+        let end = format_clock(total);
+        self.time_label.set_label(&format!("{at} / {end}"));
+        // Left alone the slider is announced as a percentage, which says
+        // nothing about a video. Speak the clock the label already shows.
+        self.position
+            .update_property(&[gtk4::accessible::Property::ValueText(&format!(
+                "{at} of {end}"
+            ))]);
     }
 
     /// Hand the handle back to the pipeline: nothing held, nothing outstanding.

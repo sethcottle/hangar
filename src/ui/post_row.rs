@@ -1080,38 +1080,48 @@ impl PostRow {
         let was_liked = *imp.is_liked.borrow();
 
         if let Some(btn) = imp.like_btn.borrow().as_ref() {
+            // The count comes off the post, never off the label: format_count
+            // writes "" for zero and "1.2K" past a thousand, so reading it back
+            // as a number failed on most of the feed.
+            let count = imp
+                .post
+                .borrow()
+                .as_ref()
+                .and_then(|p| p.like_count)
+                .unwrap_or(0);
+            let new_count = if was_liked {
+                count.saturating_sub(1)
+            } else {
+                count + 1
+            };
+
             if was_liked {
                 btn.remove_css_class("liked");
                 imp.is_liked.replace(false);
                 // Clear the like URI since we're unliking
                 imp.viewer_like_uri.replace(None);
-                // Decrement count and update accessible label
-                if let Some(label) = imp.like_count_label.borrow().as_ref() {
-                    if let Ok(count) = label.text().parse::<i32>() {
-                        let new_count = (count - 1).max(0) as u32;
-                        label.set_text(&Self::format_count(Some(new_count)));
-                        btn.update_property(&[gtk4::accessible::Property::Label(&format!(
-                            "Like. {} likes",
-                            new_count
-                        ))]);
-                    }
-                }
             } else {
                 btn.add_css_class("liked");
                 imp.is_liked.replace(true);
                 // Note: we don't have the new like URI yet, but that's OK for visual state
-                // Increment count and update accessible label
-                if let Some(label) = imp.like_count_label.borrow().as_ref() {
-                    if let Ok(count) = label.text().parse::<i32>() {
-                        let new_count = (count + 1) as u32;
-                        label.set_text(&Self::format_count(Some(new_count)));
-                        btn.update_property(&[gtk4::accessible::Property::Label(&format!(
-                            "Unlike. {} likes",
-                            new_count
-                        ))]);
-                    }
-                }
             }
+
+            // Store the count as well as show it, or the next toggle counts
+            // from the number the server last sent.
+            if let Some(post) = imp.post.borrow_mut().as_mut() {
+                post.like_count = Some(new_count);
+            }
+            if let Some(label) = imp.like_count_label.borrow().as_ref() {
+                label.set_text(&Self::format_count(Some(new_count)));
+            }
+            // Unconditional: on a plain button this name is the only like
+            // state an assistive technology can see.
+            let like_label = if was_liked {
+                format!("Like. {} likes", new_count)
+            } else {
+                format!("Unlike. {} likes", new_count)
+            };
+            btn.update_property(&[gtk4::accessible::Property::Label(&like_label)]);
         }
     }
 
@@ -1150,21 +1160,23 @@ impl PostRow {
         let was_reposted = *imp.is_reposted.borrow();
 
         if let Some(btn) = imp.repost_btn.borrow().as_ref() {
+            // Off the post, for the same reason as the like path above.
+            let count = imp
+                .post
+                .borrow()
+                .as_ref()
+                .and_then(|p| p.repost_count)
+                .unwrap_or(0);
+            let new_count = if was_reposted {
+                count.saturating_sub(1)
+            } else {
+                count + 1
+            };
+
             if was_reposted {
                 btn.remove_css_class("reposted");
                 imp.is_reposted.replace(false);
                 imp.viewer_repost_uri.replace(None);
-                // Decrement count and update accessible label
-                if let Some(label) = imp.repost_count_label.borrow().as_ref() {
-                    if let Ok(count) = label.text().parse::<i32>() {
-                        let new_count = (count - 1).max(0) as u32;
-                        label.set_text(&Self::format_count(Some(new_count)));
-                        btn.update_property(&[gtk4::accessible::Property::Label(&format!(
-                            "Repost. {} reposts",
-                            new_count
-                        ))]);
-                    }
-                }
                 // Update menu item label
                 if let Some(label) = imp.repost_item_label.borrow().as_ref() {
                     label.set_text("Repost");
@@ -1172,22 +1184,23 @@ impl PostRow {
             } else {
                 btn.add_css_class("reposted");
                 imp.is_reposted.replace(true);
-                // Increment count and update accessible label
-                if let Some(label) = imp.repost_count_label.borrow().as_ref() {
-                    if let Ok(count) = label.text().parse::<i32>() {
-                        let new_count = (count + 1) as u32;
-                        label.set_text(&Self::format_count(Some(new_count)));
-                        btn.update_property(&[gtk4::accessible::Property::Label(&format!(
-                            "Undo repost. {} reposts",
-                            new_count
-                        ))]);
-                    }
-                }
-                // Update menu item label
                 if let Some(label) = imp.repost_item_label.borrow().as_ref() {
                     label.set_text("Undo Repost");
                 }
             }
+
+            if let Some(post) = imp.post.borrow_mut().as_mut() {
+                post.repost_count = Some(new_count);
+            }
+            if let Some(label) = imp.repost_count_label.borrow().as_ref() {
+                label.set_text(&Self::format_count(Some(new_count)));
+            }
+            let repost_label = if was_reposted {
+                format!("Repost. {} reposts", new_count)
+            } else {
+                format!("Undo repost. {} reposts", new_count)
+            };
+            btn.update_property(&[gtk4::accessible::Property::Label(&repost_label)]);
         }
     }
 
@@ -3880,5 +3893,100 @@ mod tests {
         row.imp().is_focused_post.set(true);
         assert!(row.activate_action("post.open", None).is_ok());
         assert_eq!(opened.borrow().len(), 1, "the focused post does not reopen");
+    }
+
+    /// The accessible name on `widget`, the string a screen reader announces.
+    ///
+    /// gtk4-rs binds no getter for an accessible property, so this goes
+    /// through GTK's own test helper, which hands back the real value only
+    /// when it differs from the one passed in. Nothing equals the sentinel,
+    /// so what comes back is always the real value.
+    fn accessible_label(widget: &impl IsA<gtk4::Accessible>) -> String {
+        use gtk4::glib::translate::ToGlibPtr;
+
+        let sentinel = std::ffi::CString::new("\u{1}no label\u{1}").unwrap();
+        unsafe {
+            let raw = gtk4::ffi::gtk_test_accessible_check_property(
+                widget.as_ref().to_glib_none().0,
+                gtk4::ffi::GTK_ACCESSIBLE_PROPERTY_LABEL,
+                sentinel.as_ptr(),
+            );
+            if raw.is_null() {
+                return String::new();
+            }
+            let label = std::ffi::CStr::from_ptr(raw).to_string_lossy().into_owned();
+            gtk4::glib::ffi::g_free(raw.cast());
+            label
+        }
+    }
+
+    /// Neither button carries a pressed state, so its name is the whole of
+    /// what an assistive technology knows about the like, and it has to follow
+    /// every toggle. Both counts here used to be recovered by parsing the
+    /// rendered label: blank at zero, "1.2K" past a thousand, neither of which
+    /// is a number, so the button went on offering the action it had just done.
+    #[test]
+    fn the_engagement_buttons_announce_their_new_count() {
+        crate::ui::with_gtk(the_engagement_buttons_announce_their_new_count_body);
+    }
+
+    fn the_engagement_buttons_announce_their_new_count_body() {
+        let row = PostRow::new();
+        let imp = row.imp();
+        let like_btn = imp.like_btn.borrow().clone().expect("built in setup_ui");
+        let repost_btn = imp.repost_btn.borrow().clone().expect("built in setup_ui");
+        let like_count = imp
+            .like_count_label
+            .borrow()
+            .clone()
+            .expect("built in setup_ui");
+        let repost_count = imp
+            .repost_count_label
+            .borrow()
+            .clone()
+            .expect("built in setup_ui");
+
+        // Zero, which is most of any feed: the visible count is blank.
+        let mut post = post_with(None, "at://did:plc:test/app.bsky.feed.post/counts");
+        post.like_count = Some(0);
+        post.repost_count = Some(0);
+        row.bind(&post);
+        assert_eq!(accessible_label(&like_btn), "Like. 0 likes");
+
+        row.toggle_like_visual();
+        assert_eq!(accessible_label(&like_btn), "Unlike. 1 likes");
+        assert_eq!(like_count.text(), "1");
+        row.toggle_like_visual();
+        assert_eq!(accessible_label(&like_btn), "Like. 0 likes");
+        assert_eq!(like_count.text(), "", "a zero count shows nothing");
+
+        row.toggle_repost_visual();
+        assert_eq!(accessible_label(&repost_btn), "Undo repost. 1 reposts");
+        assert_eq!(repost_count.text(), "1");
+
+        // Past a thousand the label reads "1.2K", the other string that never
+        // parsed, and the one that left the name at the server's number.
+        post.like_count = Some(1200);
+        post.repost_count = Some(1200);
+        row.bind(&post);
+        assert_eq!(accessible_label(&like_btn), "Like. 1200 likes");
+
+        row.toggle_like_visual();
+        assert_eq!(accessible_label(&like_btn), "Unlike. 1201 likes");
+        row.toggle_like_visual();
+        assert_eq!(accessible_label(&like_btn), "Like. 1200 likes");
+
+        row.toggle_repost_visual();
+        assert_eq!(accessible_label(&repost_btn), "Undo repost. 1201 reposts");
+
+        // Over a thousand and back has to land on the number it started from.
+        // Reading "1.0K" back left the row a like high until the next bind.
+        post.like_count = Some(999);
+        row.bind(&post);
+        row.toggle_like_visual();
+        assert_eq!(like_count.text(), "1.0K");
+        row.toggle_like_visual();
+        assert_eq!(like_count.text(), "999", "unliking has to undo the like");
+        assert_eq!(accessible_label(&like_btn), "Like. 999 likes");
     }
 }

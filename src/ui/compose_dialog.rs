@@ -1591,8 +1591,11 @@ impl ComposeDialog {
             thumb_box.set_size_request(80, 80);
             thumb_box.add_css_class("compose-thumbnail");
 
-            // Image
-            let picture = gtk4::Picture::new();
+            // Image. The role has to be set at construction, GTK will not
+            // change it later, and this frame is what opens the description.
+            let picture = gtk4::Picture::builder()
+                .accessible_role(gtk4::AccessibleRole::Button)
+                .build();
             picture.set_paintable(Some(&img.texture));
             picture.set_can_shrink(true);
             picture.set_size_request(80, 80);
@@ -1621,43 +1624,30 @@ impl ComposeDialog {
             });
             thumb_box.add_overlay(&remove_btn);
 
-            // ALT badge in the bottom-left, shown when alt text is set
-            if !img.alt_text.is_empty() {
-                let alt_badge = gtk4::Label::new(Some("ALT"));
-                alt_badge.add_css_class("compose-alt-badge");
-                alt_badge.add_css_class("osd");
-                alt_badge.set_halign(gtk4::Align::Start);
-                alt_badge.set_valign(gtk4::Align::End);
-                alt_badge.set_margin_bottom(4);
-                alt_badge.set_margin_start(4);
-                alt_badge
-                    .update_property(&[gtk4::accessible::Property::Label("Alt text provided")]);
-                thumb_box.add_overlay(&alt_badge);
-            }
-
-            // Make the thumbnail clickable to edit alt text
-            let click = gtk4::GestureClick::new();
-            let dialog_weak = self.downgrade();
-            let idx = i;
-            click.connect_released(move |gesture, _, _, _| {
-                gesture.set_state(gtk4::EventSequenceState::Claimed);
-                if let Some(dialog) = dialog_weak.upgrade() {
-                    dialog.show_alt_text_dialog(idx);
-                }
-            });
-            picture.add_controller(click);
-
-            // Accessible label for the thumbnail
+            // Accessible label for the thumbnail, on the frame that takes
+            // focus as well as on the tile around it.
             let alt_desc = if img.alt_text.is_empty() {
                 "No alt text".to_string()
             } else {
                 format!("Alt text: {}", img.alt_text)
             };
-            thumb_box.update_property(&[gtk4::accessible::Property::Label(&format!(
-                "Image {}. {}. Click to edit alt text.",
-                i + 1,
-                alt_desc
-            ))]);
+            let thumb_label = format!("Image {}. {}. Edit alt text.", i + 1, alt_desc);
+            thumb_box.update_property(&[gtk4::accessible::Property::Label(&thumb_label)]);
+            picture.update_property(&[gtk4::accessible::Property::Label(&thumb_label)]);
+
+            let described = !img.alt_text.is_empty();
+            let action = if described {
+                format!("Edit alt text for image {}", i + 1)
+            } else {
+                format!("Add alt text to image {}", i + 1)
+            };
+            let dialog_weak = self.downgrade();
+            let idx = i;
+            Self::wire_alt_editing(&thumb_box, &picture, described, &action, move || {
+                if let Some(dialog) = dialog_weak.upgrade() {
+                    dialog.show_alt_text_dialog(idx);
+                }
+            });
 
             strip.append(&thumb_box);
         }
@@ -1766,6 +1756,59 @@ impl ComposeDialog {
         if !has_images {
             imp.content_warning.replace(None);
         }
+    }
+
+    /// Wire a thumbnail up for describing. The frame itself takes focus and
+    /// answers Enter, Keypad Enter and Space, and an ALT button sits on the
+    /// overlay so the affordance has a name to tab to instead of hiding
+    /// behind a click on the image. Pointer and keyboard run the same
+    /// `describe` closure.
+    fn wire_alt_editing<F>(
+        overlay: &gtk4::Overlay,
+        carrier: &impl IsA<gtk4::Widget>,
+        described: bool,
+        action_label: &str,
+        describe: F,
+    ) where
+        F: Fn() + Clone + 'static,
+    {
+        let carrier = carrier.as_ref();
+        carrier.set_focusable(true);
+        // Reuses the ring the quote card defines for clickable non-buttons.
+        carrier.add_css_class("quote-card-button");
+
+        let click = gtk4::GestureClick::new();
+        let open = describe.clone();
+        click.connect_released(move |gesture, _, _, _| {
+            gesture.set_state(gtk4::EventSequenceState::Claimed);
+            open();
+        });
+        carrier.add_controller(click);
+
+        let key = gtk4::EventControllerKey::new();
+        let open = describe.clone();
+        key.connect_key_pressed(move |_, keyval, _, _| match keyval {
+            gdk::Key::Return | gdk::Key::KP_Enter | gdk::Key::space | gdk::Key::KP_Space => {
+                open();
+                glib::Propagation::Stop
+            }
+            _ => glib::Propagation::Proceed,
+        });
+        carrier.add_controller(key);
+
+        // The badge doubles as the state: ALT once described, +ALT until then.
+        let badge = gtk4::Button::with_label(if described { "ALT" } else { "+ALT" });
+        badge.add_css_class("compose-alt-badge");
+        badge.add_css_class("osd");
+        badge.add_css_class("flat");
+        badge.set_halign(gtk4::Align::End);
+        badge.set_valign(gtk4::Align::End);
+        badge.set_margin_bottom(4);
+        badge.set_margin_end(4);
+        badge.set_tooltip_text(Some(action_label));
+        badge.update_property(&[gtk4::accessible::Property::Label(action_label)]);
+        badge.connect_clicked(move |_| describe());
+        overlay.add_overlay(&badge);
     }
 
     /// Show a dialog for editing the alt text of an image.
@@ -2228,9 +2271,13 @@ impl ComposeDialog {
             _ => video.progress_icon.set_visible(true),
         }
 
+        // The inner frame opens the description, so it announces itself as a
+        // button; the role has to be set at construction.
         let inner: gtk4::Widget = if let Some(preview) = &video.preview {
             tile.set_size_request(142, 80);
-            let picture = gtk4::Picture::new();
+            let picture = gtk4::Picture::builder()
+                .accessible_role(gtk4::AccessibleRole::Button)
+                .build();
             picture.set_paintable(Some(preview));
             picture.set_can_shrink(true);
             picture.set_content_fit(gtk4::ContentFit::Cover);
@@ -2252,7 +2299,11 @@ impl ComposeDialog {
             picture.upcast()
         } else {
             tile.set_size_request(200, 80);
-            let card = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+            let card = gtk4::Box::builder()
+                .orientation(gtk4::Orientation::Vertical)
+                .spacing(4)
+                .accessible_role(gtk4::AccessibleRole::Button)
+                .build();
             card.set_margin_top(10);
             card.set_margin_bottom(10);
             card.set_margin_start(10);
@@ -2299,39 +2350,29 @@ impl ComposeDialog {
         });
         tile.add_overlay(&remove_btn);
 
-        // ALT badge once described, click to describe; both as on images.
-        if !video.alt_text.is_empty() {
-            let alt_badge = gtk4::Label::new(Some("ALT"));
-            alt_badge.add_css_class("compose-alt-badge");
-            alt_badge.add_css_class("osd");
-            alt_badge.set_halign(gtk4::Align::Start);
-            alt_badge.set_valign(gtk4::Align::End);
-            alt_badge.set_margin_bottom(4);
-            alt_badge.set_margin_start(4);
-            alt_badge.update_property(&[gtk4::accessible::Property::Label("Alt text provided")]);
-            tile.add_overlay(&alt_badge);
-        }
-
-        let click = gtk4::GestureClick::new();
-        let dialog_weak = self.downgrade();
-        let token = video.token;
-        click.connect_released(move |gesture, _, _, _| {
-            gesture.set_state(gtk4::EventSequenceState::Claimed);
-            if let Some(dialog) = dialog_weak.upgrade() {
-                dialog.show_video_alt_dialog(token);
-            }
-        });
-        inner.add_controller(click);
-
         let alt_desc = if video.alt_text.is_empty() {
             "No alt text".to_string()
         } else {
             format!("Alt text: {}", video.alt_text)
         };
-        tile.update_property(&[gtk4::accessible::Property::Label(&format!(
-            "Video {}. {}. Click to edit alt text.",
-            video.file_name, alt_desc
-        ))]);
+        let tile_label = format!("Video {}. {}. Edit alt text.", video.file_name, alt_desc);
+        tile.update_property(&[gtk4::accessible::Property::Label(&tile_label)]);
+        inner.update_property(&[gtk4::accessible::Property::Label(&tile_label)]);
+
+        // Describing the video: badge, pointer and keyboard, all as on images.
+        let described = !video.alt_text.is_empty();
+        let action = if described {
+            "Edit alt text for the video"
+        } else {
+            "Add alt text to the video"
+        };
+        let dialog_weak = self.downgrade();
+        let token = video.token;
+        Self::wire_alt_editing(&tile, &inner, described, action, move || {
+            if let Some(dialog) = dialog_weak.upgrade() {
+                dialog.show_video_alt_dialog(token);
+            }
+        });
 
         tile
     }
@@ -3448,7 +3489,10 @@ impl ComposeDialog {
             thumb_box.set_size_request(80, 80);
             thumb_box.add_css_class("compose-thumbnail");
 
-            let picture = gtk4::Picture::new();
+            // As on the main post, the frame is what opens the description.
+            let picture = gtk4::Picture::builder()
+                .accessible_role(gtk4::AccessibleRole::Button)
+                .build();
             picture.set_paintable(Some(&img.texture));
             picture.set_can_shrink(true);
             picture.set_size_request(80, 80);
@@ -3464,6 +3508,10 @@ impl ComposeDialog {
             remove_btn.set_margin_top(4);
             remove_btn.set_margin_end(4);
             remove_btn.set_tooltip_text(Some(&format!("Remove image {}", i + 1)));
+            remove_btn.update_property(&[gtk4::accessible::Property::Label(&format!(
+                "Remove image {}",
+                i + 1
+            ))]);
             let dialog_weak = self.downgrade();
             let block_for_remove = block.container.clone();
             let ii = i;
@@ -3476,32 +3524,32 @@ impl ComposeDialog {
             });
             thumb_box.add_overlay(&remove_btn);
 
-            // ALT badge
-            if !img.alt_text.is_empty() {
-                let alt_badge = gtk4::Label::new(Some("ALT"));
-                alt_badge.add_css_class("compose-alt-badge");
-                alt_badge.add_css_class("osd");
-                alt_badge.set_halign(gtk4::Align::Start);
-                alt_badge.set_valign(gtk4::Align::End);
-                alt_badge.set_margin_bottom(4);
-                alt_badge.set_margin_start(4);
-                thumb_box.add_overlay(&alt_badge);
-            }
+            // The thumbnails carried no label at all before this.
+            let alt_desc = if img.alt_text.is_empty() {
+                "No alt text".to_string()
+            } else {
+                format!("Alt text: {}", img.alt_text)
+            };
+            let thumb_label = format!("Image {}. {}. Edit alt text.", i + 1, alt_desc);
+            thumb_box.update_property(&[gtk4::accessible::Property::Label(&thumb_label)]);
+            picture.update_property(&[gtk4::accessible::Property::Label(&thumb_label)]);
 
-            // Click to edit alt text
-            let click = gtk4::GestureClick::new();
+            let described = !img.alt_text.is_empty();
+            let action = if described {
+                format!("Edit alt text for image {}", i + 1)
+            } else {
+                format!("Add alt text to image {}", i + 1)
+            };
             let dialog_weak = self.downgrade();
             let block_for_alt = block.container.clone();
             let ii = i;
-            click.connect_released(move |gesture, _, _, _| {
-                gesture.set_state(gtk4::EventSequenceState::Claimed);
+            Self::wire_alt_editing(&thumb_box, &picture, described, &action, move || {
                 if let Some(dialog) = dialog_weak.upgrade()
                     && let Some(pi) = dialog.thread_index_of(&block_for_alt)
                 {
                     dialog.show_thread_alt_text_dialog(pi, ii);
                 }
             });
-            picture.add_controller(click);
 
             block.image_strip.append(&thumb_box);
         }
@@ -4509,5 +4557,69 @@ mod tests {
         dialog.with_video(0, |v| v.alt_text = "a described video".into());
         dialog.update_thread_post_button_state();
         assert!(btn.is_sensitive(), "a description frees it");
+    }
+
+    /// The feature that exists for blind users cannot need a mouse: the
+    /// thumbnail frame takes focus, announces itself as a button and answers
+    /// keys, and an ALT button on the tile makes the affordance visible.
+    #[test]
+    fn a_thumbnail_hands_its_alt_text_editor_to_the_keyboard() {
+        crate::ui::with_gtk(a_thumbnail_hands_its_alt_text_editor_to_the_keyboard_body);
+    }
+
+    fn a_thumbnail_hands_its_alt_text_editor_to_the_keyboard_body() {
+        let dialog = ComposeDialog::new();
+        let imp = dialog.imp();
+        imp.images.borrow_mut().push(a_compose_image(""));
+        dialog.rebuild_image_strip();
+
+        let strip = imp
+            .image_strip
+            .borrow()
+            .clone()
+            .expect("compose builds its image strip up front");
+        let tile = strip.first_child().expect("the image built a thumbnail");
+
+        let mut frame = None;
+        let mut alt_button = None;
+        let mut child = tile.first_child();
+        while let Some(widget) = child {
+            if widget.is::<gtk4::Picture>() {
+                frame = Some(widget.clone());
+            } else if let Some(button) = widget.downcast_ref::<gtk4::Button>()
+                && button.label().is_some_and(|text| text.contains("ALT"))
+            {
+                alt_button = Some(button.clone());
+            }
+            child = widget.next_sibling();
+        }
+
+        let frame = frame.expect("the thumbnail shows the image");
+        assert!(frame.is_focusable(), "Tab has to reach the thumbnail");
+        assert_eq!(
+            frame.accessible_role(),
+            gtk4::AccessibleRole::Button,
+            "Orca has to hear that the thumbnail does something"
+        );
+
+        let controllers = frame.observe_controllers();
+        let names: Vec<String> = (0..controllers.n_items())
+            .filter_map(|i| controllers.item(i))
+            .map(|c| c.type_().name().to_string())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "GtkEventControllerKey"),
+            "Enter, Keypad Enter and Space open the description"
+        );
+        assert!(
+            names.iter().any(|n| n == "GtkGestureClick"),
+            "the pointer still opens the description"
+        );
+
+        let alt_button = alt_button.expect("the tile carries a visible ALT button");
+        assert_eq!(
+            alt_button.tooltip_text().as_deref(),
+            Some("Add alt text to image 1")
+        );
     }
 }

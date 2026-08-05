@@ -496,6 +496,10 @@ impl ImageViewer {
         let alt = image.alt.trim();
         self.alt_label.set_visible(!alt.is_empty());
         self.alt_label.set_label(alt);
+        // One Picture serves the gallery, so the description has to be replaced
+        // on every page, not just set. An undescribed image clears it.
+        self.picture
+            .set_alternative_text((!alt.is_empty()).then_some(alt));
 
         let title = if self.images.len() > 1 {
             format!("Image {} of {}", self.index.get() + 1, self.images.len())

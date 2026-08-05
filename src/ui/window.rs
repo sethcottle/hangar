@@ -3897,41 +3897,35 @@ impl HangarWindow {
         stats_box.set_halign(gtk4::Align::Center);
         stats_box.set_margin_top(8);
 
-        // Followers, clickable. The gesture is wired once here; the click
-        // reads current_profile so a later account switch needs no rewiring.
-        let followers_box = Self::clickable_stat_box();
+        // Followers, clickable. Wired once here; the activation reads
+        // current_profile so a later account switch needs no rewiring.
+        let win = self.downgrade();
+        let followers_box = Self::clickable_stat_box(move || {
+            if let Some(win) = win.upgrade() {
+                win.open_follow_list_for_current_profile(FollowListKind::Followers);
+            }
+        });
         let followers_count = gtk4::Label::new(Some("0"));
         followers_count.add_css_class("heading");
         followers_box.append(&followers_count);
         let followers_static = gtk4::Label::new(Some("followers"));
         followers_static.add_css_class("dim-label");
         followers_box.append(&followers_static);
-        let win = self.downgrade();
-        let followers_click = gtk4::GestureClick::new();
-        followers_click.connect_released(move |_, _, _, _| {
-            if let Some(win) = win.upgrade() {
-                win.open_follow_list_for_current_profile(FollowListKind::Followers);
-            }
-        });
-        followers_box.add_controller(followers_click);
         stats_box.append(&followers_box);
 
         // Following, same deal
-        let following_box = Self::clickable_stat_box();
+        let win = self.downgrade();
+        let following_box = Self::clickable_stat_box(move || {
+            if let Some(win) = win.upgrade() {
+                win.open_follow_list_for_current_profile(FollowListKind::Following);
+            }
+        });
         let following_count = gtk4::Label::new(Some("0"));
         following_count.add_css_class("heading");
         following_box.append(&following_count);
         let following_static = gtk4::Label::new(Some("following"));
         following_static.add_css_class("dim-label");
         following_box.append(&following_static);
-        let win = self.downgrade();
-        let following_click = gtk4::GestureClick::new();
-        following_click.connect_released(move |_, _, _, _| {
-            if let Some(win) = win.upgrade() {
-                win.open_follow_list_for_current_profile(FollowListKind::Following);
-            }
-        });
-        following_box.add_controller(following_click);
         stats_box.append(&following_box);
 
         // Buttons need names before the first profile fills the counts in.
@@ -3988,13 +3982,37 @@ impl HangarWindow {
 
     /// An empty stat box that announces itself as a button and shows a
     /// pointer, for follower and following counts that open their lists.
-    fn clickable_stat_box() -> gtk4::Box {
+    ///
+    /// It claims the button role, so it has to behave like one: a focus stop
+    /// that the pointer and the keyboard both activate through `activate`.
+    fn clickable_stat_box(activate: impl Fn() + 'static) -> gtk4::Box {
         let stat_box = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Horizontal)
             .spacing(4)
             .accessible_role(gtk4::AccessibleRole::Button)
+            .focusable(true)
             .build();
         stat_box.set_cursor_from_name(Some("pointer"));
+
+        let activate = Rc::new(activate);
+        let click = gtk4::GestureClick::new();
+        let clicked = Rc::clone(&activate);
+        click.connect_released(move |_, _, _, _| clicked());
+        stat_box.add_controller(click);
+
+        let key = gtk4::EventControllerKey::new();
+        key.connect_key_pressed(move |_, keyval, _, _| match keyval {
+            gtk4::gdk::Key::Return
+            | gtk4::gdk::Key::KP_Enter
+            | gtk4::gdk::Key::space
+            | gtk4::gdk::Key::KP_Space => {
+                activate();
+                glib::Propagation::Stop
+            }
+            _ => glib::Propagation::Proceed,
+        });
+        stat_box.add_controller(key);
+
         stat_box
     }
 
@@ -4023,7 +4041,16 @@ impl HangarWindow {
             FollowListKind::Following => "following",
         };
 
-        let stat_box = Self::clickable_stat_box();
+        let win = self.downgrade();
+        let for_list = profile.clone();
+        let stat_box = Self::clickable_stat_box(move || {
+            let Some(win) = win.upgrade() else {
+                return;
+            };
+            if let Some(cb) = win.imp().follow_list_clicked_callback.borrow().as_ref() {
+                cb(for_list.clone(), kind);
+            }
+        });
         if let Some(count) = count {
             let count_label = gtk4::Label::new(Some(&Self::format_count(count)));
             count_label.add_css_class("heading");
@@ -4038,19 +4065,6 @@ impl HangarWindow {
             None => format!("{}, opens list", kind.title()),
         };
         stat_box.update_property(&[gtk4::accessible::Property::Label(&spoken)]);
-
-        let win = self.downgrade();
-        let profile = profile.clone();
-        let click = gtk4::GestureClick::new();
-        click.connect_released(move |_, _, _, _| {
-            let Some(win) = win.upgrade() else {
-                return;
-            };
-            if let Some(cb) = win.imp().follow_list_clicked_callback.borrow().as_ref() {
-                cb(profile.clone(), kind);
-            }
-        });
-        stat_box.add_controller(click);
 
         stat_box
     }
@@ -5280,9 +5294,9 @@ impl HangarWindow {
         if let Some(overlay) = self.imp().toast_overlay.borrow().as_ref() {
             let toast = adw::Toast::new(message);
             toast.set_timeout(3); // 3 seconds
+            // No announce of our own: the toast overlay already speaks the
+            // message, and saying it here made Orca read every toast twice.
             overlay.add_toast(toast);
-            // Toasts are how errors reach the user; say them aloud too.
-            self.announce(message, gtk4::AccessibleAnnouncementPriority::Medium);
         }
     }
 
@@ -5735,6 +5749,11 @@ impl HangarWindow {
         scale.set_hexpand(true);
         scale.set_margin_top(4);
         scale.set_margin_bottom(4);
+        // The "Size:" label sits in its own row, so the slider is not named
+        // by anything; without this it is an unnamed slider to a screen reader.
+        scale.update_relation(&[gtk4::accessible::Relation::LabelledBy(&[
+            size_title.upcast_ref()
+        ])]);
 
         // Add marks at each step
         for &step in FontSize::STEPS {
@@ -6243,6 +6262,17 @@ mod mention_row {
             const NAME: &'static str = "HangarMentionRow";
             type Type = super::MentionRow;
             type ParentType = gtk4::Box;
+
+            fn class_init(klass: &mut Self::Class) {
+                klass.set_accessible_role(gtk4::AccessibleRole::Group);
+
+                // The keyboard's way in, same activation the click gesture uses.
+                klass.install_action("mention.activate", None, |row, _, _| row.activate_row());
+                let empty = gtk4::gdk::ModifierType::empty();
+                klass.add_binding_action(gtk4::gdk::Key::Return, empty, "mention.activate");
+                klass.add_binding_action(gtk4::gdk::Key::KP_Enter, empty, "mention.activate");
+                klass.add_binding_action(gtk4::gdk::Key::space, empty, "mention.activate");
+            }
         }
 
         impl ObjectImpl for MentionRow {
@@ -6273,6 +6303,8 @@ mod mention_row {
 
         fn setup_ui(&self) {
             self.add_css_class("mention-row");
+            // A keyboard stop of its own; mention.activate opens it.
+            self.set_focusable(true);
             self.set_margin_start(12);
             self.set_margin_end(12);
             self.set_margin_top(8);
@@ -6355,9 +6387,7 @@ mod mention_row {
             let row_weak = self.downgrade();
             click.connect_released(move |_, _, _, _| {
                 if let Some(row) = row_weak.upgrade() {
-                    if let Some(cb) = row.imp().clicked_callback.borrow().as_ref() {
-                        cb(&row);
-                    }
+                    row.activate_row();
                 }
             });
             self.add_controller(click);
@@ -6376,6 +6406,20 @@ mod mention_row {
             imp.text_label.replace(Some(text_label));
             imp.reason_label.replace(Some(reason_label));
             imp.time_label.replace(Some(time_label));
+        }
+
+        /// The row's one activation, for the click gesture and the keyboard
+        /// alike. A notification with no post has no thread to open, and the
+        /// avatar is not a keyboard stop, so the author is where the row goes.
+        fn activate_row(&self) {
+            let imp = self.imp();
+            if let Some(cb) = imp.clicked_callback.borrow().as_ref() {
+                cb(self);
+                return;
+            }
+            if let Some(cb) = imp.profile_clicked_callback.borrow().as_ref() {
+                cb(self);
+            }
         }
 
         pub fn bind(&self, notification: &Notification) {
@@ -6521,6 +6565,17 @@ mod activity_row {
             const NAME: &'static str = "HangarActivityRow";
             type Type = super::ActivityRow;
             type ParentType = gtk4::Box;
+
+            fn class_init(klass: &mut Self::Class) {
+                klass.set_accessible_role(gtk4::AccessibleRole::Group);
+
+                // The keyboard's way in, same activation the click gesture uses.
+                klass.install_action("activity.activate", None, |row, _, _| row.activate_row());
+                let empty = gtk4::gdk::ModifierType::empty();
+                klass.add_binding_action(gtk4::gdk::Key::Return, empty, "activity.activate");
+                klass.add_binding_action(gtk4::gdk::Key::KP_Enter, empty, "activity.activate");
+                klass.add_binding_action(gtk4::gdk::Key::space, empty, "activity.activate");
+            }
         }
 
         impl ObjectImpl for ActivityRow {
@@ -6551,6 +6606,8 @@ mod activity_row {
 
         fn setup_ui(&self) {
             self.add_css_class("activity-row");
+            // A keyboard stop of its own; activity.activate opens it.
+            self.set_focusable(true);
             self.set_margin_start(12);
             self.set_margin_end(12);
             self.set_margin_top(12);
@@ -6661,9 +6718,7 @@ mod activity_row {
             let row_weak = self.downgrade();
             click.connect_released(move |_, _, _, _| {
                 if let Some(row) = row_weak.upgrade() {
-                    if let Some(cb) = row.imp().clicked_callback.borrow().as_ref() {
-                        cb(&row);
-                    }
+                    row.activate_row();
                 }
             });
             self.add_controller(click);
@@ -6835,6 +6890,20 @@ mod activity_row {
         pub fn clear_clicked(&self) {
             self.imp().clicked_callback.replace(None);
         }
+
+        /// The row's one activation, for the click gesture and the keyboard
+        /// alike. A follow has no post to open, and the avatar is not a
+        /// keyboard stop, so the author is where the row goes.
+        fn activate_row(&self) {
+            let imp = self.imp();
+            if let Some(cb) = imp.clicked_callback.borrow().as_ref() {
+                cb(self);
+                return;
+            }
+            if let Some(cb) = imp.profile_clicked_callback.borrow().as_ref() {
+                cb(self);
+            }
+        }
     }
 
     impl Default for ActivityRow {
@@ -6871,6 +6940,19 @@ mod conversation_row {
             const NAME: &'static str = "HangarConversationRow";
             type Type = super::ConversationRow;
             type ParentType = gtk4::Box;
+
+            fn class_init(klass: &mut Self::Class) {
+                klass.set_accessible_role(gtk4::AccessibleRole::Group);
+
+                // The keyboard's way in, same activation the click gesture uses.
+                klass.install_action("conversation.activate", None, |row, _, _| {
+                    row.activate_row()
+                });
+                let empty = gtk4::gdk::ModifierType::empty();
+                klass.add_binding_action(gtk4::gdk::Key::Return, empty, "conversation.activate");
+                klass.add_binding_action(gtk4::gdk::Key::KP_Enter, empty, "conversation.activate");
+                klass.add_binding_action(gtk4::gdk::Key::space, empty, "conversation.activate");
+            }
         }
 
         impl ObjectImpl for ConversationRow {
@@ -6901,6 +6983,8 @@ mod conversation_row {
 
         fn setup_ui(&self) {
             self.add_css_class("conversation-row");
+            // A keyboard stop of its own; conversation.activate opens it.
+            self.set_focusable(true);
             self.set_margin_start(12);
             self.set_margin_end(12);
             self.set_margin_top(8);
@@ -6960,9 +7044,7 @@ mod conversation_row {
             let row_weak = self.downgrade();
             click.connect_released(move |_, _, _, _| {
                 if let Some(row) = row_weak.upgrade() {
-                    if let Some(cb) = row.imp().clicked_callback.borrow().as_ref() {
-                        cb(&row);
-                    }
+                    row.activate_row();
                 }
             });
             self.add_controller(click);
@@ -7077,6 +7159,14 @@ mod conversation_row {
             self.imp()
                 .clicked_callback
                 .replace(Some(Box::new(callback)));
+        }
+
+        /// The row's one activation, for the click gesture and the keyboard
+        /// alike: open this conversation.
+        fn activate_row(&self) {
+            if let Some(cb) = self.imp().clicked_callback.borrow().as_ref() {
+                cb(self);
+            }
         }
     }
 
