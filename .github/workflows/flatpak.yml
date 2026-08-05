@@ -17,6 +17,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Stamp the build version
+        run: |
+          sed -i "s/^    RUST_BACKTRACE: '1'$/    RUST_BACKTRACE: '1'\n    HANGAR_VERSION: 'git-${GITHUB_SHA::7}'/" io.github.sethcottle.Hangar.yml
+          grep -q "HANGAR_VERSION" io.github.sethcottle.Hangar.yml || { echo "version stamp missed the manifest" >&2; exit 1; }
+
       - name: Generate Cargo sources
         run: |
           dnf install -y python3-toml python3-tomlkit python3-aiohttp
