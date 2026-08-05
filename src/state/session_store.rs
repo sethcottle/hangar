@@ -169,6 +169,14 @@ impl FileSessionStore {
             sessions.iter().map(|(k, v)| (k.to_string(), v)).collect();
         let json = serde_json::to_string_pretty(&string_map)?;
 
+        // The directory exists when the store is built, but a data wipe
+        // (GNOME Software offers one) can remove it while the app runs,
+        // and the very next thing a user does then is sign in. Recreate
+        // it on every write.
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
         // Write atomically via temp file
         let tmp_path = self.path.with_extension("json.tmp");
         std::fs::write(&tmp_path, json)?;
@@ -282,6 +290,37 @@ mod tests {
         // A build without these fields must still load what we wrote.
         let bare: Session = serde_json::from_str(&json).expect("still a valid Session");
         assert_eq!(bare.token_set.access_token, "access");
+    }
+
+    /// A data wipe can delete the config directory out from under a
+    /// running app; the next save must rebuild the path, not error.
+    #[test]
+    fn a_save_survives_its_directory_being_deleted() {
+        let dir = std::env::temp_dir().join(format!("hangar-store-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let store = FileSessionStore {
+            inner: std::sync::Arc::new(Mutex::new(HashMap::new())),
+            path: dir.join("oauth-sessions.json"),
+            pending_redirect_uri: None,
+            pending_scopes: None,
+        };
+        let row: StoredSession = serde_json::from_str(LEGACY_ROW).unwrap();
+        let did: Did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".parse().unwrap();
+        store.inner.lock().unwrap().insert(did, row);
+
+        // The wipe: the whole directory goes, mid-run.
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let guard = store.inner.lock().unwrap();
+        store
+            .save_to_disk(&guard)
+            .expect("the save rebuilds the missing directory");
+        assert!(store.path.exists(), "the session row landed on disk");
+
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// atrium calls `set` after a refresh with no pending binding; it must not
