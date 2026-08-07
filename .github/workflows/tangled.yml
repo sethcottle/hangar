@@ -1,0 +1,54 @@
+# SPDX-License-Identifier: MPL-2.0
+
+name: Mirror to Tangled
+
+# Runs after Release rather than on push. Release deletes and recreates the
+# rolling `nightly` tag, so a mirror triggered by the same push would check out
+# before that happens and leave the knot pointing at the previous nightly until
+# something else got pushed.
+
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Preview only, push nothing'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tangled-mirror
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    name: Push to knot
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Push to Tangled
+        uses: sethcottle/tangled-mirror@v1
+        with:
+          repo: sethcottle.com/hangar
+          ssh-key: ${{ secrets.TANGLED_SSH_KEY }}
+          known-hosts: ${{ vars.TANGLED_KNOWN_HOSTS }}
+          branches: main
+          # `nightly` moves on every release, and git will not move an existing
+          # tag without this. GitHub is the source of truth for Hangar, so
+          # letting the knot's tags be overwritten is the intended behaviour.
+          force-tags: true
+          dry-run: ${{ inputs.dry_run || false }}
